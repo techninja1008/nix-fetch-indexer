@@ -1374,6 +1374,7 @@ dependencies = [
  "anyhow",
  "clap",
  "nfi-api",
+ "nfi-indexer",
  "nfi-interchange",
  "nfi-testenv",
  "reqwest",

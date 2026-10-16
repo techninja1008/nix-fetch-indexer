@@ -27,3 +27,4 @@ toml = "0.8"
 nfi-testenv = { path = "../nfi-testenv" }
 nfi-interchange.workspace = true
 reqwest.workspace = true
+nfi-indexer = { path = "../nfi-indexer" }

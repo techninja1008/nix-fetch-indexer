@@ -218,7 +218,22 @@ nfi-admin jobs [ID] [--wait]
 cargo test --workspace                       # unit and integration tests
 NFI_TEST_REQUIRE_SERVICES=1 cargo test ...   # fail instead of skipping when Postgres/Meilisearch are missing
 NFI_LIVE_TESTS=1 cargo test -p nfi-indexer live_smoke   # index a sample of a real release over the network
+NFI_LIVE_TESTS=1 cargo test -p nfi --test live           # live index -> service -> CLI round trip
+NFI_LIVE_TESTS=1 NFI_LIVE_BUNDLE=full.nfib cargo test --release -p nfi --test live   # plus real-nix minimise
 ```
+
+### Live end-to-end run (full nixos-25.05 closure, packages and programs)
+
+| step | time |
+|---|---|
+| Ingest: 320k paths, 6.1M edges, 129k packages, 153k programs, plus 153k search documents | ~145 s |
+| `minimise` on the release's own `hello` (all cached: 1 root, 5-path closure) | ~1 s, most of it spent in `nix derivation show` |
+| `minimise` on a modified `hello`: 2 derivations to build, 8 roots, 82-path closure | ~0.3–2.7 s |
+
+## Known limitations
+
+- **Fixed-output sources are not in the index.** `store-paths.xz` lists only the outputs of Hydra jobs, and the closure indexer follows their *runtime* references. Source tarballs and other fixed-output derivation outputs are therefore not indexed, even though cache.nixos.org usually has them. `minimise` reports such derivations in `to_build`.
+- **Out paths need evaluation.** `packages.json` contains no store paths. Lookups only return outputs for releases whose `outpaths` dataset has been indexed (with nix-eval-jobs); other items get status `no_outpaths`.
 
 **Test services**
 
