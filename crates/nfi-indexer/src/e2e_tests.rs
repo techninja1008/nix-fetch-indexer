@@ -1,0 +1,262 @@
+//! End-to-end indexer tests against a local fixture HTTP server.
+
+use crate::closure::ClosureOptions;
+use crate::fetch::Fetcher;
+use crate::index::{IndexOptions, index_releases};
+use crate::outpaths::OutpathsOptions;
+use crate::release::{self, ReleaseLocation};
+use nfi_interchange::*;
+use std::io::Write;
+use std::path::Path;
+
+pub(crate) fn hash(n: u32) -> String {
+    let mut b = [0u8; 20];
+    b[..4].copy_from_slice(&n.to_le_bytes());
+    StoreHash(b).to_string()
+}
+
+fn xz(data: &[u8]) -> Vec<u8> {
+    let mut e = xz2::write::XzEncoder::new(Vec::new(), 1);
+    e.write_all(data).unwrap();
+    e.finish().unwrap()
+}
+
+fn br(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    {
+        let mut w = brotli::CompressorWriter::new(&mut out, 4096, 5, 22);
+        w.write_all(data).unwrap();
+    }
+    out
+}
+
+/// Fixture: paths 1..=5; 1 -> 2 -> 3; 4 -> 3; 5 -> 1. Release A lists 1, 4 and
+/// a missing path 99; release B lists 1, 5.
+fn write_fixture(root: &Path) {
+    let cache = root.join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    let refs: &[(u32, &[u32])] = &[(1, &[1, 2]), (2, &[3]), (3, &[]), (4, &[3]), (5, &[1])];
+    for (n, r) in refs {
+        let refs: Vec<String> = r.iter().map(|x| format!("{}-p{x}", hash(*x))).collect();
+        let body = format!(
+            "StorePath: /nix/store/{}-p{n}\nURL: nar/x.nar.xz\nCompression: xz\nFileSize: {}\nNarSize: {}\nReferences: {}\nDeriver: {}-p{n}.drv\n",
+            hash(*n),
+            n * 10,
+            n * 100,
+            refs.join(" "),
+            hash(n + 1000)
+        );
+        std::fs::write(cache.join(format!("{}.narinfo", hash(*n))), body).unwrap();
+    }
+    for (name, roots) in [
+        ("nixos-25.05.100.aaaaaaaaaaaa", vec![1u32, 4, 99]),
+        ("nixos-25.05.200.bbbbbbbbbbbb", vec![1, 5]),
+    ] {
+        let dir = root.join("releases/nixos/25.05").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = if name.contains("aaa") { 'a' } else { 'b' };
+        std::fs::write(dir.join("git-revision"), c.to_string().repeat(40)).unwrap();
+        let sp: String = roots
+            .iter()
+            .map(|n| format!("/nix/store/{}-p{n}\n", hash(*n)))
+            .collect();
+        std::fs::write(dir.join("store-paths.xz"), xz(sp.as_bytes())).unwrap();
+        let pj = format!(
+            r#"{{"version":"2","packages":{{"hello":{{"name":"hello-{c}","pname":"hello","version":"{c}","system":"x86_64-linux","outputs":{{"out":null}},"meta":{{"description":"greeter","mainProgram":"hello"}}}}}}}}"#
+        );
+        std::fs::write(dir.join("packages.json.br"), br(pj.as_bytes())).unwrap();
+        let db = crate::programs::make_programs_db(&[("hello", "x86_64-linux", "hello")]);
+        let tar = crate::tarball::make_tar_xz(&[
+            (&format!("{name}/default.nix"), b"{}"),
+            (&format!("{name}/programs.sqlite"), &db),
+        ]);
+        std::fs::write(dir.join("nixexprs.tar.xz"), tar).unwrap();
+    }
+    let list = r#"<ListBucketResult><IsTruncated>false</IsTruncated>
+<CommonPrefixes><Prefix>nixos/25.05/nixos-25.05.200.bbbbbbbbbbbb/</Prefix></CommonPrefixes>
+<CommonPrefixes><Prefix>nixos/25.05/nixos-25.05.100.aaaaaaaaaaaa/</Prefix></CommonPrefixes></ListBucketResult>"#;
+    std::fs::create_dir_all(root.join("s3")).unwrap();
+    std::fs::write(root.join("s3/index.xml"), list).unwrap();
+}
+
+async fn serve(root: &Path) -> String {
+    use axum::Router;
+    use tower_http::services::{ServeDir, ServeFile};
+    let app = Router::new()
+        .nest_service("/releases", ServeDir::new(root.join("releases")))
+        .nest_service("/cache", ServeDir::new(root.join("cache")))
+        .route_service("/s3/", ServeFile::new(root.join("s3/index.xml")));
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+fn opts(base: &str, datasets: Vec<Dataset>, eval: &Path) -> IndexOptions {
+    IndexOptions {
+        datasets,
+        closure: ClosureOptions {
+            cache_url: format!("{base}/cache"),
+            concurrency: 4,
+            sample: None,
+        },
+        outpaths: OutpathsOptions {
+            command: vec![eval.display().to_string()],
+            systems: vec!["x86_64-linux".into()],
+            workers: 1,
+            max_memory_mb: 100,
+        },
+        include_seed: false,
+    }
+}
+
+fn fake_eval(dir: &Path) -> std::path::PathBuf {
+    let p = dir.join("fake-nix-eval-jobs");
+    let line = format!(
+        r#"{{"attr":"hello","attrPath":["hello"],"drvPath":"/nix/store/{}-hello.drv","outputs":{{"out":"/nix/store/{}-p1"}},"system":"x86_64-linux"}}"#,
+        hash(1001),
+        hash(1)
+    );
+    let script = format!(
+        "#!/bin/sh\ncase \"$*\" in *--expr*) ;; *) exit 3;; esac\necho '{line}'\necho '{{\"attr\":\"broken\",\"error\":\"nope\"}}'\n"
+    );
+    std::fs::write(&p, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
+fn names(c: &ClosureSection, release: usize) -> Vec<String> {
+    let mut v: Vec<String> = c
+        .paths
+        .iter()
+        .filter(|p| p.releases.get(release))
+        .map(|p| p.name.clone())
+        .collect();
+    v.sort();
+    v
+}
+
+#[tokio::test]
+async fn index_two_releases_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture(dir.path());
+    let eval = fake_eval(dir.path());
+    let base = serve(dir.path()).await;
+    let fetcher = Fetcher::new(1).unwrap();
+    let locs = release::list_channel(
+        &fetcher,
+        &format!("{base}/s3"),
+        &format!("{base}/releases"),
+        "nixos/25.05",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        locs.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(),
+        vec!["nixos-25.05.100.aaaaaaaaaaaa", "nixos-25.05.200.bbbbbbbbbbbb"]
+    );
+    let b = index_releases(&fetcher, &locs, &opts(&base, Dataset::ALL.to_vec(), &eval), None)
+        .await
+        .unwrap();
+    b.validate().unwrap();
+    assert_eq!(b.releases.len(), 2);
+    assert_eq!(b.releases[0].commit, "a".repeat(40));
+    assert_eq!(b.releases[0].channel, "nixos-25.05");
+    assert_eq!(b.releases[0].datasets, Dataset::ALL.to_vec());
+    let c = b.closure.as_ref().unwrap();
+    assert_eq!(names(c, 0), vec!["p1", "p2", "p3", "p4"]);
+    assert_eq!(names(c, 1), vec!["p1", "p2", "p3", "p5"]);
+    assert_eq!(c.missing.len(), 1);
+    assert!(c.missing[0].releases.get(0) && !c.missing[0].releases.get(1));
+    let p1 = c.paths.iter().find(|p| p.name == "p1").unwrap();
+    assert_eq!(p1.nar_size, Some(100));
+    assert_eq!(p1.references.len(), 2);
+    assert_eq!(b.packages.as_ref().unwrap().entries.len(), 2);
+    assert_eq!(b.programs.as_ref().unwrap().entries.len(), 1);
+    assert_eq!(b.programs.as_ref().unwrap().entries[0].releases.count(), 2);
+    let op = &b.outpaths.as_ref().unwrap().entries;
+    assert_eq!(op.len(), 1);
+    assert_eq!(op[0].releases.count(), 2);
+}
+
+#[tokio::test]
+async fn seeded_run_reuses_known_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture(dir.path());
+    let eval = fake_eval(dir.path());
+    let base = serve(dir.path()).await;
+    let fetcher = Fetcher::new(1).unwrap();
+    let a = ReleaseLocation::parse(&format!(
+        "{base}/releases/nixos/25.05/nixos-25.05.100.aaaaaaaaaaaa"
+    ))
+    .unwrap();
+    let bl = ReleaseLocation::parse(&format!(
+        "{base}/releases/nixos/25.05/nixos-25.05.200.bbbbbbbbbbbb"
+    ))
+    .unwrap();
+    let o = opts(&base, vec![Dataset::Closure], &eval);
+    let seed = index_releases(&fetcher, std::slice::from_ref(&a), &o, None)
+        .await
+        .unwrap();
+
+    // Remove narinfos that the seed already knows: a seeded run must not need them.
+    for n in [1u32, 2, 3] {
+        std::fs::remove_file(dir.path().join("cache").join(format!("{}.narinfo", hash(n)))).unwrap();
+    }
+    let b = index_releases(&fetcher, std::slice::from_ref(&bl), &o, Some(seed.clone()))
+        .await
+        .unwrap();
+    b.validate().unwrap();
+    assert_eq!(b.releases.len(), 1);
+    assert_eq!(b.releases[0].name, bl.name);
+    assert_eq!(
+        names(b.closure.as_ref().unwrap(), 0),
+        vec!["p1", "p2", "p3", "p5"]
+    );
+    assert!(b.closure.as_ref().unwrap().missing.is_empty());
+
+    let mut o2 = o.clone();
+    o2.include_seed = true;
+    let both = index_releases(&fetcher, std::slice::from_ref(&bl), &o2, Some(seed))
+        .await
+        .unwrap();
+    assert_eq!(both.releases.len(), 2);
+}
+
+/// Opt-in live smoke test (`NFI_LIVE_TESTS=1`): index a small sample of a real
+/// release's closure plus its packages and programs.
+#[tokio::test]
+async fn live_smoke() {
+    if std::env::var("NFI_LIVE_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping live smoke test (set NFI_LIVE_TESTS=1)");
+        return;
+    }
+    let url = std::env::var("NFI_LIVE_RELEASE_URL")
+        .unwrap_or_else(|_| "https://releases.nixos.org/nixos/25.05/nixos-25.05.813814.ac62194c3917".into());
+    let fetcher = Fetcher::new(4).unwrap();
+    let loc = ReleaseLocation::parse(&url).unwrap();
+    let opts = IndexOptions {
+        datasets: vec![Dataset::Closure, Dataset::Packages, Dataset::Programs],
+        closure: ClosureOptions {
+            sample: Some(25),
+            ..Default::default()
+        },
+        outpaths: OutpathsOptions::default(),
+        include_seed: false,
+    };
+    let b = index_releases(&fetcher, &[loc], &opts, None).await.unwrap();
+    b.validate().unwrap();
+    assert_eq!(b.releases[0].commit.len(), 40);
+    assert!(b.closure.as_ref().unwrap().paths.len() >= 25);
+    assert!(b.packages.as_ref().unwrap().entries.len() > 50_000);
+    assert!(b.programs.as_ref().unwrap().entries.len() > 10_000);
+    let mut buf = Vec::new();
+    nfi_interchange::codec::write(
+        &b,
+        &mut buf,
+        nfi_interchange::Format::Binary(nfi_interchange::Compression::DEFAULT),
+    )
+    .unwrap();
+    assert_eq!(nfi_interchange::codec::read(&buf[..]).unwrap(), b);
+}
