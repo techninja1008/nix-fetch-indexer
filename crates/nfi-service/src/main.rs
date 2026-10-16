@@ -47,9 +47,10 @@ async fn main() -> Result<()> {
         .map(|u| Meili::new(u, cli.meili_key.clone(), &cli.meili_index))
         .transpose()?;
     if let Some(m) = &meili
-        && let Err(e) = m.ensure_index().await {
-            tracing::warn!(error = %format!("{e:#}"), "could not configure meilisearch index");
-        }
+        && let Err(e) = m.ensure_index().await
+    {
+        tracing::warn!(error = %format!("{e:#}"), "could not configure meilisearch index");
+    }
     let state = AppState {
         pool,
         meili,

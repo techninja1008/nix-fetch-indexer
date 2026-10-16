@@ -119,9 +119,10 @@ pub fn roots(hits: &BTreeSet<String>, edges: &[(String, String)]) -> Vec<String>
         .collect();
     while let Some(n) = stack.pop() {
         if reached.insert(n)
-            && let Some(next) = adj.get(n) {
-                stack.extend(next.iter().copied());
-            }
+            && let Some(next) = adj.get(n)
+        {
+            stack.extend(next.iter().copied());
+        }
     }
     hits.iter()
         .filter(|h| !reached.contains(h.as_str()))

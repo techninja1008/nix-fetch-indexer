@@ -1,6 +1,8 @@
 //! Request/response types shared by the query service and CLIs, plus the
 //! derivation-graph reduction and minimise planning algorithms.
 
+#[cfg(feature = "client")]
+pub mod client;
 pub mod drv;
 pub mod minimise;
 

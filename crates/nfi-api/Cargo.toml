@@ -11,3 +11,10 @@ anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
+reqwest = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+
+[features]
+client = ["dep:reqwest", "dep:futures", "dep:tokio", "dep:tokio-util"]
