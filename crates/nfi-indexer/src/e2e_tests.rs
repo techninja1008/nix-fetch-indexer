@@ -260,3 +260,71 @@ async fn live_smoke() {
     .unwrap();
     assert_eq!(nfi_interchange::codec::read(&buf[..]).unwrap(), b);
 }
+
+/// Runs the real nix-eval-jobs (when on PATH and able to evaluate) over a
+/// miniature nixexprs tree.
+#[tokio::test]
+async fn real_nix_eval_jobs() {
+    let ok = std::process::Command::new("nix-eval-jobs")
+        .arg("--help")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !ok {
+        eprintln!("skipping: nix-eval-jobs not available");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let top = dir.path().join("nixos-test");
+    std::fs::create_dir_all(top.join("pkgs/top-level")).unwrap();
+    std::fs::write(
+        top.join("pkgs/top-level/packages-config.nix"),
+        "{ allowAliases = false; }",
+    )
+    .unwrap();
+    std::fs::write(
+        top.join("default.nix"),
+        r#"{ system, config }:
+let mk = name: outputs: derivation { inherit name system outputs; builder = "/bin/sh"; args = [ "-c" "true" ]; };
+in {
+  hello = mk "hello-1.0" [ "out" ];
+  multi = mk "multi-2.0" [ "out" "dev" ];
+  nested = { recurseForDerivations = true; inner = mk "inner-3" [ "out" ]; };
+  hidden = { inner = mk "hidden" [ "out" ]; };
+  broken = throw "evaluation error";
+}"#,
+    )
+    .unwrap();
+    let opts = OutpathsOptions {
+        workers: 1,
+        max_memory_mb: 512,
+        ..Default::default()
+    };
+    let res = crate::outpaths::evaluate(&top, &opts, 0).await;
+    let entries = match res {
+        Ok(e) => e,
+        // e.g. no nix daemon/store access inside a build sandbox
+        Err(e) => {
+            eprintln!("skipping: nix-eval-jobs could not evaluate: {e:#}");
+            return;
+        }
+    };
+    let mut attrs: Vec<(&str, Vec<&str>)> = entries
+        .iter()
+        .map(|e| (e.attr.as_str(), e.outputs.keys().map(String::as_str).collect()))
+        .collect();
+    attrs.sort();
+    assert_eq!(
+        attrs,
+        vec![
+            ("hello", vec!["out"]),
+            ("multi", vec!["dev", "out"]),
+            ("nested.inner", vec!["out"])
+        ]
+    );
+    assert!(
+        entries
+            .iter()
+            .all(|e| e.drv_path.as_deref().is_some_and(|d| d.ends_with(".drv")))
+    );
+    assert!(entries.iter().all(|e| e.system == "x86_64-linux"));
+}
