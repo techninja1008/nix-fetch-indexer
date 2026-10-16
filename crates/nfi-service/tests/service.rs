@@ -213,6 +213,19 @@ async fn ingest_lookup_bulk_minimise_prune() {
         .unwrap();
     assert_eq!(n, 5 + 3);
 
+    // A release name already indexed under a different commit is rejected.
+    let mut conflicting = bundle();
+    conflicting.releases[0].commit = "c".repeat(40);
+    let r = c
+        .admin(reqwest::Method::POST, "/admin/v1/ingest")
+        .body(encode(&conflicting, Format::Json))
+        .send()
+        .await
+        .unwrap();
+    let j = c.wait_job(r.json::<JobCreated>().await.unwrap().id).await;
+    assert_eq!(j.status, JobStatus::Failed);
+    assert!(j.error.unwrap().contains("already indexed with commit"));
+
     // Search (merged packages + programs).
     if c.svc.has_search {
         let (s, r): (u16, SearchResponse) = c.get("/v1/search?q=greeting").await;

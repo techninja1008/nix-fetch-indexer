@@ -1,8 +1,9 @@
 //! Ingesting interchange bundles into Postgres.
 //!
-//! For every release in the bundle and every dataset the release carries in
-//! the bundle, the release's existing rows for that dataset are replaced, so
-//! re-ingesting is idempotent.
+//! Ingest is purely additive: entries are immutable (a store path's
+//! references never change, a release's contents never change), so every
+//! insert is `ON CONFLICT DO NOTHING` and re-ingesting is a no-op. Nothing is
+//! deleted here; removal only happens through pruning.
 
 use crate::copy::{CopyBuf, copy_in};
 use anyhow::{Context, Result};
@@ -63,20 +64,35 @@ pub async fn ingest(
     // Releases.
     let mut ids: Vec<i32> = Vec::with_capacity(bundle.releases.len());
     for r in &bundle.releases {
-        let id: i32 = sqlx::query_scalar(
+        sqlx::query(
             "INSERT INTO releases (name, commit, channel, series, url) VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (name) DO UPDATE SET commit = EXCLUDED.commit, channel = EXCLUDED.channel,
-               series = EXCLUDED.series, url = COALESCE(EXCLUDED.url, releases.url), indexed_at = now()
-             RETURNING id",
+             ON CONFLICT DO NOTHING",
         )
         .bind(&r.name)
         .bind(&r.commit)
         .bind(&r.channel)
         .bind(&r.series)
         .bind(&r.url)
-        .fetch_one(&mut *tx)
+        .execute(&mut *tx)
         .await
-        .with_context(|| format!("upserting release {}", r.name))?;
+        .with_context(|| format!("inserting release {}", r.name))?;
+        let (id, commit): (i32, String) = sqlx::query_as("SELECT id, commit FROM releases WHERE name = $1")
+            .bind(&r.name)
+            .fetch_optional(&mut *tx)
+            .await?
+            .with_context(|| {
+                format!(
+                    "release {}: commit {} already belongs to another release",
+                    r.name, r.commit
+                )
+            })?;
+        if commit != r.commit {
+            anyhow::bail!(
+                "release {} is already indexed with commit {commit}, not {}",
+                r.name,
+                r.commit
+            );
+        }
         ids.push(id);
         report.releases.push(r.name.clone());
     }
@@ -115,14 +131,6 @@ pub async fn ingest(
     if let Some(c) = &bundle.closure {
         let rel = with(Dataset::Closure);
         progress(format!("closure: {} paths", c.paths.len()));
-        sqlx::query("DELETE FROM store_path_releases WHERE release_id = ANY($1)")
-            .bind(&rel)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM missing_paths WHERE release_id = ANY($1)")
-            .bind(&rel)
-            .execute(&mut *tx)
-            .await?;
         exec(
             &mut tx,
             "CREATE TEMP TABLE t_paths (idx int, hash text, name text, nar_size bigint, file_size bigint, deriver text) ON COMMIT DROP",
@@ -184,13 +192,7 @@ pub async fn ingest(
             &mut tx,
             "INSERT INTO store_paths (hash, name, nar_size, file_size, deriver)
              SELECT hash, name, nar_size, file_size, deriver FROM t_paths
-             ON CONFLICT (hash) DO UPDATE SET
-               nar_size = COALESCE(store_paths.nar_size, EXCLUDED.nar_size),
-               file_size = COALESCE(store_paths.file_size, EXCLUDED.file_size),
-               deriver = COALESCE(store_paths.deriver, EXCLUDED.deriver)
-             WHERE (store_paths.nar_size IS NULL AND EXCLUDED.nar_size IS NOT NULL)
-                OR (store_paths.file_size IS NULL AND EXCLUDED.file_size IS NOT NULL)
-                OR (store_paths.deriver IS NULL AND EXCLUDED.deriver IS NOT NULL)",
+             ON CONFLICT DO NOTHING",
         )
         .await?;
         exec(
@@ -228,17 +230,6 @@ pub async fn ingest(
     if let Some(s) = &bundle.packages {
         let rel = with(Dataset::Packages);
         progress(format!("packages: {} entries", s.entries.len()));
-        let old: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT p.attr FROM packages p JOIN package_releases pr ON pr.package_id = p.id WHERE pr.release_id = ANY($1)",
-        )
-        .bind(&rel)
-        .fetch_all(&mut *tx)
-        .await?;
-        report.touched_attrs.extend(old);
-        sqlx::query("DELETE FROM package_releases WHERE release_id = ANY($1)")
-            .bind(&rel)
-            .execute(&mut *tx)
-            .await?;
         exec(
             &mut tx,
             "CREATE TEMP TABLE t_pkgs (key text, attr text, system text, name text, pname text, version text,
@@ -299,10 +290,6 @@ pub async fn ingest(
     if let Some(s) = &bundle.outpaths {
         let rel = with(Dataset::Outpaths);
         progress(format!("outpaths: {} entries", s.entries.len()));
-        sqlx::query("DELETE FROM package_outputs WHERE release_id = ANY($1)")
-            .bind(&rel)
-            .execute(&mut *tx)
-            .await?;
         exec(
             &mut tx,
             "CREATE TEMP TABLE t_out (release_id int, attr text, system text, output text, path text, drv_path text) ON COMMIT DROP",
@@ -328,7 +315,7 @@ pub async fn ingest(
             &mut tx,
             "INSERT INTO package_outputs (release_id, attr, system, output, path, drv_path)
              SELECT DISTINCT ON (release_id, attr, system, output) release_id, attr, system, output, path, drv_path FROM t_out
-             ON CONFLICT (release_id, attr, system, output) DO UPDATE SET path = EXCLUDED.path, drv_path = EXCLUDED.drv_path",
+             ON CONFLICT DO NOTHING",
         )
         .await?;
     }
@@ -337,16 +324,6 @@ pub async fn ingest(
     if let Some(s) = &bundle.programs {
         let rel = with(Dataset::Programs);
         progress(format!("programs: {} entries", s.entries.len()));
-        let old: Vec<String> =
-            sqlx::query_scalar("SELECT DISTINCT attr FROM programs WHERE release_id = ANY($1)")
-                .bind(&rel)
-                .fetch_all(&mut *tx)
-                .await?;
-        report.touched_attrs.extend(old);
-        sqlx::query("DELETE FROM programs WHERE release_id = ANY($1)")
-            .bind(&rel)
-            .execute(&mut *tx)
-            .await?;
         exec(
             &mut tx,
             "CREATE TEMP TABLE t_prog (release_id int, name text, system text, attr text) ON COMMIT DROP",
@@ -370,7 +347,6 @@ pub async fn ingest(
     }
 
     progress("committing".into());
-    crate::prune::gc(&mut tx).await?;
     tx.commit().await?;
     Ok(report)
 }

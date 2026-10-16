@@ -178,7 +178,7 @@ Every replica serves queries. Every replica also runs a job worker, unless `--no
 | POST | `/admin/v1/prune` | `{"releases":[], "commits":[], "channels":[]}`; garbage-collects orphaned paths and packages, then rebuilds search |
 | POST | `/admin/v1/reindex` | Rebuilds the Meilisearch index from Postgres and swaps it in |
 
-Re-ingesting a release replaces that release's rows for every dataset the bundle carries, so ingestion is idempotent.
+Ingest is purely additive: entries are immutable, so every insert is `ON CONFLICT DO NOTHING` and re-ingesting (or ingesting overlapping bundles) is a no-op for data already present. Nothing is deleted on ingest; rows are only removed by `prune`, which also garbage-collects orphaned store paths and packages. A bundle whose release name is already indexed with a different commit is rejected.
 
 ## CLIs
 

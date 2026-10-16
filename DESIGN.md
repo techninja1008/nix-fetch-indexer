@@ -140,7 +140,7 @@ jobs(id, kind, status, params jsonb, staged_blob oid/bytea, progress, error, cre
 - Admin ingest and prune requests enqueue a job.
 - Any replica's worker claims jobs with `SELECT … FOR UPDATE SKIP LOCKED`.
 - Uploaded bundles are staged in Postgres before processing.
-- Ingest is an idempotent upsert.
+- Ingest is purely additive (`ON CONFLICT DO NOTHING`): entries are immutable, so re-ingesting is a no-op and nothing is deleted or garbage-collected on ingest. A release name already indexed with a different commit is rejected.
 - Prune removes release associations, then garbage-collects store paths, packages and programs that no remaining release references.
 - Search documents are updated after each Postgres commit.
 
