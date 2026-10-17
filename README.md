@@ -59,7 +59,7 @@ nfi-indexer closure --release-url $R2 --seed closure.nfib -o closure-2.nfib
 - `--cache-url`: the binary cache to query (default `https://cache.nixos.org`).
 - `--sample N`: index only the first N roots, for testing.
 - `--format json`: write the JSON form.
-- `--compression {none,zstd,xz,brotli}[:level]`: compression for the binary form (default `zstd:19`).
+- `--compression {none,zstd,xz,brotli}[:level]`: compression for the binary form (default `zstd:9`).
 
 **Bundle tools**
 
@@ -88,26 +88,25 @@ These figures come from `bench-compression` on a full `nixos-25.05` closure bund
 |---|---:|---:|---:|
 | none | 66,100,519 | 0.18 s | 0.54 s |
 | zstd:3 | 29,035,513 | 0.25 s | 0.47 s |
-| zstd:9 | 26,022,350 | 0.47 s | 0.59 s |
+| **zstd:9** (default) | 26,022,350 | 0.47 s | 0.59 s |
 | zstd:15 | 24,808,926 | 3.7 s | 0.65 s |
-| **zstd:19** (default) | 21,650,286 | 14.7 s | 1.05 s |
+| zstd:19 | 21,650,286 | 14.7 s | 1.05 s |
 | xz:6 | 22,709,338 | 30.8 s | 2.38 s |
 | brotli:9 | 23,550,686 | 32.7 s | 1.14 s |
 
-**Default: zstd:19**
+**Default: zstd:9**
 
-- It produces the smallest file of the algorithms tested.
+- It encodes about 30× faster than zstd:19: about 0.5 s for a release, and seconds rather than minutes for a whole channel.
 - It decodes quickly, and decoding happens on every ingest.
+- Its files are about 20% larger than zstd:19, which gives the smallest files of the algorithms tested. Use `--compression zstd:19` when bundle size matters more than write time.
 - Multithreaded zstd uses 4 MiB jobs, so all cores are busy, and long-distance matching is on.
-
-For quick iteration, `--compression zstd:9` encodes about 30× faster and produces a file about 20% larger.
 
 **Layout:** in the binary form, entries are written as positional CBOR arrays rather than maps with field names, which keeps the encoded closure at 66 MB rather than 84 MB. The JSON form keeps named fields.
 
-**Indexing time:** a full `nixos-25.05` closure (320k narinfos) indexes and writes in about 55 s with the defaults:
+**Indexing time:** a full `nixos-25.05` closure (320k narinfos) indexes and writes in about 40 s with the defaults:
 
 - about 35 s fetching at roughly 9–10k narinfos/s
-- about 15 s writing at zstd:19
+- under 1 s writing at zstd:9 (about 15 s at zstd:19)
 
 ## Query service
 

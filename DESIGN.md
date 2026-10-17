@@ -84,7 +84,7 @@ ProgramsSection { entries: [Program { name, system, attr, releases: Bitset }] }
   - Layout: magic `NFIB`, a one-byte container version (2), a one-byte compression id, then the compressed CBOR body.
   - Compression ids: `0` none, `1` zstd, `2` xz, `3` brotli.
   - Benchmark (`nfi-indexer bench-compression`): per algorithm, compressed size and encode/decode time.
-  - Default: **zstd level 19** for indexer output.
+  - Default: **zstd level 9** for indexer output (fast to write, quick to decode); `zstd:19` gives about 17% smaller files for slower writes.
 - **JSON form:** the same data model.
   - Structurally identical, with bitsets as hex strings and references as index arrays.
   - It is detected by a leading `{`.
