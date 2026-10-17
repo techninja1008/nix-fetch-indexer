@@ -82,19 +82,18 @@ fn is_stdenv_drv(drv: &str) -> bool {
 /// stdenv almost always means the graph was evaluated from a nixpkgs
 /// revision that is not indexed (or with overlays/config that change stdenv).
 pub fn anchor_warnings(graph: &ReducedGraph, is_cached: impl Fn(&str) -> bool) -> Vec<crate::Warning> {
-    let stdenvs: Vec<(&String, bool)> = graph
+    // Every uncached final stdenv is reported: graphs can legitimately mix
+    // several nixpkgs instances, and each unindexed one deserves a warning.
+    let uncached: Vec<String> = graph
         .derivations
         .iter()
         .filter(|(drv, _)| is_stdenv_drv(drv))
-        .map(|(drv, d)| (drv, d.outputs.values().flatten().any(|p| is_cached(p))))
+        .filter(|(_, d)| !d.outputs.values().flatten().any(|p| is_cached(p)))
+        .map(|(drv, _)| drv.clone())
         .collect();
-    // Graphs usually contain more than one final stdenv (e.g. stdenvNoCC).
-    // Only warn when none of them is cached: an unindexed revision makes all
-    // of them uncached, while a single unusual variant should not.
-    if stdenvs.is_empty() || stdenvs.iter().any(|(_, cached)| *cached) {
+    if uncached.is_empty() {
         return Vec::new();
     }
-    let uncached: Vec<String> = stdenvs.into_iter().map(|(drv, _)| drv.clone()).collect();
     vec![crate::Warning {
         code: UNINDEXED_NIXPKGS.into(),
         message: format!(
@@ -310,12 +309,16 @@ mod tests {
         assert_eq!(w[0].code, UNINDEXED_NIXPKGS);
         assert_eq!(w[0].paths, vec![stdenv.to_string()]);
         assert!(w[0].message.contains("stdenv-linux.drv"));
-        // Several final stdenvs: one cached is enough to stay quiet.
+        // Several final stdenvs (e.g. two nixpkgs instances): any uncached one
+        // warns, and only the uncached ones are named.
         let other = "/nix/store/cccccccccccccccccccccccccccccccc-stdenv-linux.drv";
         g.derivations
             .insert(other.into(), drv(&[("out", Some("other-out"))], &[], &[]));
-        assert!(anchor_warnings(&g, |p| p == "other-out").is_empty());
+        let w = anchor_warnings(&g, |p| p == "other-out");
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].paths, vec![stdenv.to_string()]);
         assert_eq!(anchor_warnings(&g, |_| false)[0].paths.len(), 2);
+        assert!(anchor_warnings(&g, |p| p == "other-out" || p == "stdenv-out").is_empty());
         // No stdenv in the graph: nothing to say.
         assert!(anchor_warnings(&graph(), |_| false).is_empty());
     }

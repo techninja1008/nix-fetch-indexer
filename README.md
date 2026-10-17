@@ -197,7 +197,7 @@ nfi-service --embedded-postgres /var/lib/nfi/pg --embedded-meilisearch /var/lib/
 - `closure`: the full runtime closure of the hits.
 - `unresolved`: input derivations missing from the graph.
 - `warnings`: problems for the client to show. Each has a `code`, a `message` and the `paths` it concerns.
-  - `unindexed_nixpkgs` is raised when the graph contains the final `stdenv-linux`/`stdenv-darwin` derivation(s) and none of their outputs is indexed.
+  - `unindexed_nixpkgs` is raised for every final `stdenv-linux`/`stdenv-darwin` derivation in the graph whose output isn't indexed. Graphs can mix several nixpkgs instances, and each unindexed one is reported.
   - Hydra builds stdenv for every release, so this almost always means the graph was evaluated from a nixpkgs revision that isn't indexed, or with overlays/config that change stdenv.
   - `nfi minimise` prints warnings to stderr.
 
