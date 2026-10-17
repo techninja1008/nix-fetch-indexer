@@ -185,6 +185,20 @@ pub struct MinimiseResponse {
     pub unresolved: Vec<String>,
     pub nar_size: u64,
     pub file_size: u64,
+    /// Problems the client should surface to the user.
+    #[serde(default)]
+    pub warnings: Vec<Warning>,
+}
+
+/// A machine-readable warning with a human-readable message.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Warning {
+    /// Stable identifier, e.g. `unindexed_nixpkgs`.
+    pub code: String,
+    pub message: String,
+    /// Store or derivation paths the warning is about.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
 }
 
 // ---------- admin ----------

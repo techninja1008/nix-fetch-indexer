@@ -317,6 +317,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             for u in &r.unresolved {
                 eprintln!("warning: input derivation not in graph: {u}");
             }
+            for w in &r.warnings {
+                eprintln!("warning: {}", w.message);
+            }
             eprintln!(
                 "{} requested, {} to build; {} root paths, {} in closure ({} download, {} unpacked)",
                 r.requested.len(),
