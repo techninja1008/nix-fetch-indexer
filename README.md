@@ -169,6 +169,18 @@ nfi-service --embedded-postgres /var/lib/nfi/pg --embedded-meilisearch /var/lib/
 - Embedded PostgreSQL implies a single replica, so `--no-worker` is not allowed with it.
 - The cargo features `embedded-postgres` and `embedded-meilisearch` are on by default.
 
+**Ingest performance**
+
+The figures below were measured with embedded PostgreSQL 16 on 4 cores.
+
+| workload | time |
+|---|---|
+| One full release (320k paths, 6.1M references) into an empty database | ~18 s |
+| The same release again (nothing new) | ~7.5 s |
+| All 87 `nixos-26.05` releases in one bundle (2.7M paths, 22.5M memberships, 38M references) | ~3.2 min |
+| An extra release into that database (315k new paths) | ~24 s |
+| Pruning one release, or a whole channel, from it | ~20 s |
+
 ### Public API
 
 | method | path | description |

@@ -90,36 +90,38 @@ pub async fn closure(
     if hashes.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
-    let rows: Vec<(i64, String, String, Option<i64>, Option<i64>)> = sqlx::query_as(
+    let rows: Vec<(i64, String, String, Option<i64>, Option<i64>, Vec<i64>)> = sqlx::query_as(
         "WITH RECURSIVE c(id) AS (
              SELECT id FROM store_paths WHERE hash = ANY($1)
              UNION
-             SELECT r.ref_id FROM store_path_refs r JOIN c ON r.path_id = c.id
+             SELECT unnest(s.refs) FROM store_paths s JOIN c ON s.id = c.id
          )
-         SELECT s.id, s.hash, s.name, s.nar_size, s.file_size FROM c JOIN store_paths s ON s.id = c.id ORDER BY s.hash",
+         SELECT s.id, s.hash, s.name, s.nar_size, s.file_size, s.refs
+           FROM c JOIN store_paths s ON s.id = c.id ORDER BY s.hash",
     )
     .bind(&hashes)
     .fetch_all(pool)
     .await?;
-    let ids: Vec<i64> = rows.iter().map(|r| r.0).collect();
-    let nodes: Vec<ClosureNode> = rows
+    let by_id: HashMap<i64, String> = rows
+        .iter()
+        .map(|(id, hash, name, ..)| (*id, format!("/nix/store/{hash}-{name}")))
+        .collect();
+    let mut edges = Vec::new();
+    for (id, _, _, _, _, refs) in &rows {
+        for r in refs {
+            if let (Some(a), Some(b)) = (by_id.get(id), by_id.get(r)) {
+                edges.push((a.clone(), b.clone()));
+            }
+        }
+    }
+    let nodes = rows
         .into_iter()
-        .map(|(id, hash, name, nar, file)| ClosureNode {
+        .map(|(id, _, _, nar, file, _)| ClosureNode {
             id,
-            path: format!("/nix/store/{hash}-{name}"),
+            path: by_id[&id].clone(),
             nar_size: nar,
             file_size: file,
         })
-        .collect();
-    let by_id: HashMap<i64, &str> = nodes.iter().map(|n| (n.id, n.path.as_str())).collect();
-    let edge_rows: Vec<(i64, i64)> =
-        sqlx::query_as("SELECT path_id, ref_id FROM store_path_refs WHERE path_id = ANY($1)")
-            .bind(&ids)
-            .fetch_all(pool)
-            .await?;
-    let edges = edge_rows
-        .into_iter()
-        .filter_map(|(a, b)| Some((by_id.get(&a)?.to_string(), by_id.get(&b)?.to_string())))
         .collect();
     Ok((nodes, edges))
 }

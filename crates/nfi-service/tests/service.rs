@@ -232,7 +232,7 @@ async fn ingest_lookup_bulk_minimise_prune() {
 
     // Re-ingesting (as JSON this time) is idempotent.
     c.ingest_bytes(encode(&bundle(), Format::Json)).await;
-    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM store_path_releases")
+    let n: i64 = sqlx::query_scalar("SELECT sum(cardinality(releases))::bigint FROM store_paths")
         .fetch_one(&c.svc.state.pool)
         .await
         .unwrap();
