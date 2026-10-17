@@ -202,6 +202,31 @@ async fn ingest_lookup_bulk_minimise_prune() {
         .post("/v1/minimise", &serde_json::to_value(&reduced).unwrap())
         .await;
     assert_eq!(m2.closure, m.closure);
+    assert!(m.warnings.is_empty(), "{:?}", m.warnings);
+
+    // stdenv anchor: an uncached stdenv means an unindexed nixpkgs revision.
+    let stdenv_graph = |out: String| {
+        json!({"version": 4, "derivations": {
+            drv(9, "stdenv-linux"): {"outputs": {"out": {"path": out}}, "inputs": {"drvs": {}, "srcs": []}},
+            drv(1, "app"): {"outputs": {"out": {"path": format!("{}-app", h(50))}},
+                "inputs": {"drvs": {drv(9, "stdenv-linux"): {"outputs": ["out"], "dynamicOutputs": {}}}, "srcs": []}},
+        }})
+    };
+    let (_, m): (u16, MinimiseResponse) = c
+        .post("/v1/minimise", &stdenv_graph(format!("{}-stdenv-linux", h(77))))
+        .await;
+    assert_eq!(m.warnings.len(), 1, "{:?}", m.warnings);
+    assert_eq!(m.warnings[0].code, "unindexed_nixpkgs");
+    assert_eq!(
+        m.warnings[0].paths,
+        vec![format!("/nix/store/{}", drv(9, "stdenv-linux"))]
+    );
+    // A cached stdenv output (reusing an indexed path) raises no warning.
+    let (_, m): (u16, MinimiseResponse) = c
+        .post("/v1/minimise", &stdenv_graph(format!("{}-glibc-2.40", h(1))))
+        .await;
+    assert!(m.warnings.is_empty(), "{:?}", m.warnings);
+
     let (s, _): (u16, Value) = c.post("/v1/minimise", &json!({"nope": 1})).await;
     assert_eq!(s, 400);
 

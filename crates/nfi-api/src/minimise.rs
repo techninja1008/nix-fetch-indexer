@@ -68,6 +68,48 @@ pub fn plan(graph: &ReducedGraph, is_cached: impl Fn(&str) -> bool) -> Plan {
     plan
 }
 
+pub const UNINDEXED_NIXPKGS: &str = "unindexed_nixpkgs";
+
+/// Whether a derivation path is a final standard environment
+/// (`<hash>-stdenv-linux.drv` / `<hash>-stdenv-darwin.drv`, not a bootstrap stage).
+fn is_stdenv_drv(drv: &str) -> bool {
+    let base = drv.rsplit('/').next().unwrap_or(drv);
+    let name = base.get(33..).unwrap_or("");
+    matches!(name, "stdenv-linux.drv" | "stdenv-darwin.drv")
+}
+
+/// Anchor check: Hydra builds stdenv for every release, so an uncached
+/// stdenv almost always means the graph was evaluated from a nixpkgs
+/// revision that is not indexed (or with overlays/config that change stdenv).
+pub fn anchor_warnings(graph: &ReducedGraph, is_cached: impl Fn(&str) -> bool) -> Vec<crate::Warning> {
+    // Every uncached final stdenv is reported: graphs can legitimately mix
+    // several nixpkgs instances, and each unindexed one deserves a warning.
+    let uncached: Vec<String> = graph
+        .derivations
+        .iter()
+        .filter(|(drv, _)| is_stdenv_drv(drv))
+        .filter(|(_, d)| !d.outputs.values().flatten().any(|p| is_cached(p)))
+        .map(|(drv, _)| drv.clone())
+        .collect();
+    if uncached.is_empty() {
+        return Vec::new();
+    }
+    vec![crate::Warning {
+        code: UNINDEXED_NIXPKGS.into(),
+        message: format!(
+            "the standard environment ({}) is not in the index: this graph was most likely evaluated from a \
+             nixpkgs revision that is not indexed (or with overlays/config that change stdenv), so far more \
+             will need to be built than with an indexed release",
+            uncached
+                .iter()
+                .map(|d| d.rsplit('/').next().unwrap_or(d))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        paths: uncached,
+    }]
+}
+
 /// Dependants-first order of every derivation reachable from `roots`
 /// (reverse DFS post-order). Missing derivations are included as leaves.
 fn topo_order<'a>(graph: &'a ReducedGraph, roots: &'a [String]) -> Vec<&'a str> {
@@ -248,6 +290,37 @@ mod tests {
         let p = plan(&graph(), |_| true);
         assert!(p.to_build.is_empty());
         assert_eq!(p.hits.into_iter().collect::<Vec<_>>(), vec!["app"]);
+    }
+
+    #[test]
+    fn stdenv_anchor() {
+        let mut g = graph();
+        let stdenv = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-stdenv-linux.drv";
+        let stage = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-bootstrap-stage1-stdenv-linux.drv";
+        g.derivations
+            .insert(stdenv.into(), drv(&[("out", Some("stdenv-out"))], &[], &[]));
+        g.derivations
+            .insert(stage.into(), drv(&[("out", Some("stage-out"))], &[], &[]));
+        // Cached stdenv (bootstrap stages are never cached and are ignored): no warning.
+        assert!(anchor_warnings(&g, |p| p == "stdenv-out").is_empty());
+        // Uncached stdenv: one warning naming it.
+        let w = anchor_warnings(&g, |_| false);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].code, UNINDEXED_NIXPKGS);
+        assert_eq!(w[0].paths, vec![stdenv.to_string()]);
+        assert!(w[0].message.contains("stdenv-linux.drv"));
+        // Several final stdenvs (e.g. two nixpkgs instances): any uncached one
+        // warns, and only the uncached ones are named.
+        let other = "/nix/store/cccccccccccccccccccccccccccccccc-stdenv-linux.drv";
+        g.derivations
+            .insert(other.into(), drv(&[("out", Some("other-out"))], &[], &[]));
+        let w = anchor_warnings(&g, |p| p == "other-out");
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].paths, vec![stdenv.to_string()]);
+        assert_eq!(anchor_warnings(&g, |_| false)[0].paths.len(), 2);
+        assert!(anchor_warnings(&g, |p| p == "other-out" || p == "stdenv-out").is_empty());
+        // No stdenv in the graph: nothing to say.
+        assert!(anchor_warnings(&graph(), |_| false).is_empty());
     }
 
     #[test]

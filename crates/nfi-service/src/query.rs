@@ -136,6 +136,7 @@ fn sizes(nodes: &[ClosureNode]) -> (u64, u64) {
 pub async fn minimise(pool: &PgPool, graph: &ReducedGraph) -> Result<MinimiseResponse> {
     let cached = cached_paths(pool, &graph.all_paths()).await?;
     let plan = nfi_api::minimise::plan(graph, |p| cached.contains(p));
+    let warnings = nfi_api::minimise::anchor_warnings(graph, |p| cached.contains(p));
     let (nodes, edges) = closure(pool, &plan.hits).await?;
     let roots = nfi_api::minimise::roots(&plan.hits, &edges);
     let (nar_size, file_size) = sizes(&nodes);
@@ -147,6 +148,7 @@ pub async fn minimise(pool: &PgPool, graph: &ReducedGraph) -> Result<MinimiseRes
         unresolved: plan.unresolved,
         nar_size,
         file_size,
+        warnings,
     })
 }
 

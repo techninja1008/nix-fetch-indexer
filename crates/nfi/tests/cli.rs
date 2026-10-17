@@ -160,6 +160,25 @@ async fn query_cli() {
     assert_eq!(o.code, 0, "{}", o.stderr);
     assert_eq!(std::fs::read_to_string(&roots_file).unwrap().lines().count(), 2);
 
+    // An uncached stdenv in the graph produces an unindexed-nixpkgs warning on stderr.
+    let stdenv_file = d.join("stdenv-graph.json");
+    let sdrv = format!("/nix/store/{}-stdenv-linux.drv", h(150));
+    std::fs::write(
+        &stdenv_file,
+        json!({ sdrv.clone(): {"outputs": {"out": {"path": format!("/nix/store/{}-stdenv-linux", h(151))}}, "inputDrvs": {}, "inputSrcs": []} }).to_string(),
+    )
+    .unwrap();
+    let o = run(&["minimise", "-f", stdenv_file.to_str().unwrap()]);
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(
+        o.stderr.contains("warning: the standard environment"),
+        "{}",
+        o.stderr
+    );
+    assert!(o.stderr.contains("not indexed"), "{}", o.stderr);
+    let o = run(&["minimise", "-f", gfile.to_str().unwrap()]);
+    assert!(!o.stderr.contains("standard environment"), "{}", o.stderr);
+
     // minimise with installables resolved through a (fake) nix command.
     let fake = d.join("fake-nix");
     let args_log = d.join("nix-args");
