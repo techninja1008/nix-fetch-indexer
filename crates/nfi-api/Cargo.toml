@@ -1,0 +1,20 @@
+[package]
+name = "nfi-api"
+description = "Shared API types and algorithms for nix-fetch-indexer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nfi-interchange.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+reqwest = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+
+[features]
+client = ["dep:reqwest", "dep:futures", "dep:tokio", "dep:tokio-util"]

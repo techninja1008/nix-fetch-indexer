@@ -1,0 +1,16 @@
+[package]
+name = "nfi-testenv"
+description = "Ephemeral Postgres/Meilisearch/service instances for tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+nfi-service = { path = "../nfi-service" }
+anyhow.workspace = true
+tokio.workspace = true
+sqlx.workspace = true
+reqwest.workspace = true
+tempfile.workspace = true
+nfi-interchange.workspace = true

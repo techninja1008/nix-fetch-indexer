@@ -1,0 +1,47 @@
+[package]
+name = "nfi-service"
+description = "Query service for nix-fetch-indexer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "nfi-service"
+path = "src/main.rs"
+
+[dependencies]
+nfi-interchange.workspace = true
+nfi-api.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+reqwest.workspace = true
+futures.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+sqlx.workspace = true
+chrono.workspace = true
+bytes.workspace = true
+hex.workspace = true
+sha2 = "0.10"
+nfi-embedded-postgres = { path = "../nfi-embedded-postgres", optional = true }
+nfi-embedded-meilisearch = { path = "../nfi-embedded-meilisearch", optional = true }
+
+[features]
+default = ["embedded-postgres", "embedded-meilisearch"]
+# `--embedded-postgres`: run a private PostgreSQL as a child process.
+embedded-postgres = ["dep:nfi-embedded-postgres"]
+# `--embedded-meilisearch`: run a private Meilisearch as a child process.
+embedded-meilisearch = ["dep:nfi-embedded-meilisearch"]
+
+[dev-dependencies]
+tempfile.workspace = true
+nfi-testenv = { path = "../nfi-testenv" }
