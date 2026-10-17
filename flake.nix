@@ -48,6 +48,13 @@
             postInstall = ''
               wrapProgram $out/bin/nfi-indexer --suffix PATH : ${lib.makeBinPath [ pkgs.nix-eval-jobs ]}
               wrapProgram $out/bin/nfi --suffix PATH : ${lib.makeBinPath [ pkgs.nix ]}
+              # For --embedded-postgres / --embedded-meilisearch (single-node mode).
+              wrapProgram $out/bin/nfi-service --suffix PATH : ${
+                lib.makeBinPath [
+                  pkgs.postgresql
+                  pkgs.meilisearch
+                ]
+              }
               rm -f $out/bin/nfi-testenv
             '';
 

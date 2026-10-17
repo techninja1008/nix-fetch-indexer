@@ -61,7 +61,8 @@ fn watchdog(pid: u32, signal: &str) {
         .spawn();
 }
 
-fn pg_bindir() -> Option<PathBuf> {
+/// Directory with the PostgreSQL server binaries used by tests.
+pub fn pg_bindir() -> Option<PathBuf> {
     if let Ok(d) = std::env::var("NFI_TEST_PG_BINDIR") {
         return Some(d.into());
     }
@@ -92,7 +93,8 @@ fn which(name: &str) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-fn is_root() -> bool {
+/// Whether the tests run as root (PostgreSQL refuses to).
+pub fn is_root() -> bool {
     Command::new("id")
         .arg("-u")
         .output()
@@ -191,11 +193,16 @@ fn start_postgres(dir: &Path) -> Result<String> {
     Ok(format!("postgres://nfi@127.0.0.1:{port}/postgres"))
 }
 
-fn start_meili(dir: &Path) -> Result<String> {
-    let bin = std::env::var("NFI_TEST_MEILI_BIN")
+/// The meilisearch binary used by tests.
+pub fn meili_bin() -> Option<PathBuf> {
+    std::env::var("NFI_TEST_MEILI_BIN")
         .map(PathBuf::from)
         .ok()
-        .or_else(|| which("meilisearch"));
+        .or_else(|| which("meilisearch"))
+}
+
+fn start_meili(dir: &Path) -> Result<String> {
+    let bin = meili_bin();
     let bin = bin.context("meilisearch binary not found")?;
     let port = free_port();
     let child = Command::new(bin)

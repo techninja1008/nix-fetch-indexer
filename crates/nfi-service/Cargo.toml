@@ -32,6 +32,15 @@ chrono.workspace = true
 bytes.workspace = true
 hex.workspace = true
 sha2 = "0.10"
+nfi-embedded-postgres = { path = "../nfi-embedded-postgres", optional = true }
+nfi-embedded-meilisearch = { path = "../nfi-embedded-meilisearch", optional = true }
+
+[features]
+default = ["embedded-postgres", "embedded-meilisearch"]
+# `--embedded-postgres`: run a private PostgreSQL as a child process.
+embedded-postgres = ["dep:nfi-embedded-postgres"]
+# `--embedded-meilisearch`: run a private Meilisearch as a child process.
+embedded-meilisearch = ["dep:nfi-embedded-meilisearch"]
 
 [dev-dependencies]
 tempfile.workspace = true

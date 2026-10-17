@@ -21,6 +21,7 @@ Supporting libraries:
 
 - `nfi-interchange`: the bundle format.
 - `nfi-api`: shared API types, the derivation-graph reducer, the minimise planner and an HTTP client.
+- `nfi-embedded-postgres`, `nfi-embedded-meilisearch`: supervised child-process PostgreSQL and Meilisearch for single-node mode.
 - `nfi-testenv`: ephemeral Postgres and Meilisearch for tests.
 
 ## Building
@@ -139,6 +140,40 @@ Every replica serves queries. Every replica also runs a job worker, unless `--no
 - Jobs (ingest, prune, reindex) live in a Postgres table. Any replica can claim them with `SKIP LOCKED`, and a stale heartbeat makes a job reclaimable.
 - Uploads are staged in Postgres, so it does not matter which replica receives them.
 - Writers are serialised with an advisory lock.
+
+### Single-node mode (embedded PostgreSQL and Meilisearch)
+
+For a simple single node, the service can run its own PostgreSQL and Meilisearch as supervised child processes. This is implemented in the `nfi-embedded-postgres` and `nfi-embedded-meilisearch` crates.
+
+```sh
+nfi-service --embedded-postgres /var/lib/nfi/pg --embedded-meilisearch /var/lib/nfi/meili
+```
+
+**PostgreSQL**
+
+- The cluster lives in `<dir>/pgdata`. It is created with `initdb` on first start.
+- The server listens only on a Unix socket in `<dir>`; there is no TCP listener.
+- PostgreSQL refuses to run as root, so the service must run as an unprivileged user.
+- Binaries are found from `--pg-bindir`, then `pg_config`, then the `PATH`. The Nix package puts `postgresql` on its `PATH`.
+- A cluster created by another PostgreSQL major version is refused. Upgrade it with `pg_upgrade`, or delete it and re-ingest the bundles.
+- A second service on the same directory is refused.
+
+**Meilisearch**
+
+- The database lives in `<dir>/data.ms`.
+- The server listens on a random loopback port, with a random master key generated on each start.
+- Search data is derived from PostgreSQL. When the database is new, or was written by a different Meilisearch version, it is discarded and a `reindex` job is queued automatically.
+
+**Shutdown**
+
+- On SIGINT or SIGTERM, the service stops serving, then stops Meilisearch, then PostgreSQL.
+- On Linux the children are also signalled if the service dies.
+
+**Combining modes**
+
+- Either backend can be used on its own, alongside an external instance of the other (e.g. `--embedded-postgres` with `--meili-url`).
+- Embedded PostgreSQL implies a single replica, so `--no-worker` is not allowed with it.
+- The cargo features `embedded-postgres` and `embedded-meilisearch` are on by default.
 
 ### Public API
 

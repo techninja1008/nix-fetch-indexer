@@ -14,6 +14,8 @@ A single Cargo workspace:
 | `nfi-service` | bin | Query service (axum HTTP/JSON, Postgres, Meilisearch) |
 | `nfi` | bin | Query CLI (non-administrative endpoints, fetch hook, flake-ref resolution) |
 | `nfi-admin` | bin | Admin CLI (ingest, list releases, prune, reindex, job status) |
+| `nfi-embedded-postgres` | lib | Supervised child-process PostgreSQL for single-node mode (`--embedded-postgres`) |
+| `nfi-embedded-meilisearch` | lib | Supervised child-process Meilisearch for single-node mode (`--embedded-meilisearch`) |
 | `nfi-api` | lib | Shared request/response types for the service and CLIs |
 
 Packaging uses Nix flake packages for all binaries, plus a dev shell.
@@ -118,6 +120,27 @@ ProgramsSection { entries: [Program { name, system, attr, releases: Bitset }] }
 - **Store:** Postgres is the source of truth. Caching may be added later.
 - **Search:** Meilisearch.
 - **Listeners:** a public listener for queries, and a separate admin listener. The admin listener accepts an optional static bearer token (`NFI_ADMIN_TOKEN`).
+
+### Single-node mode
+
+`--embedded-postgres <dir>` and `--embedded-meilisearch <dir>` run private servers as child processes of the service, for running a single node without external infrastructure.
+
+**PostgreSQL**
+
+- Listens on a Unix socket only.
+- Must not run as root.
+- Refuses a cluster created by another major version.
+- Refuses to start if another server already holds the data directory.
+
+**Meilisearch**
+
+- Listens on loopback only, with a random master key.
+- Its data is derived from PostgreSQL. A new database, or one written by another version, is discarded and rebuilt through a `reindex` job.
+
+**Lifecycle**
+
+- Children are started from the main thread and stopped on shutdown.
+- On Linux, `PR_SET_PDEATHSIG` also signals them if the service dies.
 
 ### Postgres schema (sketch)
 

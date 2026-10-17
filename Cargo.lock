@@ -1416,6 +1416,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "nfi-embedded-meilisearch"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "nfi-embedded-postgres"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "nfi-indexer"
 version = "0.1.0"
 dependencies = [
@@ -1467,6 +1487,8 @@ dependencies = [
  "futures",
  "hex",
  "nfi-api",
+ "nfi-embedded-meilisearch",
+ "nfi-embedded-postgres",
  "nfi-interchange",
  "nfi-testenv",
  "reqwest",

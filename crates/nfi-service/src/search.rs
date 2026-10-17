@@ -80,6 +80,15 @@ impl Meili {
         }
     }
 
+    async fn index_exists(&self, uid: &str) -> Result<bool> {
+        Ok(self
+            .req(reqwest::Method::GET, &format!("/indexes/{uid}"))
+            .send()
+            .await?
+            .status()
+            .is_success())
+    }
+
     async fn ensure_index_named(&self, uid: &str) -> Result<()> {
         let exists = self
             .req(reqwest::Method::GET, &format!("/indexes/{uid}"))
@@ -203,11 +212,12 @@ impl Meili {
     pub async fn reindex(&self, pool: &PgPool) -> Result<usize> {
         self.ensure_index().await?;
         let tmp = format!("{}_rebuild", self.index);
-        let t = self
-            .send(self.req(reqwest::Method::DELETE, &format!("/indexes/{tmp}")))
-            .await;
-        if let Ok(t) = t {
-            self.wait(&t).await.ok();
+        // Drop a leftover scratch index from an interrupted rebuild.
+        if self.index_exists(&tmp).await? {
+            let t = self
+                .send(self.req(reqwest::Method::DELETE, &format!("/indexes/{tmp}")))
+                .await?;
+            self.wait(&t).await?;
         }
         self.ensure_index_named(&tmp).await?;
         let docs = build_docs(pool, None).await?;
