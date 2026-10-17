@@ -80,7 +80,8 @@ ProgramsSection { entries: [Program { name, system, attr, releases: Bitset }] }
 - **References** are indices into `paths`, which keeps the binary form compact. Paths outside the indexed set do not exist, because the closure is followed transitively.
 - **Bitsets** are encoded as little-endian byte strings.
 - **Binary form:**
-  - Layout: magic `NFIB`, a one-byte version, a one-byte compression id, then the compressed CBOR body.
+  - Entries (closure paths, missing paths, packages, outpaths, programs) are positional CBOR arrays instead of maps, keeping field names out of every entry. The JSON form uses named fields.
+  - Layout: magic `NFIB`, a one-byte container version (2), a one-byte compression id, then the compressed CBOR body.
   - Compression ids: `0` none, `1` zstd, `2` xz, `3` brotli.
   - Benchmark (`nfi-indexer bench-compression`): per algorithm, compressed size and encode/decode time.
   - Default: **zstd level 19** for indexer output.
@@ -99,7 +100,7 @@ ProgramsSection { entries: [Program { name, system, attr, releases: Bitset }] }
 - **Input:** each indexer takes either `--release-url <full URL>` or `--channel-list <prefix>`. The second option enumerates every release under a prefix via the S3 listing API, with optional `--limit` and `--since`.
 - **Output:** a bundle written with `-o <file>` and `--format binary|json`.
 - **`closure`**
-  - Fetch `store-paths.xz`, then mass-query narinfos over HTTP/2 with bounded concurrency (default 64).
+  - Fetch `store-paths.xz`, then mass-query narinfos over HTTP/2 with bounded concurrency (default 512), spread over several independent connections (`--connections`, default 8), because the cache caps concurrent streams per connection.
   - Retries back off on 429/5xx.
   - The indexer follows references transitively.
   - Paths that return 404 are recorded in `missing`.

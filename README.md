@@ -54,7 +54,8 @@ nfi-indexer closure --release-url $R2 --seed closure.nfib -o closure-2.nfib
 
 **Indexer options**
 
-- `--concurrency`: number of concurrent narinfo requests (default 64).
+- `--concurrency`: number of concurrent narinfo requests (default 512).
+- `--connections`: number of independent HTTP/2 connections the requests are spread over (default 8). cache.nixos.org caps concurrent streams per connection at about 100, so throughput scales with this setting. In testing, 8×512 reached about 10k narinfos/s and 16×1024 about 14–20k/s. These limits apply to a shared public cache, so raise them with care.
 - `--cache-url`: the binary cache to query (default `https://cache.nixos.org`).
 - `--sample N`: index only the first N roots, for testing.
 - `--format json`: write the JSON form.
@@ -76,44 +77,37 @@ nfi-indexer bench-compression ab.nfib
 A bundle holds a table of releases plus up to four sections: `closure`, `packages`, `outpaths` and `programs`.
 
 - **Release membership:** each entry has a bitset over the release table. One file can therefore hold many releases and still be split or filtered per release.
-- **Binary form:** `NFIB`, a container version byte, a compression byte, then compressed CBOR. In this form store hashes are 20 raw bytes and bitsets are byte strings.
+- **Binary form:** `NFIB`, a container version byte (currently 2), a compression byte, then compressed CBOR. In this form entries are positional arrays, store hashes are 20 raw bytes and bitsets are byte strings.
 - **JSON form:** the same data model, with nix-base32 hashes and hex bitsets. The JSON form is detected by its leading `{`.
 
 ### Compression benchmark
 
-These figures come from `bench-compression` on a real `nixos-25.05` bundle, run with a release build on 4 cores.
-
-The bundle contains:
-
-- a 20,803-path closure sample
-- 129,498 packages
-- 152,764 programs
+These figures come from `bench-compression` on a full `nixos-25.05` closure bundle (320,419 paths, 6.1M reference edges), run with a release build on 4 cores.
 
 | algorithm | bytes | encode | decode |
 |---|---:|---:|---:|
-| none | 47,489,350 | 0.07 s | 0.84 s |
-| zstd:3 | 8,489,081 | 0.35 s | 0.54 s |
-| zstd:9 | 7,243,393 | 0.58 s | 0.59 s |
-| **zstd:19** (default) | 6,121,250 | 29.7 s | 0.90 s |
-| xz:6 | 5,964,526 | 20.9 s | 0.95 s |
-| xz:9 | 5,884,070 | 25.0 s | 1.10 s |
-| brotli:9 | 6,620,546 | 5.8 s | 0.53 s |
-| brotli:11 | 5,835,451 | 95.8 s | 0.48 s |
-
-The same bundle is 56.8 MB as JSON.
+| none | 66,100,519 | 0.18 s | 0.54 s |
+| zstd:3 | 29,035,513 | 0.25 s | 0.47 s |
+| zstd:9 | 26,022,350 | 0.47 s | 0.59 s |
+| zstd:15 | 24,808,926 | 3.7 s | 0.65 s |
+| **zstd:19** (default) | 21,650,286 | 14.7 s | 1.05 s |
+| xz:6 | 22,709,338 | 30.8 s | 2.38 s |
+| brotli:9 | 23,550,686 | 32.7 s | 1.14 s |
 
 **Default: zstd:19**
 
-- It decodes quickly, and decoding is done on every ingest.
-- Its output is within 5% of the smallest results (xz and brotli:11).
+- It produces the smallest file of the algorithms tested.
+- It decodes quickly, and decoding happens on every ingest.
+- Multithreaded zstd uses 4 MiB jobs, so all cores are busy, and long-distance matching is on.
 
-For quick iteration, `--compression zstd:3` encodes about 85× faster but produces a file about 40% larger.
+For quick iteration, `--compression zstd:9` encodes about 30× faster and produces a file about 20% larger.
 
-A full `nixos-25.05` closure, from a live run, is:
+**Layout:** in the binary form, entries are written as positional CBOR arrays rather than maps with field names, which keeps the encoded closure at 66 MB rather than 84 MB. The JSON form keeps named fields.
 
-- 320,419 paths and 6.1M reference edges
-- 30 MB at zstd:3
-- indexed in about 6 minutes at a concurrency of 96
+**Indexing time:** a full `nixos-25.05` closure (320k narinfos) indexes and writes in about 55 s with the defaults:
+
+- about 35 s fetching at roughly 9–10k narinfos/s
+- about 15 s writing at zstd:19
 
 ## Query service
 

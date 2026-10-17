@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use nfi_indexer::closure::{ClosureOptions, DEFAULT_CACHE};
 use nfi_indexer::fetch::Fetcher;
-use nfi_indexer::index::{IndexOptions, index_releases};
+use nfi_indexer::index::{IndexOptions, index_releases_with_report};
 use nfi_indexer::outpaths::OutpathsOptions;
 use nfi_indexer::release::{self, DEFAULT_RELEASES_BASE, DEFAULT_S3_LIST_BASE, ReleaseLocation};
 use nfi_interchange::codec::{self, Compression, Format};
@@ -133,8 +133,11 @@ struct IndexCmd {
     releases_base: String,
     #[arg(long, default_value = DEFAULT_S3_LIST_BASE, env = "NFI_S3_LIST_BASE")]
     s3_list_base: String,
-    /// Concurrent narinfo requests.
-    #[arg(long, default_value_t = 64)]
+    /// Independent HTTP connections to spread narinfo requests over.
+    #[arg(long, default_value_t = 8)]
+    connections: usize,
+    /// Concurrent narinfo requests (spread over --connections).
+    #[arg(long, default_value_t = 512)]
     concurrency: usize,
     #[arg(long, default_value_t = 6)]
     retries: u32,
@@ -159,22 +162,120 @@ fn format_of(out: &OutArgs) -> Result<Format> {
     Format::parse(&out.format, out.compression.as_deref())
 }
 
-fn write_out(bundle: &nfi_interchange::Bundle, out: &OutArgs) -> Result<()> {
-    let format = format_of(out)?;
-    if out.output == "-" {
-        codec::write(bundle, std::io::stdout().lock(), format)
-    } else {
-        codec::write_file(bundle, std::path::Path::new(&out.output), format)
+fn mib(bytes: u64) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+fn format_label(format: Format) -> String {
+    match format {
+        Format::Json => "json".into(),
+        Format::Binary(Compression::None) => "binary (uncompressed)".into(),
+        Format::Binary(Compression::Zstd(l)) => format!("binary (zstd:{l})"),
+        Format::Binary(Compression::Xz(l)) => format!("binary (xz:{l})"),
+        Format::Binary(Compression::Brotli(l)) => format!("binary (brotli:{l})"),
     }
 }
 
+/// Write the bundle, logging what is written and how long it took.
+fn write_out(bundle: &nfi_interchange::Bundle, out: &OutArgs) -> Result<codec::WriteStats> {
+    let format = format_of(out)?;
+    let dest = if out.output == "-" {
+        "<stdout>"
+    } else {
+        out.output.as_str()
+    };
+    let st = ops::stats(bundle);
+    tracing::info!(
+        output = dest,
+        format = %format_label(format),
+        releases = st.releases.len(),
+        closure_paths = st.closure_paths,
+        closure_edges = st.closure_edges,
+        packages = st.packages,
+        outpaths = st.outpaths,
+        programs = st.programs,
+        "writing bundle"
+    );
+    let t = std::time::Instant::now();
+    let stats = if out.output == "-" {
+        codec::write(bundle, std::io::stdout().lock(), format)?
+    } else {
+        codec::write_file(bundle, std::path::Path::new(&out.output), format)?
+    };
+    let secs = t.elapsed().as_secs_f64();
+    tracing::info!(
+        output = dest,
+        encoded = %mib(stats.encoded_bytes),
+        written = %mib(stats.written_bytes),
+        ratio = format!("{:.2}", stats.encoded_bytes as f64 / stats.written_bytes.max(1) as f64),
+        secs = format!("{secs:.1}"),
+        throughput = format!("{}/s", mib((stats.encoded_bytes as f64 / secs.max(1e-9)) as u64)),
+        "bundle written"
+    );
+    Ok(stats)
+}
+
+/// Final summary of an indexing run.
+fn log_summary(
+    report: &nfi_indexer::index::IndexReport,
+    bundle: &nfi_interchange::Bundle,
+    out: &OutArgs,
+    written: &codec::WriteStats,
+    write_secs: f64,
+    total_secs: f64,
+) {
+    let st = ops::stats(bundle);
+    for r in &report.releases {
+        let mut parts = Vec::new();
+        if let Some(c) = &r.closure {
+            parts.push(format!(
+                "closure: {} roots, {} narinfos fetched, {} reused, {} missing in {:.1}s",
+                c.roots, c.fetched, c.reused, c.missing, r.closure_secs
+            ));
+        }
+        if let Some(n) = r.packages {
+            parts.push(format!("packages: {n} in {:.1}s", r.packages_secs));
+        }
+        if let Some(n) = r.programs {
+            parts.push(format!("programs: {n} in {:.1}s", r.programs_secs));
+        }
+        if let Some(n) = r.outpaths {
+            parts.push(format!("outpaths: {n} in {:.1}s", r.outpaths_secs));
+        }
+        tracing::info!(release = %r.name, commit = %r.commit, "summary: {}", parts.join("; "));
+    }
+    let fetched: usize = report
+        .releases
+        .iter()
+        .filter_map(|r| r.closure.as_ref())
+        .map(|c| c.fetched)
+        .sum();
+    tracing::info!(
+        releases = st.releases.len(),
+        closure_paths = st.closure_paths,
+        closure_edges = st.closure_edges,
+        missing = st.missing_paths,
+        packages = st.packages,
+        outpaths = st.outpaths,
+        programs = st.programs,
+        narinfos_fetched = fetched,
+        output = if out.output == "-" { "<stdout>" } else { out.output.as_str() },
+        size = %mib(written.written_bytes),
+        index_secs = format!("{:.1}", report.total_secs),
+        write_secs = format!("{write_secs:.1}"),
+        total_secs = format!("{total_secs:.1}"),
+        "summary: done"
+    );
+}
+
 async fn run_index(cmd: IndexCmd, default: &[Dataset]) -> Result<()> {
+    let started = std::time::Instant::now();
     let datasets = if cmd.datasets.is_empty() {
         default.to_vec()
     } else {
         cmd.datasets.clone()
     };
-    let fetcher = Fetcher::new(cmd.retries)?;
+    let fetcher = Fetcher::with_connections(cmd.retries, cmd.connections)?;
     let mut locations: Vec<ReleaseLocation> = cmd
         .release_urls
         .iter()
@@ -218,9 +319,19 @@ async fn run_index(cmd: IndexCmd, default: &[Dataset]) -> Result<()> {
         },
         include_seed: cmd.include_seed,
     };
-    let bundle = index_releases(&fetcher, &locations, &opts, seed).await?;
+    let (bundle, report) = index_releases_with_report(&fetcher, &locations, &opts, seed).await?;
     bundle.validate().map_err(anyhow::Error::msg)?;
-    write_out(&bundle, &cmd.out)
+    let t = std::time::Instant::now();
+    let written = write_out(&bundle, &cmd.out)?;
+    log_summary(
+        &report,
+        &bundle,
+        &cmd.out,
+        &written,
+        t.elapsed().as_secs_f64(),
+        started.elapsed().as_secs_f64(),
+    );
+    Ok(())
 }
 
 fn shell_split(s: &str) -> Result<Vec<String>> {
@@ -251,7 +362,7 @@ async fn main() -> Result<()> {
                 .iter()
                 .map(|p| codec::read_path_or_stdin(p))
                 .collect::<Result<Vec<_>>>()?;
-            write_out(&ops::merge(bundles), &out)
+            write_out(&ops::merge(bundles), &out).map(|_| ())
         }
         Cmd::Split {
             input,
@@ -297,9 +408,9 @@ async fn main() -> Result<()> {
                     Some(&sections)
                 },
             );
-            write_out(&f, &out)
+            write_out(&f, &out).map(|_| ())
         }
-        Cmd::Convert { input, out } => write_out(&codec::read_path_or_stdin(&input)?, &out),
+        Cmd::Convert { input, out } => write_out(&codec::read_path_or_stdin(&input)?, &out).map(|_| ()),
         Cmd::Inspect { input, json } => {
             let s = ops::stats(&codec::read_path_or_stdin(&input)?);
             if json {

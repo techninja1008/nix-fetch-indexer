@@ -5,7 +5,35 @@ use crate::store_path::StoreHash;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
+
+/// Entry types serialise as named-field objects in human-readable formats
+/// (JSON) and as positional arrays in the binary form, which keeps field
+/// names out of every entry. The derived (map) impls are generated as
+/// inherent functions via `#[serde(remote = "Self")]`.
+macro_rules! compact_binary {
+    ($ty:ident { $($f:ident),* $(,)? }) => {
+        impl Serialize for $ty {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                if s.is_human_readable() {
+                    $ty::serialize(self, s)
+                } else {
+                    ($(&self.$f,)*).serialize(s)
+                }
+            }
+        }
+        impl<'de> Deserialize<'de> for $ty {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                if d.is_human_readable() {
+                    $ty::deserialize(d)
+                } else {
+                    let ($($f,)*) = Deserialize::deserialize(d)?;
+                    Ok($ty { $($f),* })
+                }
+            }
+        }
+    };
+}
 
 /// The kinds of dataset a bundle section can hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -79,6 +107,7 @@ impl Release {
 
 /// An indexed store path, with its runtime references.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct ClosurePath {
     pub hash: StoreHash,
     pub name: String,
@@ -94,14 +123,25 @@ pub struct ClosurePath {
     pub deriver: Option<String>,
     pub releases: Bitset,
 }
+compact_binary!(ClosurePath {
+    hash,
+    name,
+    references,
+    nar_size,
+    file_size,
+    deriver,
+    releases
+});
 
 /// A path listed in a release's store-paths but not present in the cache.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct MissingPath {
     pub hash: StoreHash,
     pub name: String,
     pub releases: Bitset,
 }
+compact_binary!(MissingPath { hash, name, releases });
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClosureSection {
@@ -111,6 +151,7 @@ pub struct ClosureSection {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct Package {
     /// nixpkgs attribute path.
     pub attr: String,
@@ -137,6 +178,21 @@ pub struct Package {
     pub unfree: bool,
     pub releases: Bitset,
 }
+compact_binary!(Package {
+    attr,
+    name,
+    pname,
+    version,
+    system,
+    description,
+    homepage,
+    license,
+    main_program,
+    outputs,
+    broken,
+    unfree,
+    releases
+});
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackagesSection {
@@ -145,6 +201,7 @@ pub struct PackagesSection {
 
 /// Evaluated output paths for an attribute.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct Outpaths {
     pub attr: String,
     pub system: String,
@@ -154,6 +211,13 @@ pub struct Outpaths {
     pub outputs: BTreeMap<String, String>,
     pub releases: Bitset,
 }
+compact_binary!(Outpaths {
+    attr,
+    system,
+    drv_path,
+    outputs,
+    releases
+});
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutpathsSection {
@@ -162,6 +226,7 @@ pub struct OutpathsSection {
 
 /// A program (binary name) provided by a package, from programs.sqlite.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct Program {
     pub name: String,
     pub system: String,
@@ -169,6 +234,12 @@ pub struct Program {
     pub attr: String,
     pub releases: Bitset,
 }
+compact_binary!(Program {
+    name,
+    system,
+    attr,
+    releases
+});
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProgramsSection {
