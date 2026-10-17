@@ -17,6 +17,34 @@ pub struct IndexOptions {
     pub include_seed: bool,
 }
 
+/// Timings and counts for one indexed release.
+#[derive(Clone, Debug, Default)]
+pub struct ReleaseReport {
+    pub name: String,
+    pub commit: String,
+    pub closure: Option<closure::ClosureReport>,
+    pub closure_secs: f64,
+    pub packages: Option<usize>,
+    pub packages_secs: f64,
+    pub programs: Option<usize>,
+    pub programs_secs: f64,
+    pub outpaths: Option<usize>,
+    pub outpaths_secs: f64,
+}
+
+/// What an indexing run did, for logging a summary.
+#[derive(Clone, Debug, Default)]
+pub struct IndexReport {
+    pub releases: Vec<ReleaseReport>,
+    /// Building the final bundle (closure finalisation, merge/filter).
+    pub assemble_secs: f64,
+    pub total_secs: f64,
+}
+
+fn secs(t: std::time::Instant) -> f64 {
+    t.elapsed().as_secs_f64()
+}
+
 /// Index `locations` (in order) into a new bundle. When `seed` is given its
 /// closure section is used to avoid re-fetching known narinfos.
 pub async fn index_releases(
@@ -25,6 +53,20 @@ pub async fn index_releases(
     opts: &IndexOptions,
     seed: Option<Bundle>,
 ) -> Result<Bundle> {
+    Ok(index_releases_with_report(fetcher, locations, opts, seed)
+        .await?
+        .0)
+}
+
+/// Like [`index_releases`], also returning per-phase timings and counts.
+pub async fn index_releases_with_report(
+    fetcher: &Fetcher,
+    locations: &[ReleaseLocation],
+    opts: &IndexOptions,
+    seed: Option<Bundle>,
+) -> Result<(Bundle, IndexReport)> {
+    let run_started = std::time::Instant::now();
+    let mut report = IndexReport::default();
     let mut bundle = Bundle::default();
     let mut builder = ClosureBuilder::new();
     let mut seed_releases = Vec::new();
@@ -54,58 +96,98 @@ pub async fn index_releases(
         release.datasets = Vec::new();
         let idx = bundle.ensure_release(release.clone());
         new_releases.push(release.name.clone());
+        let mut rr = ReleaseReport {
+            name: release.name.clone(),
+            commit: release.commit.clone(),
+            ..Default::default()
+        };
 
         if opts.datasets.contains(&Dataset::Closure) {
+            let t = std::time::Instant::now();
             let xz = fetcher.get(&loc.file("store-paths.xz")).await?;
             let mut roots = closure::parse_store_paths(&xz)?;
             if let Some(n) = opts.closure.sample {
                 roots.truncate(n);
             }
             let report = closure::index_closure(fetcher, &opts.closure, &mut builder, &roots, idx).await?;
+            rr.closure_secs = secs(t);
             tracing::info!(
                 release = %release.name,
                 roots = report.roots,
                 fetched = report.fetched,
                 reused = report.reused,
                 missing = report.missing,
+                secs = format!("{:.1}", rr.closure_secs),
                 "closure indexed"
             );
+            rr.closure = Some(report);
             bundle.releases[idx].add_dataset(Dataset::Closure);
         }
         if opts.datasets.contains(&Dataset::Packages) {
+            let t = std::time::Instant::now();
             let br = fetcher.get(&loc.file("packages.json.br")).await?;
             let entries = packages::parse_packages_json_br(&br, idx)?;
-            tracing::info!(release = %release.name, packages = entries.len(), "packages indexed");
+            rr.packages_secs = secs(t);
+            rr.packages = Some(entries.len());
+            tracing::info!(
+                release = %release.name,
+                packages = entries.len(),
+                secs = format!("{:.1}", rr.packages_secs),
+                "packages indexed"
+            );
             package_entries.extend(entries);
             bundle.releases[idx].add_dataset(Dataset::Packages);
         }
         let want_tar =
             opts.datasets.contains(&Dataset::Programs) || opts.datasets.contains(&Dataset::Outpaths);
         if want_tar {
+            let t = std::time::Instant::now();
             let tar = fetcher.get(&loc.file("nixexprs.tar.xz")).await?;
             if opts.datasets.contains(&Dataset::Programs) {
                 match tarball::read_top_level_file(&tar, "programs.sqlite")? {
                     Some(db) => {
                         let entries = programs::read_programs_db(&db, idx)?;
-                        tracing::info!(release = %release.name, programs = entries.len(), "programs indexed");
+                        rr.programs_secs = secs(t);
+                        rr.programs = Some(entries.len());
+                        tracing::info!(
+                            release = %release.name,
+                            programs = entries.len(),
+                            secs = format!("{:.1}", rr.programs_secs),
+                            "programs indexed"
+                        );
                         program_entries.extend(entries);
                     }
-                    None => tracing::warn!(release = %release.name, "no programs.sqlite in nixexprs tarball"),
+                    None => {
+                        rr.programs = Some(0);
+                        tracing::warn!(release = %release.name, "no programs.sqlite in nixexprs tarball")
+                    }
                 }
                 bundle.releases[idx].add_dataset(Dataset::Programs);
             }
             if opts.datasets.contains(&Dataset::Outpaths) {
+                let t = std::time::Instant::now();
                 let dir = tempfile::tempdir()?;
                 let top = tarball::extract(&tar, dir.path())?;
                 let entries = outpaths::evaluate(&top, &opts.outpaths, idx)
                     .await
                     .with_context(|| format!("evaluating {}", release.name))?;
-                tracing::info!(release = %release.name, outpaths = entries.len(), "out paths indexed");
+                rr.outpaths_secs = secs(t);
+                rr.outpaths = Some(entries.len());
+                tracing::info!(
+                    release = %release.name,
+                    outpaths = entries.len(),
+                    secs = format!("{:.1}", rr.outpaths_secs),
+                    "out paths indexed"
+                );
                 outpath_entries.extend(entries);
                 bundle.releases[idx].add_dataset(Dataset::Outpaths);
             }
         }
+        report.releases.push(rr);
     }
+
+    let t = std::time::Instant::now();
+    tracing::info!("assembling bundle");
 
     if opts.datasets.contains(&Dataset::Closure)
         || seed_sections.as_ref().is_some_and(|s| s.closure.is_some())
@@ -135,13 +217,25 @@ pub async fn index_releases(
             ..seed
         };
         ops::merge([bundle, seed_rest])
-    } else if !seed_releases.is_empty() {
-        ops::merge([ops::filter(&bundle, |r| new_releases.contains(&r.name), None)])
     } else {
-        // Merging a single bundle deduplicates entries across its releases.
-        ops::merge([bundle])
+        // Merging a single bundle deduplicates package/program/outpath entries
+        // across its releases. The closure is already deduplicated by the
+        // builder, so keep it out of the merge (it is by far the largest
+        // section); a single-input merge keeps the release table order.
+        let mut b = if seed_releases.is_empty() {
+            bundle
+        } else {
+            ops::filter(&bundle, |r| new_releases.contains(&r.name), None)
+        };
+        let closure = b.closure.take();
+        let mut merged = ops::merge([b]);
+        merged.closure = closure;
+        merged
     };
-    Ok(bundle)
+    report.assemble_secs = secs(t);
+    report.total_secs = secs(run_started);
+    tracing::info!(secs = format!("{:.1}", report.assemble_secs), "bundle assembled");
+    Ok((bundle, report))
 }
 
 /// Check that a release directory exists (has a git-revision file).

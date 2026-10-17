@@ -22,7 +22,7 @@ impl Default for ClosureOptions {
     fn default() -> Self {
         Self {
             cache_url: DEFAULT_CACHE.into(),
-            concurrency: 64,
+            concurrency: 512,
             sample: None,
         }
     }
@@ -73,6 +73,15 @@ pub async fn index_closure(
         }
     }
     let mut missing_roots: Vec<(StoreHash, String)> = Vec::new();
+    if !pending.is_empty() {
+        fetcher
+            .warm_up(&format!(
+                "{}/nix-cache-info",
+                opts.cache_url.trim_end_matches('/')
+            ))
+            .await;
+    }
+    let started = std::time::Instant::now();
     let mut in_flight = FuturesUnordered::new();
     let total_hint = pending.len();
     loop {
@@ -112,6 +121,13 @@ pub async fn index_closure(
             }
         }
     }
+    let secs = started.elapsed().as_secs_f64();
+    tracing::info!(
+        fetched = report.fetched,
+        secs = format!("{secs:.1}"),
+        per_sec = format!("{:.0}", (report.fetched + report.missing) as f64 / secs.max(1e-9)),
+        "narinfo fetching finished"
+    );
     let root_hashes: Vec<StoreHash> = roots.iter().map(|r| r.hash).collect();
     let missing_set: HashSet<StoreHash> = missing_roots.iter().map(|(h, _)| *h).collect();
     builder.mark_closure(
