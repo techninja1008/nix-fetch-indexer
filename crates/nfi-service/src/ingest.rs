@@ -20,6 +20,8 @@ pub const WRITE_LOCK: i64 = 0x6e66_6900;
 pub struct IngestReport {
     pub releases: Vec<String>,
     pub store_paths: usize,
+    /// Store paths not previously in the database.
+    pub new_store_paths: usize,
     pub references: usize,
     pub missing: usize,
     pub packages: usize,
@@ -120,20 +122,28 @@ pub async fn ingest(
         .execute(&mut *tx)
         .await?;
     }
-    let release_ids = |bits: &nfi_interchange::Bitset, allowed: &[i32]| -> Vec<i32> {
+    // Bundle release indices whose release carries a dataset, as a mask
+    // (O(1) per membership bit rather than a scan of the release list).
+    let mask = |allowed: &[i32]| -> Vec<bool> { ids.iter().map(|id| allowed.contains(id)).collect() };
+    let release_ids = |bits: &nfi_interchange::Bitset, mask: &[bool]| -> Vec<i32> {
         bits.iter()
+            .filter(|&i| mask.get(i).copied().unwrap_or(false))
             .map(|i| ids[i])
-            .filter(|id| allowed.contains(id))
             .collect()
     };
 
     // Closure.
+    //
+    // A store path's references never change, so they are only written when
+    // the path is new to the database; existing paths just gain release ids.
     if let Some(c) = &bundle.closure {
         let rel = with(Dataset::Closure);
+        let rel_mask = mask(&rel);
         progress(format!("closure: {} paths", c.paths.len()));
         exec(
             &mut tx,
-            "CREATE TEMP TABLE t_paths (idx int, hash text, name text, nar_size bigint, file_size bigint, deriver text) ON COMMIT DROP",
+            "CREATE TEMP TABLE t_paths (idx int, hash text, name text, nar_size bigint, file_size bigint,
+               deriver text, releases int[], id bigint, existing int[]) ON COMMIT DROP",
         )
         .await?;
         exec(
@@ -143,38 +153,46 @@ pub async fn ingest(
         .await?;
         exec(
             &mut tx,
-            "CREATE TEMP TABLE t_prel (idx int, release_id int) ON COMMIT DROP",
-        )
-        .await?;
-        exec(
-            &mut tx,
             "CREATE TEMP TABLE t_missing (hash text, name text, release_id int) ON COMMIT DROP",
         )
         .await?;
-        let (mut paths, mut refs, mut prel, mut missing) =
-            (CopyBuf::new(), CopyBuf::new(), CopyBuf::new(), CopyBuf::new());
+        let (mut paths, mut refs, mut missing) = (CopyBuf::new(), CopyBuf::new(), CopyBuf::new());
+        let mut releases_text = String::new();
         for (i, p) in c.paths.iter().enumerate() {
+            let ids = release_ids(&p.releases, &rel_mask);
+            // Paths in none of the releases whose closure is ingested are not
+            // stored (they would be orphans). The bundle's closures are closed
+            // (checked by validate()), so no stored path references them.
+            if ids.is_empty() {
+                continue;
+            }
             let hash = p.hash.to_string();
+            releases_text.clear();
+            releases_text.push('{');
+            for (n, id) in ids.into_iter().enumerate() {
+                if n > 0 {
+                    releases_text.push(',');
+                }
+                releases_text.push_str(&id.to_string());
+            }
+            releases_text.push('}');
             paths
                 .field(i as i64)
                 .field(&hash)
                 .field(&p.name)
                 .field(p.nar_size)
                 .field(p.file_size)
-                .field(&p.deriver);
+                .field(&p.deriver)
+                .field(releases_text.as_str());
             paths.end_row();
             for &r in &p.references {
                 refs.field(i as i64).field(r);
                 refs.end_row();
             }
-            for id in release_ids(&p.releases, &rel) {
-                prel.field(i as i64).field(id);
-                prel.end_row();
-            }
         }
         for m in &c.missing {
             let hash = m.hash.to_string();
-            for id in release_ids(&m.releases, &rel) {
+            for id in release_ids(&m.releases, &rel_mask) {
                 missing.field(&hash).field(&m.name).field(id);
                 missing.end_row();
             }
@@ -182,41 +200,59 @@ pub async fn ingest(
         report.store_paths = paths.rows;
         report.references = refs.rows;
         report.missing = missing.rows;
-        copy_in(&mut tx, "t_paths", paths).await?;
-        copy_in(&mut tx, "t_refs", refs).await?;
-        copy_in(&mut tx, "t_prel", prel).await?;
+        copy_in(
+            &mut tx,
+            "t_paths (idx, hash, name, nar_size, file_size, deriver, releases)",
+            paths,
+        )
+        .await?;
         copy_in(&mut tx, "t_missing", missing).await?;
+        exec(&mut tx, "CREATE INDEX ON t_paths (idx)").await?;
         exec(&mut tx, "ANALYZE t_paths").await?;
-        progress("closure: inserting paths".into());
+
+        // Resolve ids: existing paths keep theirs, new paths get fresh ids up
+        // front (writers hold WRITE_LOCK, so nothing else inserts meanwhile)
+        // so their references can be written in the same insert.
+        progress("closure: resolving paths".into());
         exec(
             &mut tx,
-            "INSERT INTO store_paths (hash, name, nar_size, file_size, deriver)
-             SELECT hash, name, nar_size, file_size, deriver FROM t_paths
-             ON CONFLICT DO NOTHING",
+            "UPDATE t_paths t SET id = s.id, existing = s.releases FROM store_paths s WHERE s.hash = t.hash",
         )
         .await?;
-        exec(
-            &mut tx,
-            "CREATE TEMP TABLE t_map ON COMMIT DROP AS SELECT t.idx, s.id FROM t_paths t JOIN store_paths s ON s.hash = t.hash",
+        let new_paths = sqlx::query(
+            "UPDATE t_paths SET id = nextval(pg_get_serial_sequence('store_paths', 'id')) WHERE id IS NULL",
         )
-        .await?;
-        exec(&mut tx, "CREATE INDEX ON t_map (idx)").await?;
-        exec(&mut tx, "ANALYZE t_map").await?;
-        exec(&mut tx, "ANALYZE t_refs").await?;
-        exec(&mut tx, "ANALYZE t_prel").await?;
-        progress("closure: inserting references".into());
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        report.new_store_paths = new_paths as usize;
+
+        if new_paths > 0 {
+            progress(format!("closure: inserting {new_paths} new paths"));
+            copy_in(&mut tx, "t_refs", refs).await?;
+            exec(
+                &mut tx,
+                "INSERT INTO store_paths (id, hash, name, nar_size, file_size, deriver, releases, refs)
+                 SELECT t.id, t.hash, t.name, t.nar_size, t.file_size, t.deriver, t.releases,
+                        COALESCE(r.refs, '{}')
+                   FROM t_paths t
+                   LEFT JOIN (SELECT r.idx, array_agg(b.id ORDER BY b.id) AS refs
+                                FROM t_refs r
+                                JOIN t_paths a ON a.idx = r.idx AND a.existing IS NULL
+                                JOIN t_paths b ON b.idx = r.ref
+                               GROUP BY r.idx) r ON r.idx = t.idx
+                  WHERE t.existing IS NULL",
+            )
+            .await?;
+        }
+
+        progress("closure: adding releases to existing paths".into());
         exec(
             &mut tx,
-            "INSERT INTO store_path_refs (path_id, ref_id)
-             SELECT a.id, b.id FROM t_refs r JOIN t_map a ON a.idx = r.idx JOIN t_map b ON b.idx = r.ref
-             ON CONFLICT DO NOTHING",
-        )
-        .await?;
-        progress("closure: inserting release membership".into());
-        exec(
-            &mut tx,
-            "INSERT INTO store_path_releases (path_id, release_id)
-             SELECT m.id, t.release_id FROM t_prel t JOIN t_map m ON m.idx = t.idx ON CONFLICT DO NOTHING",
+            "UPDATE store_paths s
+                SET releases = ARRAY(SELECT DISTINCT x FROM unnest(t.existing || t.releases) x ORDER BY x)
+               FROM t_paths t
+              WHERE t.existing IS NOT NULL AND NOT t.existing @> t.releases AND s.id = t.id",
         )
         .await?;
         exec(
@@ -229,6 +265,7 @@ pub async fn ingest(
     // Packages.
     if let Some(s) = &bundle.packages {
         let rel = with(Dataset::Packages);
+        let rel_mask = mask(&rel);
         progress(format!("packages: {} entries", s.entries.len()));
         exec(
             &mut tx,
@@ -260,7 +297,7 @@ pub async fn ingest(
                 .field(p.broken)
                 .field(p.unfree);
             pk.end_row();
-            for id in release_ids(&p.releases, &rel) {
+            for id in release_ids(&p.releases, &rel_mask) {
                 pr.field(&key).field(id);
                 pr.end_row();
             }
@@ -289,6 +326,7 @@ pub async fn ingest(
     // Out paths (joined onto package rows at query time by release/attr/system).
     if let Some(s) = &bundle.outpaths {
         let rel = with(Dataset::Outpaths);
+        let rel_mask = mask(&rel);
         progress(format!("outpaths: {} entries", s.entries.len()));
         exec(
             &mut tx,
@@ -297,7 +335,7 @@ pub async fn ingest(
         .await?;
         let mut buf = CopyBuf::new();
         for e in &s.entries {
-            for id in release_ids(&e.releases, &rel) {
+            for id in release_ids(&e.releases, &rel_mask) {
                 for (o, p) in &e.outputs {
                     buf.field(id)
                         .field(&e.attr)
@@ -323,6 +361,7 @@ pub async fn ingest(
     // Programs.
     if let Some(s) = &bundle.programs {
         let rel = with(Dataset::Programs);
+        let rel_mask = mask(&rel);
         progress(format!("programs: {} entries", s.entries.len()));
         exec(
             &mut tx,
@@ -331,7 +370,7 @@ pub async fn ingest(
         .await?;
         let mut buf = CopyBuf::new();
         for e in &s.entries {
-            for id in release_ids(&e.releases, &rel) {
+            for id in release_ids(&e.releases, &rel_mask) {
                 buf.field(id).field(&e.name).field(&e.system).field(&e.attr);
                 buf.end_row();
             }

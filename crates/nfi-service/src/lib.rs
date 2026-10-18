@@ -2,6 +2,7 @@
 #![allow(clippy::type_complexity)]
 
 pub mod api;
+pub mod check;
 pub mod copy;
 pub mod ingest;
 pub mod jobs;

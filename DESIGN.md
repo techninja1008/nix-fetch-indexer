@@ -84,7 +84,7 @@ ProgramsSection { entries: [Program { name, system, attr, releases: Bitset }] }
   - Layout: magic `NFIB`, a one-byte container version (2), a one-byte compression id, then the compressed CBOR body.
   - Compression ids: `0` none, `1` zstd, `2` xz, `3` brotli.
   - Benchmark (`nfi-indexer bench-compression`): per algorithm, compressed size and encode/decode time.
-  - Default: **zstd level 19** for indexer output.
+  - Default: **zstd level 9** for indexer output (fast to write, quick to decode); `zstd:19` gives about 17% smaller files for slower writes.
 - **JSON form:** the same data model.
   - Structurally identical, with bitsets as hex strings and references as index arrays.
   - It is detected by a leading `{`.
@@ -148,9 +148,9 @@ ProgramsSection { entries: [Program { name, system, attr, releases: Bitset }] }
 ```
 releases(id, name unique, commit unique, channel, series, url, indexed_at)
 release_datasets(release_id, dataset)
-store_paths(id bigserial, hash char(32) unique, name, nar_size, file_size, deriver)
-store_path_refs(path_id, ref_id)                    -- edges
-store_path_releases(path_id, release_id)
+store_paths(id bigserial, hash char(32) unique, name, nar_size, file_size, deriver,
+            releases int[],   -- sorted ids of the releases whose closure contains the path
+            refs bigint[])    -- ids of the path's runtime references
 missing_paths(hash, name, release_id)
 packages(id, attr, version, system, name, pname, description, homepage, license, main_program, broken, unfree)
 package_releases(package_id, release_id)
@@ -158,6 +158,30 @@ package_outputs(attr, system, release_id, output, path_hash, drv_path)   -- join
 programs(name, system, attr, release_id)
 jobs(id, kind, status, params jsonb, staged_blob oid/bytea, progress, error, created_at, started_at, finished_at)
 ```
+
+Membership and references are arrays on the path row, not one row per (path, release) or per edge. A channel's releases share most of their paths, so per-pair rows grow quickly: all 87 `nixos-26.05` releases are 2.7M paths, 22.5M memberships and 38M references.
+
+**Ingest of a closure section**
+1. Load the bundle's paths into a temporary table.
+2. Resolve existing paths by hash. Allocate ids for new paths from the sequence; this is safe because writers hold the advisory lock.
+3. Insert the new paths with their references in one statement.
+4. Add the bundle's release ids to the arrays of existing paths.
+
+A store path's references never change, so they are written only once, when the path is new.
+
+**Prune** removes the pruned release ids from the arrays, then deletes paths that are left with no releases.
+
+**Invariants.** These replace the foreign keys:
+- every reference resolves to an existing path;
+- every release id exists;
+- every path belongs to at least one release;
+- a path's references belong to all of its releases (closures are closed).
+
+**Enforcement:**
+- `Bundle::validate` rejects open closures.
+- Ingest skips paths outside the ingested releases.
+- `nfi-admin check` (`POST /admin/v1/check`) verifies the invariants.
+- Closure queries fail with an `index inconsistency` error instead of returning partial results.
 
 ### Jobs
 
@@ -197,6 +221,7 @@ jobs(id, kind, status, params jsonb, staged_blob oid/bytea, progress, error, cre
 - `GET /admin/v1/releases` lists releases and their datasets.
 - `POST /admin/v1/prune` takes `{releases?:[name], commits?:[hash], channels?:[name]}` and returns a job id.
 - `POST /admin/v1/reindex` returns a job id.
+- `POST /admin/v1/check` returns a job id. The job's result is a consistency report: `ok`, totals, and per issue kind a count and examples.
 
 ### Minimise algorithm
 

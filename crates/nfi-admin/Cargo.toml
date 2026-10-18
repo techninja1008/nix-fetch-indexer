@@ -9,6 +9,7 @@ license.workspace = true
 nfi-api = { workspace = true, features = ["client"] }
 anyhow.workspace = true
 serde_json.workspace = true
+sqlx.workspace = true
 tokio.workspace = true
 clap.workspace = true
 
@@ -17,3 +18,4 @@ nfi-testenv = { path = "../nfi-testenv" }
 nfi-interchange.workspace = true
 tempfile.workspace = true
 serde_json.workspace = true
+sqlx.workspace = true

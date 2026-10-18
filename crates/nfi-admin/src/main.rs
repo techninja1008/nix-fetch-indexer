@@ -73,6 +73,79 @@ enum Cmd {
         #[arg(long)]
         wait: bool,
     },
+    /// Check the closure index for inconsistencies (dangling references,
+    /// unknown releases, orphaned paths, open closures). With --wait, exits
+    /// with status 3 if any are found.
+    Check {
+        #[arg(long)]
+        wait: bool,
+    },
+}
+
+/// How a command finished, mapped to the exit status.
+enum Outcome {
+    Ok,
+    /// A job failed (exit 2).
+    Failed,
+    /// The consistency check found problems (exit 3).
+    Inconsistent,
+}
+
+impl From<bool> for Outcome {
+    fn from(ok: bool) -> Self {
+        if ok { Outcome::Ok } else { Outcome::Failed }
+    }
+}
+
+fn print_check(r: &nfi_api::CheckReport) {
+    println!(
+        "{}: {} store paths, {} references, {} releases",
+        if r.ok { "ok" } else { "INCONSISTENT" },
+        r.store_paths,
+        r.references,
+        r.releases
+    );
+    for i in &r.issues {
+        println!("  {} ({}): {}", i.kind, i.count, i.description);
+        for e in &i.examples {
+            println!("    {e}");
+        }
+        if i.count as usize > i.examples.len() {
+            println!("    ... and {} more", i.count as usize - i.examples.len());
+        }
+    }
+}
+
+async fn check_cmd(client: &Client, do_wait: bool, json: bool) -> Result<Outcome> {
+    let created = client.check().await?;
+    if !do_wait {
+        return submitted(client, created.id, false, json)
+            .await
+            .map(Outcome::from);
+    }
+    let j = client
+        .wait_job(created.id, |j| {
+            if let Some(p) = &j.progress {
+                eprintln!("job {}: {p}", j.id);
+            }
+        })
+        .await?;
+    if j.status != JobStatus::Succeeded {
+        print_job(&j, json)?;
+        return Ok(Outcome::Failed);
+    }
+    let report: nfi_api::CheckReport =
+        serde_json::from_value(j.result.clone().unwrap_or_default()).context("decoding check result")?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_check(&report);
+    }
+    Ok(if report.ok {
+        Outcome::Ok
+    } else {
+        Outcome::Inconsistent
+    })
 }
 
 fn print_job(j: &JobInfo, json: bool) -> Result<()> {
@@ -130,7 +203,7 @@ async fn submitted(client: &Client, id: i64, do_wait: bool, json: bool) -> Resul
     }
 }
 
-async fn run(cli: Cli) -> Result<bool> {
+async fn run(cli: Cli) -> Result<Outcome> {
     let token = match (&cli.token, &cli.token_file) {
         (Some(t), _) => Some(t.clone()),
         (None, Some(f)) => Some(
@@ -142,7 +215,10 @@ async fn run(cli: Cli) -> Result<bool> {
         (None, None) => None,
     };
     let client = Client::new(&cli.url, token)?;
-    match cli.cmd {
+    if let Cmd::Check { wait } = cli.cmd {
+        return check_cmd(&client, wait, cli.json).await;
+    }
+    let ok = match cli.cmd {
         Cmd::Ingest { sources, wait } => {
             let mut ok = true;
             for s in &sources {
@@ -222,14 +298,17 @@ async fn run(cli: Cli) -> Result<bool> {
             let created = client.reindex().await?;
             submitted(&client, created.id, wait, cli.json).await
         }
-    }
+        Cmd::Check { .. } => unreachable!("handled above"),
+    }?;
+    Ok(ok.into())
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     match run(Cli::parse()).await {
-        Ok(true) => ExitCode::SUCCESS,
-        Ok(false) => ExitCode::from(2),
+        Ok(Outcome::Ok) => ExitCode::SUCCESS,
+        Ok(Outcome::Failed) => ExitCode::from(2),
+        Ok(Outcome::Inconsistent) => ExitCode::from(3),
         Err(e) => {
             eprintln!("error: {e:#}");
             ExitCode::FAILURE

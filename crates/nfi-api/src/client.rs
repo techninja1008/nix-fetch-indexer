@@ -131,6 +131,12 @@ impl Client {
             .await
     }
 
+    /// Queue a consistency check of the closure index.
+    pub async fn check(&self) -> Result<JobCreated> {
+        self.send(self.req(reqwest::Method::POST, "/admin/v1/check"))
+            .await
+    }
+
     /// Poll a job until it finishes, calling `on_progress` when its progress changes.
     pub async fn wait_job(&self, id: i64, mut on_progress: impl FnMut(&JobInfo)) -> Result<JobInfo> {
         let mut last: Option<String> = None;

@@ -1396,6 +1396,7 @@ dependencies = [
  "nfi-interchange",
  "nfi-testenv",
  "serde_json",
+ "sqlx",
  "tempfile",
  "tokio",
 ]

@@ -59,7 +59,7 @@ nfi-indexer closure --release-url $R2 --seed closure.nfib -o closure-2.nfib
 - `--cache-url`: the binary cache to query (default `https://cache.nixos.org`).
 - `--sample N`: index only the first N roots, for testing.
 - `--format json`: write the JSON form.
-- `--compression {none,zstd,xz,brotli}[:level]`: compression for the binary form (default `zstd:19`).
+- `--compression {none,zstd,xz,brotli}[:level]`: compression for the binary form (default `zstd:9`).
 
 **Bundle tools**
 
@@ -88,26 +88,25 @@ These figures come from `bench-compression` on a full `nixos-25.05` closure bund
 |---|---:|---:|---:|
 | none | 66,100,519 | 0.18 s | 0.54 s |
 | zstd:3 | 29,035,513 | 0.25 s | 0.47 s |
-| zstd:9 | 26,022,350 | 0.47 s | 0.59 s |
+| **zstd:9** (default) | 26,022,350 | 0.47 s | 0.59 s |
 | zstd:15 | 24,808,926 | 3.7 s | 0.65 s |
-| **zstd:19** (default) | 21,650,286 | 14.7 s | 1.05 s |
+| zstd:19 | 21,650,286 | 14.7 s | 1.05 s |
 | xz:6 | 22,709,338 | 30.8 s | 2.38 s |
 | brotli:9 | 23,550,686 | 32.7 s | 1.14 s |
 
-**Default: zstd:19**
+**Default: zstd:9**
 
-- It produces the smallest file of the algorithms tested.
+- It encodes about 30× faster than zstd:19: about 0.5 s for a release, and seconds rather than minutes for a whole channel.
 - It decodes quickly, and decoding happens on every ingest.
+- Its files are about 20% larger than zstd:19, which gives the smallest files of the algorithms tested. Use `--compression zstd:19` when bundle size matters more than write time.
 - Multithreaded zstd uses 4 MiB jobs, so all cores are busy, and long-distance matching is on.
-
-For quick iteration, `--compression zstd:9` encodes about 30× faster and produces a file about 20% larger.
 
 **Layout:** in the binary form, entries are written as positional CBOR arrays rather than maps with field names, which keeps the encoded closure at 66 MB rather than 84 MB. The JSON form keeps named fields.
 
-**Indexing time:** a full `nixos-25.05` closure (320k narinfos) indexes and writes in about 55 s with the defaults:
+**Indexing time:** a full `nixos-25.05` closure (320k narinfos) indexes and writes in about 40 s with the defaults:
 
 - about 35 s fetching at roughly 9–10k narinfos/s
-- about 15 s writing at zstd:19
+- under 1 s writing at zstd:9 (about 15 s at zstd:19)
 
 ## Query service
 
@@ -169,6 +168,18 @@ nfi-service --embedded-postgres /var/lib/nfi/pg --embedded-meilisearch /var/lib/
 - Embedded PostgreSQL implies a single replica, so `--no-worker` is not allowed with it.
 - The cargo features `embedded-postgres` and `embedded-meilisearch` are on by default.
 
+**Ingest performance**
+
+The figures below were measured with embedded PostgreSQL 16 on 4 cores.
+
+| workload | time |
+|---|---|
+| One full release (320k paths, 6.1M references) into an empty database | ~18 s |
+| The same release again (nothing new) | ~7.5 s |
+| All 87 `nixos-26.05` releases in one bundle (2.7M paths, 22.5M memberships, 38M references) | ~3.2 min |
+| An extra release into that database (315k new paths) | ~24 s |
+| Pruning one release, or a whole channel, from it | ~20 s |
+
 ### Public API
 
 | method | path | description |
@@ -210,8 +221,28 @@ nfi-service --embedded-postgres /var/lib/nfi/pg --embedded-meilisearch /var/lib/
 | GET | `/admin/v1/releases` | Releases (name, commit, channel, series) with their datasets |
 | POST | `/admin/v1/prune` | `{"releases":[], "commits":[], "channels":[]}`; garbage-collects orphaned paths and packages, then rebuilds search |
 | POST | `/admin/v1/reindex` | Rebuilds the Meilisearch index from Postgres and swaps it in |
+| POST | `/admin/v1/check` | Checks closure-index consistency (see below); the job result is a report with `ok`, counts and example rows per issue |
 
 Ingest is purely additive: entries are immutable, so every insert is `ON CONFLICT DO NOTHING` and re-ingesting (or ingesting overlapping bundles) is a no-op for data already present. Nothing is deleted on ingest; rows are only removed by `prune`, which also garbage-collects orphaned store paths and packages. A bundle whose release name is already indexed with a different commit is rejected.
+
+### Consistency
+
+Release membership and references are arrays on store path rows, so PostgreSQL can't enforce them with foreign keys. Ingest and prune maintain the invariants instead, and a few safeguards back them up.
+
+**`nfi-admin check`** runs these checks in one read-only snapshot:
+
+| issue | meaning |
+|---|---|
+| `dangling_refs` | a reference to a store path id that doesn't exist |
+| `unknown_releases` | membership in a release that doesn't exist |
+| `orphan_paths` | a store path that belongs to no release |
+| `open_closures` | a path is in a release that one of its references isn't in |
+
+The check takes about 20 s on all of `nixos-26.05`: 2.7M paths and 38M references.
+
+**Queries fail instead of returning partial results.** If a closure query reaches a dangling reference or a path with no releases, the request fails with HTTP 500 and an `index inconsistency: …` message. It doesn't return a smaller closure.
+
+**Bundles are validated.** `Bundle::validate`, which runs in the indexers and at ingest, rejects closures that aren't closed. Ingest doesn't store paths that belong to none of the ingested releases.
 
 ## CLIs
 
@@ -242,6 +273,7 @@ nfi-admin releases
 nfi-admin prune --channel nixos-24.11 --wait
 nfi-admin prune --commit ac62194c3917 --release nixos-25.05.813814.ac62194c3917
 nfi-admin reindex --wait
+nfi-admin check --wait      # exit status 3 if the index is inconsistent
 nfi-admin jobs [ID] [--wait]
 ```
 

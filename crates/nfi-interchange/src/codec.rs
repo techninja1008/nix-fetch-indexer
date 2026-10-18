@@ -21,7 +21,7 @@ pub enum Compression {
 }
 
 impl Compression {
-    pub const DEFAULT: Compression = Compression::Zstd(19);
+    pub const DEFAULT: Compression = Compression::Zstd(9);
 
     pub fn id(&self) -> u8 {
         match self {
@@ -49,7 +49,7 @@ impl Compression {
         };
         Ok(match name {
             "none" => Compression::None,
-            "zstd" => Compression::Zstd(level.unwrap_or(19) as i32),
+            "zstd" => Compression::Zstd(level.unwrap_or(9) as i32),
             "xz" => Compression::Xz(level.unwrap_or(9) as u32),
             "brotli" => Compression::Brotli(level.unwrap_or(11) as u32),
             _ => bail!("unknown compression {name:?} (expected none, zstd, xz, brotli)"),

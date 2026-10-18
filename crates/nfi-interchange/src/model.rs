@@ -332,6 +332,19 @@ impl Bundle {
                     return Err(format!("{}: reference index {r} out of range", p.name));
                 }
             }
+            // Closures must be closed: a path's references belong to every
+            // release the path belongs to.
+            for p in &c.paths {
+                for &r in &p.references {
+                    let t = &c.paths[r as usize];
+                    if !p.releases.is_subset(&t.releases) {
+                        return Err(format!(
+                            "{}-{} (releases {:?}) references {}-{} which is missing from some of them ({:?})",
+                            p.hash, p.name, p.releases, t.hash, t.name, t.releases
+                        ));
+                    }
+                }
+            }
             for m in &c.missing {
                 check_bits(&m.releases, &m.name)?;
             }

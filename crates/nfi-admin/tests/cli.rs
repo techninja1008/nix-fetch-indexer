@@ -50,9 +50,34 @@ async fn admin_cli_round_trip() {
     assert_eq!(code, 0, "{out}");
     assert!(out.contains("nixos-26.11pre200.bbbbbbbbbbbb"));
 
+    // Consistency check: clean index exits 0.
+    let (code, out, err) = tokio::task::block_in_place(|| admin(svc2, &["check", "--wait"]));
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(out.starts_with("ok:"), "{out}");
+
     let (code, out, _) = tokio::task::block_in_place(|| admin(svc2, &["jobs"]));
     assert_eq!(code, 0);
-    assert_eq!(out.matches("succeeded").count(), 2);
+    assert_eq!(out.matches("succeeded").count(), 3);
+
+    // An inconsistency makes `check --wait` exit 3 and name the problem.
+    sqlx::query("UPDATE store_paths SET refs = refs || 999999::bigint WHERE name = 'glibc-2.40'")
+        .execute(&svc.state.pool)
+        .await
+        .unwrap();
+    let (code, out, _) = tokio::task::block_in_place(|| admin(svc2, &["check", "--wait"]));
+    assert_eq!(code, 3, "{out}");
+    assert!(
+        out.contains("INCONSISTENT") && out.contains("dangling_refs (1)"),
+        "{out}"
+    );
+    let (code, out, _) = tokio::task::block_in_place(|| admin(svc2, &["--json", "check", "--wait"]));
+    assert_eq!(code, 3);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["ok"], false);
+    sqlx::query("UPDATE store_paths SET refs = array_remove(refs, 999999::bigint)")
+        .execute(&svc.state.pool)
+        .await
+        .unwrap();
 
     // Failing ingest exits with status 2; bad token fails with 1.
     let bad = dir.path().join("bad");

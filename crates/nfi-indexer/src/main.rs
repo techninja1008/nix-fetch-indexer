@@ -85,7 +85,7 @@ enum Cmd {
         #[arg(
             long,
             value_delimiter = ',',
-            default_value = "none,zstd:3,zstd:19,xz:6,xz:9,brotli:9,brotli:11"
+            default_value = "none,zstd:3,zstd:9,zstd:19,xz:6,xz:9,brotli:9,brotli:11"
         )]
         algos: Vec<String>,
     },
@@ -99,7 +99,7 @@ struct OutArgs {
     /// binary or json
     #[arg(long, default_value = "binary")]
     format: String,
-    /// none, zstd[:level], xz[:level], brotli[:level] (binary only; default zstd:19)
+    /// none, zstd[:level], xz[:level], brotli[:level] (binary only; default zstd:9)
     #[arg(long)]
     compression: Option<String>,
 }
