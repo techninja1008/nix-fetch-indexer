@@ -32,6 +32,18 @@ enum Cmd {
     Programs(IndexCmd),
     /// Index several datasets in one run (default: closure, packages, programs).
     All(IndexCmd),
+    /// List the releases under a channel prefix (e.g. nixos/26.05), oldest
+    /// first, as `name<TAB>url` lines.
+    ListReleases {
+        prefix: String,
+        /// Only releases newer than this release name.
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long, default_value = DEFAULT_RELEASES_BASE, env = "NFI_RELEASES_BASE")]
+        releases_base: String,
+        #[arg(long, default_value = DEFAULT_S3_LIST_BASE, env = "NFI_S3_LIST_BASE")]
+        s3_list_base: String,
+    },
     /// Merge bundles.
     Merge {
         inputs: Vec<String>,
@@ -357,12 +369,44 @@ async fn main() -> Result<()> {
         Cmd::Outpaths(c) => run_index(c, &[Dataset::Outpaths]).await,
         Cmd::Programs(c) => run_index(c, &[Dataset::Programs]).await,
         Cmd::All(c) => run_index(c, &[Dataset::Closure, Dataset::Packages, Dataset::Programs]).await,
+        Cmd::ListReleases {
+            prefix,
+            since,
+            releases_base,
+            s3_list_base,
+        } => {
+            let fetcher = Fetcher::new(6)?;
+            let mut listed = release::list_channel(&fetcher, &s3_list_base, &releases_base, &prefix).await?;
+            if let Some(since) = &since {
+                let floor = release::revcount(since);
+                listed.retain(|l| release::revcount(&l.name) > floor);
+            }
+            for l in listed {
+                println!("{}\t{}", l.name, l.url);
+            }
+            Ok(())
+        }
         Cmd::Merge { inputs, out } => {
-            let bundles = inputs
-                .iter()
-                .map(|p| codec::read_path_or_stdin(p))
-                .collect::<Result<Vec<_>>>()?;
-            write_out(&ops::merge(bundles), &out).map(|_| ())
+            // Read inputs one at a time so only the merged result and one
+            // input are in memory (cumulative files fold in many bundles).
+            let mut error = None;
+            let n = inputs.len();
+            let bundles = inputs.iter().enumerate().map_while(|(i, p)| {
+                tracing::info!(input = %p, "merging {}/{n}", i + 1);
+                match codec::read_path_or_stdin(p) {
+                    Ok(b) => Some(b),
+                    Err(e) => {
+                        error = Some(e);
+                        None
+                    }
+                }
+            });
+            let merged = ops::merge(bundles);
+            if let Some(e) = error {
+                return Err(e);
+            }
+            merged.validate().map_err(anyhow::Error::msg)?;
+            write_out(&merged, &out).map(|_| ())
         }
         Cmd::Split {
             input,

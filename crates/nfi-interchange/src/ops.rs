@@ -181,6 +181,82 @@ impl ClosureBuilder {
     }
 }
 
+/// Accumulates entries, OR-ing the release bits of entries with equal keys,
+/// so many releases' entries can be collected without holding duplicates.
+pub struct Dedup<K, T> {
+    index: HashMap<K, usize>,
+    entries: Vec<T>,
+    key: fn(&T) -> K,
+    bits: fn(&mut T) -> &mut Bitset,
+}
+
+impl<K: std::hash::Hash + Eq, T> Dedup<K, T> {
+    pub fn add(&mut self, mut e: T) {
+        let k = (self.key)(&e);
+        match self.index.get(&k) {
+            Some(&i) => {
+                let bits = std::mem::take((self.bits)(&mut e));
+                (self.bits)(&mut self.entries[i]).union_with(&bits);
+            }
+            None => {
+                self.index.insert(k, self.entries.len());
+                self.entries.push(e);
+            }
+        }
+    }
+
+    pub fn extend(&mut self, es: impl IntoIterator<Item = T>) {
+        for e in es {
+            self.add(e);
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn into_entries(self) -> Vec<T> {
+        self.entries
+    }
+}
+
+impl Dedup<Package, Package> {
+    pub fn packages() -> Self {
+        Self {
+            index: HashMap::new(),
+            entries: Vec::new(),
+            key: package_key,
+            bits: |p| &mut p.releases,
+        }
+    }
+}
+
+impl Dedup<(String, String, Option<String>, BTreeMap<String, String>), Outpaths> {
+    pub fn outpaths() -> Self {
+        Self {
+            index: HashMap::new(),
+            entries: Vec::new(),
+            key: outpaths_key,
+            bits: |p| &mut p.releases,
+        }
+    }
+}
+
+impl Dedup<(String, String, String), Program> {
+    pub fn programs() -> Self {
+        Self {
+            index: HashMap::new(),
+            entries: Vec::new(),
+            key: program_key,
+            bits: |p| &mut p.releases,
+        }
+    }
+}
+
 fn package_key(p: &Package) -> Package {
     Package {
         releases: Bitset::new(),
@@ -490,4 +566,28 @@ pub fn stats(b: &Bundle) -> Stats {
     }
     s.releases = releases;
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn program(attr: &str, release: usize) -> Program {
+        Program {
+            name: "hello".into(),
+            system: "x86_64-linux".into(),
+            attr: attr.into(),
+            releases: Bitset::single(release),
+        }
+    }
+
+    #[test]
+    fn dedup_unions_releases() {
+        let mut d = Dedup::programs();
+        d.extend([program("hello", 0), program("hello", 2), program("hi", 1)]);
+        assert_eq!(d.len(), 2);
+        let entries = d.into_entries();
+        assert_eq!(entries[0].releases.iter().collect::<Vec<_>>(), [0, 2]);
+        assert_eq!(entries[1].releases.iter().collect::<Vec<_>>(), [1]);
+    }
 }

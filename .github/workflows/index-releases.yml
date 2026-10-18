@@ -1,0 +1,73 @@
+name: Index releases
+
+# Index new NixOS releases and publish the bundles as GitHub releases on the
+# data repository. See "Published indexes" in README.md for the layout and the
+# one-time setup (data repository, NFI_DATA_REPO_TOKEN secret).
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Channel to index (blank: all channels in ci/channels.json)"
+        required: false
+        default: ""
+      max_releases:
+        description: "Index at most this many new releases per channel (0: all)"
+        required: false
+        default: "0"
+
+permissions:
+  contents: read
+
+jobs:
+  channels:
+    runs-on: ubuntu-latest
+    outputs:
+      channels: ${{ steps.list.outputs.channels }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: list
+        env:
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          if [[ -n $CHANNEL ]]; then
+            jq -ec --arg c "$CHANNEL" '[.[] | select(.channel == $c) | .channel] | select(length > 0)' ci/channels.json \
+              || { echo "unknown channel $CHANNEL" >&2; exit 1; }
+          fi
+          echo "channels=$(jq -c --arg c "$CHANNEL" '[.[] | select($c == "" or .channel == $c) | .channel]' ci/channels.json)" >>"$GITHUB_OUTPUT"
+
+  index:
+    needs: channels
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: ${{ fromJSON(needs.channels.outputs.channels) }}
+    # One run per channel at a time: each run appends to the channel's manifest.
+    concurrency:
+      group: index-${{ matrix.channel }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: nfi-indexer
+      - name: Build
+        run: cargo build --release --locked -p nfi-indexer
+      - name: Index and publish
+        env:
+          GH_TOKEN: ${{ secrets.NFI_DATA_REPO_TOKEN }}
+          NFI_STORE: gh:${{ vars.NFI_DATA_REPO || 'techninja1008/nix-fetch-indexer-data' }}
+          NFI_INDEXER: ${{ github.workspace }}/target/release/nfi-indexer
+          NFI_MAX_RELEASES: ${{ inputs.max_releases || '0' }}
+          NFI_WORK: ${{ runner.temp }}/nfi-work
+        run: |
+          if [[ -z $GH_TOKEN ]]; then
+            echo "::error::NFI_DATA_REPO_TOKEN secret is not set"
+            exit 1
+          fi
+          ci/index-channel.sh "${{ matrix.channel }}"

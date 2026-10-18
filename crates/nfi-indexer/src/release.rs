@@ -72,14 +72,13 @@ pub fn revcount(name: &str) -> u64 {
     if parts.len() < 2 {
         return 0;
     }
+    // Stable: `nixos-25.05.813814.<hash>`; pre-releases put the count after
+    // a marker: `nixos-26.11pre880000.<hash>`, `nixos-25.05beta772522.<hash>`.
     let candidate = parts[parts.len() - 2];
-    let digits: String = candidate
-        .rsplit("pre")
-        .next()
-        .unwrap_or(candidate)
-        .chars()
-        .filter(|c| c.is_ascii_digit())
-        .collect();
+    let start = candidate
+        .rfind(|c: char| !c.is_ascii_digit())
+        .map_or(0, |i| i + 1);
+    let digits = &candidate[start..];
     digits.parse().unwrap_or(0)
 }
 
@@ -194,6 +193,10 @@ mod tests {
     fn revcounts() {
         assert_eq!(revcount("nixos-25.05.813814.ac62194c3917"), 813814);
         assert_eq!(revcount("nixos-26.11pre880000.abcdef"), 880000);
+        assert_eq!(revcount("nixos-25.05beta772522.1e5b653dff12"), 772522);
+        assert!(
+            revcount("nixos-25.05beta772522.1e5b653dff12") < revcount("nixos-26.11pre1092090.b25309931cfd")
+        );
         assert_eq!(revcount("garbage"), 0);
     }
 

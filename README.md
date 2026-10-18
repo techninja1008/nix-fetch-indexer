@@ -69,8 +69,50 @@ nfi-indexer split ab.nfib -o per-release/
 nfi-indexer filter ab.nfib --channel nixos-25.05 --section closure,packages -o f.nfib
 nfi-indexer convert ab.nfib --format json -o ab.json
 nfi-indexer inspect ab.nfib
+nfi-indexer list-releases nixos/26.05 --since nixos-26.05.590.ec942ba042da  # name<TAB>url, oldest first
 nfi-indexer bench-compression ab.nfib
 ```
+
+## Published indexes
+
+The `Index releases` workflow (`.github/workflows/index-releases.yml`) runs every six hours. It can also be started by hand, optionally for a single channel and with a cap on how many new releases to index. For each channel in [`ci/channels.json`](ci/channels.json), it runs [`ci/index-channel.sh`](ci/index-channel.sh), which indexes releases not yet published and uploads binary bundles (closure, packages and programs) as GitHub releases on the data repository [`techninja1008/nix-fetch-indexer-data`](https://github.com/techninja1008/nix-fetch-indexer-data).
+
+| Channel | Per-release bundles | Cumulative bundles | Starting point |
+|---|---|---|---|
+| nixos-unstable | yes | no | the newest release when first run |
+| nixos-26.05 | yes | yes | every release |
+| nixos-25.11, nixos-25.05, nixos-24.11, nixos-24.05 | no | yes | every release |
+
+**Assets**
+
+- **Per-release bundles.** Release tag `<release>` (e.g. `nixos-26.05.590.ec942ba042da`). One asset per dataset: `<release>-closure.nfib`, `<release>-packages.nfib` and `<release>-programs.nfib`. The release notes summarise path, package and program counts.
+- **Cumulative bundles.** Release tag `<channel>` (e.g. `nixos-26.05`). One asset per dataset covering every release processed so far: `<series>-<dataset>-cumulative.nfib`, e.g. `26.05-closure-cumulative.nfib`.
+- **Manifest.** Each channel's release (tag `<channel>`) also holds `releases.txt`, which lists the releases processed so far, oldest first. The next run starts after its last line.
+
+**Seeding.** A release usually shares nearly all of its closure with the previous release in the same channel, and very little with older ones. Each new release is therefore seeded with the previous release's closure only. For per-release channels, the seed comes from the previous release's `-closure.nfib`. For cumulative-only channels, it is filtered out of the cumulative bundle. With the seed, only narinfos that are new are fetched.
+
+**Recovery.** If a run fails after publishing some per-release bundles but before updating `releases.txt`, the next run reuses those bundles instead of indexing them again. Merging a release that is already in a cumulative bundle is a no-op.
+
+**Consuming.**
+
+```sh
+D=https://github.com/techninja1008/nix-fetch-indexer-data/releases/download
+# Catch up on a whole channel:
+nfi-admin ingest $D/nixos-26.05/26.05-closure-cumulative.nfib $D/nixos-26.05/26.05-packages-cumulative.nfib --wait
+# Then add releases one at a time:
+nfi-admin ingest $D/nixos-26.05.889.b51242d7d436/nixos-26.05.889.b51242d7d436-closure.nfib --wait
+```
+
+**Setup**
+
+1. Create the data repository with at least one commit, because GitHub releases need a commit to tag.
+2. Create a fine-grained personal access token. Scope it to the data repository with **Contents: read and write**, then store it as the `NFI_DATA_REPO_TOKEN` Actions secret on this repository.
+3. Optional: to publish somewhere else, set the `NFI_DATA_REPO` Actions variable to `owner/repo`.
+4. Optional: run the workflow by hand to backfill. Backfilling a whole old channel can exceed the job's time limit. Set `max_releases` to backfill in batches; every run picks up where the last one stopped.
+
+When a new stable channel appears (e.g. nixos-26.11), add it to `ci/channels.json` with `per_release: true`. Then set the channel it replaces to `per_release: false`. Its existing per-release bundles stay where they are, and its cumulative bundles keep being updated.
+
+The script can also run locally. Set `NFI_STORE=dir:<path>` to write to a directory instead of GitHub, and `NFI_INDEX_ARGS="--sample 30"` for a quick test.
 
 ## Interchange format
 
