@@ -7,8 +7,7 @@ name: Index releases
 #
 # Requires the NFI_DATA_REPO_TOKEN secret: a fine-grained token with Contents
 # read/write on the data repository (which needs at least one commit). Set the
-# NFI_DATA_REPO variable to publish to a different repository. Each run indexes
-# at most 20 new releases per channel, so a backfill continues over several runs.
+# NFI_DATA_REPO variable to publish to a different repository.
 
 on:
   schedule:
@@ -20,9 +19,9 @@ on:
         required: false
         default: ""
       max_releases:
-        description: "Index at most this many new releases per channel (0: all; default 20)"
+        description: "Index at most this many new releases per channel (0: all)"
         required: false
-        default: ""
+        default: "0"
 
 permissions:
   contents: read
@@ -82,9 +81,7 @@ jobs:
           path: bin
       - name: Index and upload
         env:
-          # Batches keep a backfill within the job time limit; later runs
-          # continue where this one stopped.
-          NFI_MAX_RELEASES: ${{ inputs.max_releases || '20' }}
+          NFI_MAX_RELEASES: ${{ inputs.max_releases || '0' }}
           NFI_WORK: ${{ runner.temp }}/nfi-work
         run: |
           chmod +x bin/nfi-indexer
