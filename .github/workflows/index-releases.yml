@@ -37,14 +37,18 @@ jobs:
     outputs:
       channels: ${{ steps.plan.outputs.channels }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Build
         run: |
           cargo build --release --locked -p nfi-indexer
           mkdir -p bin && cp target/release/nfi-indexer bin/
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: nfi-indexer
           path: bin/nfi-indexer
@@ -74,8 +78,10 @@ jobs:
       group: index-${{ matrix.channel }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: nfi-indexer
           path: bin
@@ -83,6 +89,7 @@ jobs:
         env:
           NFI_MAX_RELEASES: ${{ inputs.max_releases || '0' }}
           NFI_WORK: ${{ runner.temp }}/nfi-work
+          CHANNEL: ${{ matrix.channel }}
         run: |
           chmod +x bin/nfi-indexer
-          ci/index-channel.sh "${{ matrix.channel }}"
+          ci/index-channel.sh "$CHANNEL"
