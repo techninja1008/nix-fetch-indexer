@@ -3,7 +3,12 @@ name: Index releases
 # Index new NixOS releases and upload the bundles as GitHub release assets on
 # the data repository. Nothing is ingested anywhere. Channels are discovered
 # automatically (ci/channels.sh, policy in ci/config.json). See "Published
-# indexes" in README.md for the layout and the one-time setup.
+# indexes" in README.md for the layout.
+#
+# Requires the NFI_DATA_REPO_TOKEN secret: a fine-grained token with Contents
+# read/write on the data repository (which needs at least one commit). Set the
+# NFI_DATA_REPO variable to publish to a different repository. Each run indexes
+# at most 20 new releases per channel, so a backfill continues over several runs.
 
 on:
   schedule:

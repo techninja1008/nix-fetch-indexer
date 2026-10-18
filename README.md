@@ -111,13 +111,6 @@ nfi-admin ingest $D/nixos-26.05/26.05-closure-cumulative.nfib $D/nixos-26.05/26.
 nfi-admin ingest $D/nixos-26.05.889.b51242d7d436/nixos-26.05.889.b51242d7d436-closure.nfib --wait
 ```
 
-**Setup**
-
-1. Create the data repository with at least one commit, because GitHub releases need a commit to tag.
-2. Create a fine-grained personal access token. Scope it to the data repository with **Contents: read and write**, then store it as the `NFI_DATA_REPO_TOKEN` Actions secret on this repository.
-3. Optional: to publish somewhere else, set the `NFI_DATA_REPO` Actions variable to `owner/repo`.
-4. Optional: run the workflow by hand to speed up the backfill. Each run indexes at most 20 new releases per channel (`max_releases`), so that a whole channel doesn't exceed the job's time limit. Later runs continue where the previous one stopped, so the scheduled runs finish the backfill of every stable channel from 24.05 within a day or two.
-
 The script can also run locally. Set `NFI_STORE=dir:<path>` to write to a directory instead of GitHub, and `NFI_INDEX_ARGS="--sample 30"` for a quick test.
 
 ## Interchange format
