@@ -269,6 +269,29 @@ pub struct JobInfo {
     pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// One kind of index inconsistency found by a consistency check.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckIssue {
+    /// `dangling_refs`, `unknown_releases`, `orphan_paths` or `open_closures`.
+    pub kind: String,
+    pub description: String,
+    pub count: u64,
+    /// A few affected rows, for diagnosis.
+    #[serde(default)]
+    pub examples: Vec<String>,
+}
+
+/// Result of a consistency check of the closure index.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckReport {
+    pub ok: bool,
+    pub store_paths: u64,
+    pub references: u64,
+    pub releases: u64,
+    /// Only kinds with at least one occurrence are listed.
+    pub issues: Vec<CheckIssue>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ErrorBody {
     pub error: String,

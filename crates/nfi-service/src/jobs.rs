@@ -260,6 +260,11 @@ async fn run_job(state: &AppState, id: i64, kind: &str, params: &Value) -> Resul
             };
             Ok(json!({"search_documents": m.reindex(pool).await?}))
         }
+        "check" => {
+            progress("checking index consistency".into());
+            let report = crate::check::check(pool).await?;
+            Ok(serde_json::to_value(&report)?)
+        }
         other => bail!("unknown job kind {other:?}"),
     }
 }

@@ -221,8 +221,28 @@ The figures below were measured with embedded PostgreSQL 16 on 4 cores.
 | GET | `/admin/v1/releases` | Releases (name, commit, channel, series) with their datasets |
 | POST | `/admin/v1/prune` | `{"releases":[], "commits":[], "channels":[]}`; garbage-collects orphaned paths and packages, then rebuilds search |
 | POST | `/admin/v1/reindex` | Rebuilds the Meilisearch index from Postgres and swaps it in |
+| POST | `/admin/v1/check` | Checks closure-index consistency (see below); the job result is a report with `ok`, counts and example rows per issue |
 
 Ingest is purely additive: entries are immutable, so every insert is `ON CONFLICT DO NOTHING` and re-ingesting (or ingesting overlapping bundles) is a no-op for data already present. Nothing is deleted on ingest; rows are only removed by `prune`, which also garbage-collects orphaned store paths and packages. A bundle whose release name is already indexed with a different commit is rejected.
+
+### Consistency
+
+Release membership and references are arrays on store path rows, so PostgreSQL can't enforce them with foreign keys. Ingest and prune maintain the invariants instead, and a few safeguards back them up.
+
+**`nfi-admin check`** runs these checks in one read-only snapshot:
+
+| issue | meaning |
+|---|---|
+| `dangling_refs` | a reference to a store path id that doesn't exist |
+| `unknown_releases` | membership in a release that doesn't exist |
+| `orphan_paths` | a store path that belongs to no release |
+| `open_closures` | a path is in a release that one of its references isn't in |
+
+The check takes about 20 s on all of `nixos-26.05`: 2.7M paths and 38M references.
+
+**Queries fail instead of returning partial results.** If a closure query reaches a dangling reference or a path with no releases, the request fails with HTTP 500 and an `index inconsistency: …` message. It doesn't return a smaller closure.
+
+**Bundles are validated.** `Bundle::validate`, which runs in the indexers and at ingest, rejects closures that aren't closed. Ingest doesn't store paths that belong to none of the ingested releases.
 
 ## CLIs
 
@@ -253,6 +273,7 @@ nfi-admin releases
 nfi-admin prune --channel nixos-24.11 --wait
 nfi-admin prune --commit ac62194c3917 --release nixos-25.05.813814.ac62194c3917
 nfi-admin reindex --wait
+nfi-admin check --wait      # exit status 3 if the index is inconsistent
 nfi-admin jobs [ID] [--wait]
 ```
 

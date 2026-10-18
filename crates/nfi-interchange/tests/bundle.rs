@@ -243,3 +243,19 @@ fn rejects_garbage() {
     assert!(codec::read(&b"NOPE00"[..]).is_err());
     assert!(codec::read(&b"NFIB\x01\x09"[..]).is_err());
 }
+
+#[test]
+fn validate_rejects_open_closures() {
+    let mut b = sample("r1", &"a".repeat(40), false);
+    b.validate().unwrap();
+    let r2 = b.ensure_release(release("r2", &"b".repeat(40), "nixos-25.05"));
+    // p1 (which references p2) joins r2 without p2: the closure is not closed.
+    let c = b.closure.as_mut().unwrap();
+    let p1 = c.paths.iter_mut().find(|p| p.name == "p1").unwrap();
+    p1.releases.set(r2);
+    let err = b.validate().unwrap_err();
+    assert!(err.contains("p1") && err.contains("p2"), "{err}");
+    assert!(Bitset::from_indices([1, 9]).is_subset(&Bitset::from_indices([1, 2, 9])));
+    assert!(!Bitset::from_indices([1, 9]).is_subset(&Bitset::from_indices([1])));
+    assert!(Bitset::new().is_subset(&Bitset::new()));
+}

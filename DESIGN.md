@@ -171,6 +171,18 @@ A store path's references never change, so they are written only once, when the 
 
 **Prune** removes the pruned release ids from the arrays, then deletes paths that are left with no releases.
 
+**Invariants.** These replace the foreign keys:
+- every reference resolves to an existing path;
+- every release id exists;
+- every path belongs to at least one release;
+- a path's references belong to all of its releases (closures are closed).
+
+**Enforcement:**
+- `Bundle::validate` rejects open closures.
+- Ingest skips paths outside the ingested releases.
+- `nfi-admin check` (`POST /admin/v1/check`) verifies the invariants.
+- Closure queries fail with an `index inconsistency` error instead of returning partial results.
+
 ### Jobs
 
 - Admin ingest and prune requests enqueue a job.
@@ -209,6 +221,7 @@ A store path's references never change, so they are written only once, when the 
 - `GET /admin/v1/releases` lists releases and their datasets.
 - `POST /admin/v1/prune` takes `{releases?:[name], commits?:[hash], channels?:[name]}` and returns a job id.
 - `POST /admin/v1/reindex` returns a job id.
+- `POST /admin/v1/check` returns a job id. The job's result is a consistency report: `ok`, totals, and per issue kind a count and examples.
 
 ### Minimise algorithm
 

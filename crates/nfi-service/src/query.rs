@@ -27,6 +27,12 @@ impl ReleaseRow {
     }
 }
 
+/// The index violates an invariant that ingest and prune maintain (see
+/// `nfi-admin check`). Queries fail rather than return partial answers.
+#[derive(Debug, thiserror::Error)]
+#[error("index inconsistency: {0}; run `nfi-admin check` for details")]
+pub struct Inconsistent(pub String);
+
 pub enum CommitLookup {
     Found(ReleaseRow),
     Unknown,
@@ -64,12 +70,15 @@ pub struct ClosureNode {
 pub async fn cached_paths(pool: &PgPool, paths: &BTreeSet<String>) -> Result<BTreeSet<String>> {
     let parsed: Vec<StorePath> = paths.iter().filter_map(|p| StorePath::parse(p).ok()).collect();
     let hashes: Vec<String> = parsed.iter().map(|p| p.hash.to_string()).collect();
-    let found: Vec<(String, String)> =
-        sqlx::query_as("SELECT hash, name FROM store_paths WHERE hash = ANY($1)")
+    let found: Vec<(String, String, i32)> =
+        sqlx::query_as("SELECT hash, name, cardinality(releases) FROM store_paths WHERE hash = ANY($1)")
             .bind(&hashes)
             .fetch_all(pool)
             .await?;
-    let found: HashMap<String, String> = found.into_iter().collect();
+    if let Some((hash, name, _)) = found.iter().find(|(_, _, n)| *n == 0) {
+        return Err(Inconsistent(format!("store path {hash}-{name} belongs to no release")).into());
+    }
+    let found: HashMap<String, String> = found.into_iter().map(|(h, n, _)| (h, n)).collect();
     Ok(parsed
         .into_iter()
         .filter(|p| found.get(&p.hash.to_string()).is_some_and(|n| *n == p.name))
@@ -90,13 +99,13 @@ pub async fn closure(
     if hashes.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
-    let rows: Vec<(i64, String, String, Option<i64>, Option<i64>, Vec<i64>)> = sqlx::query_as(
+    let rows: Vec<(i64, String, String, Option<i64>, Option<i64>, Vec<i64>, i32)> = sqlx::query_as(
         "WITH RECURSIVE c(id) AS (
              SELECT id FROM store_paths WHERE hash = ANY($1)
              UNION
              SELECT unnest(s.refs) FROM store_paths s JOIN c ON s.id = c.id
          )
-         SELECT s.id, s.hash, s.name, s.nar_size, s.file_size, s.refs
+         SELECT s.id, s.hash, s.name, s.nar_size, s.file_size, s.refs, cardinality(s.releases)
            FROM c JOIN store_paths s ON s.id = c.id ORDER BY s.hash",
     )
     .bind(&hashes)
@@ -106,17 +115,24 @@ pub async fn closure(
         .iter()
         .map(|(id, hash, name, ..)| (*id, format!("/nix/store/{hash}-{name}")))
         .collect();
+    // References to ids without a row would otherwise silently shrink the
+    // closure (the recursive join drops them).
     let mut edges = Vec::new();
-    for (id, _, _, _, _, refs) in &rows {
+    for (id, _, _, _, _, refs, releases) in &rows {
+        let path = &by_id[id];
+        if *releases == 0 {
+            return Err(Inconsistent(format!("store path {path} belongs to no release")).into());
+        }
         for r in refs {
-            if let (Some(a), Some(b)) = (by_id.get(id), by_id.get(r)) {
-                edges.push((a.clone(), b.clone()));
-            }
+            let Some(target) = by_id.get(r) else {
+                return Err(Inconsistent(format!("{path} references missing store path id {r}")).into());
+            };
+            edges.push((path.clone(), target.clone()));
         }
     }
     let nodes = rows
         .into_iter()
-        .map(|(id, _, _, nar, file, _)| ClosureNode {
+        .map(|(id, _, _, nar, file, _, _)| ClosureNode {
             id,
             path: by_id[&id].clone(),
             nar_size: nar,

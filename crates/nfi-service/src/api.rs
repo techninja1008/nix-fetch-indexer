@@ -55,6 +55,7 @@ pub fn admin_router(state: AppState) -> Router {
         .route("/admin/v1/releases", get(releases))
         .route("/admin/v1/prune", post(prune))
         .route("/admin/v1/reindex", post(reindex))
+        .route("/admin/v1/check", post(check))
         .layer(DefaultBodyLimit::disable())
         .layer(middleware::from_fn_with_state(state.clone(), admin_auth))
         .route("/healthz", get(|| async { "ok" }))
@@ -212,6 +213,11 @@ async fn reindex(State(s): State<AppState>) -> Result<Response, AppError> {
         return Err(err(StatusCode::SERVICE_UNAVAILABLE, "search is not configured"));
     }
     let id = jobs::enqueue(&s.pool, "reindex", serde_json::json!({})).await?;
+    Ok((StatusCode::ACCEPTED, Json(JobCreated { id })).into_response())
+}
+
+async fn check(State(s): State<AppState>) -> Result<Response, AppError> {
+    let id = jobs::enqueue(&s.pool, "check", serde_json::json!({})).await?;
     Ok((StatusCode::ACCEPTED, Json(JobCreated { id })).into_response())
 }
 

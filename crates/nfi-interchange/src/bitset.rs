@@ -62,6 +62,14 @@ impl Bitset {
         })
     }
 
+    /// Whether every bit set in `self` is also set in `other`.
+    pub fn is_subset(&self, other: &Bitset) -> bool {
+        self.0
+            .iter()
+            .enumerate()
+            .all(|(i, &b)| b & !other.0.get(i).copied().unwrap_or(0) == 0)
+    }
+
     pub fn union_with(&mut self, other: &Bitset) {
         if self.0.len() < other.0.len() {
             self.0.resize(other.0.len(), 0);

@@ -159,10 +159,17 @@ pub async fn ingest(
         let (mut paths, mut refs, mut missing) = (CopyBuf::new(), CopyBuf::new(), CopyBuf::new());
         let mut releases_text = String::new();
         for (i, p) in c.paths.iter().enumerate() {
+            let ids = release_ids(&p.releases, &rel_mask);
+            // Paths in none of the releases whose closure is ingested are not
+            // stored (they would be orphans). The bundle's closures are closed
+            // (checked by validate()), so no stored path references them.
+            if ids.is_empty() {
+                continue;
+            }
             let hash = p.hash.to_string();
             releases_text.clear();
             releases_text.push('{');
-            for (n, id) in release_ids(&p.releases, &rel_mask).into_iter().enumerate() {
+            for (n, id) in ids.into_iter().enumerate() {
                 if n > 0 {
                     releases_text.push(',');
                 }

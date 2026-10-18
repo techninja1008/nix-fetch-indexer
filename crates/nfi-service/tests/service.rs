@@ -409,3 +409,111 @@ async fn admin_token_and_url_ingest() {
         assert_eq!(j.result.unwrap()["search_documents"], 4);
     }
 }
+
+#[tokio::test]
+async fn consistency_check_and_query_errors() {
+    let Some(c) = setup(None).await else { return };
+    c.ingest_bytes(encode(&bundle(), Format::Binary(Compression::Zstd(3))))
+        .await;
+    let pool = &c.svc.state.pool;
+    let run_check = || async {
+        let r = c
+            .admin(reqwest::Method::POST, "/admin/v1/check")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 202);
+        let j = c.wait_job(r.json::<JobCreated>().await.unwrap().id).await;
+        assert_eq!(j.status, JobStatus::Succeeded, "{:?}", j.error);
+        serde_json::from_value::<CheckReport>(j.result.unwrap()).unwrap()
+    };
+    let report = run_check().await;
+    assert!(report.ok, "{report:?}");
+    assert_eq!(report.store_paths, 6);
+    assert_eq!(report.releases, 2);
+    let bulk = |attr: &str| json!({"items": [{"attr": attr, "commit": A}]});
+    let (s, _): (u16, BulkResponse) = c.post("/v1/lookup/bulk", &bulk("hello")).await;
+    assert_eq!(s, 200);
+
+    let exec = |sql: &'static str| async move { sqlx::query(sql).execute(pool).await.unwrap() };
+    let hello = format!("{}", h(2));
+    let glibc = format!("{}", h(1));
+    // 1. A dangling reference: queries touching it fail instead of returning a short closure.
+    sqlx::query("UPDATE store_paths SET refs = refs || 999999::bigint WHERE hash = $1")
+        .bind(&hello)
+        .execute(pool)
+        .await
+        .unwrap();
+    let (s, e): (u16, Value) = c.post("/v1/lookup/bulk", &bulk("hello")).await;
+    assert_eq!(s, 500);
+    assert!(
+        e["error"].as_str().unwrap().contains("index inconsistency"),
+        "{e}"
+    );
+    assert!(
+        e["error"]
+            .as_str()
+            .unwrap()
+            .contains("missing store path id 999999"),
+        "{e}"
+    );
+    // Unaffected closures still work.
+    let (s, _): (u16, BulkResponse) = c.post("/v1/lookup/bulk", &bulk("curl")).await;
+    assert_eq!(s, 200);
+    // 2. Membership in an unknown release, 3. an orphan path, 4. an open closure.
+    exec("UPDATE store_paths SET releases = releases || 4242 WHERE name = 'curl-8.0'").await;
+    exec("INSERT INTO store_paths (hash, name, releases) VALUES ('orphanorphanorphanorphanorphan00', 'orphan', '{}')").await;
+    sqlx::query("UPDATE store_paths SET releases = releases[1:1] WHERE hash = $1")
+        .bind(&glibc)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    let report = run_check().await;
+    assert!(!report.ok);
+    let kinds: Vec<(&str, u64)> = report.issues.iter().map(|i| (i.kind.as_str(), i.count)).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            ("dangling_refs", 1),
+            ("unknown_releases", 1),
+            ("orphan_paths", 1),
+            ("open_closures", 4)
+        ]
+    );
+    assert!(report.issues[0].examples[0].contains("missing id 999999"));
+    assert!(report.issues[1].examples[0].contains("missing release id 4242"));
+
+    // A path with no releases is inconsistent too when a query reaches it.
+    exec("UPDATE store_paths SET releases = '{}' WHERE name = 'curl-8.0'").await;
+    let (s, e): (u16, Value) = c.get(&format!("/v1/packages/curl?commit={A}")).await;
+    assert_eq!(s, 500);
+    assert!(
+        e["error"].as_str().unwrap().contains("belongs to no release"),
+        "{e}"
+    );
+}
+
+#[tokio::test]
+async fn ingest_skips_paths_outside_ingested_releases() {
+    let Some(c) = setup(None).await else { return };
+    // Release B carries only packages: its closure bits must not be stored,
+    // and paths only in B must not become orphans.
+    let mut b = bundle();
+    b.releases[1].datasets = vec![Dataset::Packages];
+    c.ingest_bytes(encode(&b, Format::Json)).await;
+    let only_b: i64 = sqlx::query_scalar("SELECT count(*) FROM store_paths WHERE name = 'only-in-b'")
+        .fetch_one(&c.svc.state.pool)
+        .await
+        .unwrap();
+    assert_eq!(only_b, 0);
+    let r = c
+        .admin(reqwest::Method::POST, "/admin/v1/check")
+        .send()
+        .await
+        .unwrap();
+    let j = c.wait_job(r.json::<JobCreated>().await.unwrap().id).await;
+    let report: CheckReport = serde_json::from_value(j.result.unwrap()).unwrap();
+    assert!(report.ok, "{report:?}");
+    assert_eq!(report.store_paths, 5);
+}
