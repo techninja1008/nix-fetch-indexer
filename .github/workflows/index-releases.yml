@@ -1,0 +1,91 @@
+name: Index releases
+
+# Index new NixOS releases and upload the bundles as GitHub release assets on
+# the data repository. Nothing is ingested anywhere. Channels are discovered
+# automatically (ci/channels.sh, policy in ci/config.json). See "Published
+# indexes" in README.md for the layout.
+#
+# Requires the NFI_DATA_REPO_TOKEN secret: a fine-grained token with Contents
+# read/write on the data repository (which needs at least one commit). Set the
+# NFI_DATA_REPO variable to publish to a different repository. Each run indexes
+# at most 20 new releases per channel, so a backfill continues over several runs.
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Only this channel, e.g. nixos-26.05 (blank: all)"
+        required: false
+        default: ""
+      max_releases:
+        description: "Index at most this many new releases per channel (0: all; default 20)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  GH_TOKEN: ${{ secrets.NFI_DATA_REPO_TOKEN }}
+  NFI_STORE: gh:${{ vars.NFI_DATA_REPO || 'techninja1008/nix-fetch-indexer-data' }}
+  NFI_INDEXER: ${{ github.workspace }}/bin/nfi-indexer
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      channels: ${{ steps.plan.outputs.channels }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: |
+          cargo build --release --locked -p nfi-indexer
+          mkdir -p bin && cp target/release/nfi-indexer bin/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nfi-indexer
+          path: bin/nfi-indexer
+          retention-days: 1
+      - name: Find channels with new releases
+        id: plan
+        env:
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          if [[ -z $GH_TOKEN ]]; then
+            echo "::error::NFI_DATA_REPO_TOKEN secret is not set"
+            exit 1
+          fi
+          echo "channels=$(ci/plan.sh "$CHANNEL")" >>"$GITHUB_OUTPUT"
+
+  index:
+    needs: plan
+    if: needs.plan.outputs.channels != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: ${{ fromJSON(needs.plan.outputs.channels) }}
+    # One run per channel at a time: each run appends to the channel's manifest.
+    concurrency:
+      group: index-${{ matrix.channel }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: nfi-indexer
+          path: bin
+      - name: Index and upload
+        env:
+          # Batches keep a backfill within the job time limit; later runs
+          # continue where this one stopped.
+          NFI_MAX_RELEASES: ${{ inputs.max_releases || '20' }}
+          NFI_WORK: ${{ runner.temp }}/nfi-work
+        run: |
+          chmod +x bin/nfi-indexer
+          ci/index-channel.sh "${{ matrix.channel }}"

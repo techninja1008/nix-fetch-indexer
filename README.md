@@ -69,8 +69,49 @@ nfi-indexer split ab.nfib -o per-release/
 nfi-indexer filter ab.nfib --channel nixos-25.05 --section closure,packages -o f.nfib
 nfi-indexer convert ab.nfib --format json -o ab.json
 nfi-indexer inspect ab.nfib
+nfi-indexer list-channels nixos   # 24.05, 26.05, unstable, ...
+nfi-indexer list-releases nixos/26.05 --since nixos-26.05.590.ec942ba042da  # name<TAB>url, oldest first
 nfi-indexer bench-compression ab.nfib
 ```
+
+## Published indexes
+
+The `Index releases` workflow (`.github/workflows/index-releases.yml`) runs every six hours, and can also be started by hand for one channel with a cap on how many new releases to index. It only uploads: bundles are published as GitHub release assets on [`techninja1008/nix-fetch-indexer-data`](https://github.com/techninja1008/nix-fetch-indexer-data), and nothing is ingested anywhere.
+
+1. A plan job builds `nfi-indexer` once. [`ci/channels.sh`](ci/channels.sh) discovers the channels on releases.nixos.org, and [`ci/plan.sh`](ci/plan.sh) keeps those with releases not yet published.
+2. One job per such channel runs [`ci/index-channel.sh`](ci/index-channel.sh), which indexes the new releases and uploads binary bundles (closure, packages and programs).
+
+**Channels.** Channels are discovered automatically according to the policy in [`ci/config.json`](ci/config.json); `-small` and `-aarch64` channels are skipped.
+
+| Channel | Per-release bundles | Cumulative bundles | Starting point |
+|---|---|---|---|
+| nixos-unstable | yes | no | the newest release when first run (`unstable_start`) |
+| nixos-YY.MM from 26.05 (`per_release_from`), including new channels such as 26.11 | yes | yes | every release |
+| nixos-24.05 (`oldest`) to nixos-25.11 | no | yes | every release |
+
+A stable channel only gets releases for about a month after the next one ships; 25.11's last release, for example, was on 2026-07-01. Channels before 26.05 had stopped updating before publishing started, so they only get cumulative bundles. Every release from now on, in any stable channel, gets both per-release and cumulative bundles.
+
+**Assets**
+
+- **Per-release bundles.** Release tag `<release>` (e.g. `nixos-26.05.590.ec942ba042da`). One asset per dataset: `<release>-closure.nfib`, `<release>-packages.nfib` and `<release>-programs.nfib`. The release notes summarise path, package and program counts.
+- **Cumulative bundles.** Release tag `<channel>` (e.g. `nixos-26.05`). One asset per dataset covering every release processed so far: `<series>-<dataset>-cumulative.nfib`, e.g. `26.05-closure-cumulative.nfib`.
+- **Manifest.** Each channel's release (tag `<channel>`) also holds `releases.txt`, which lists the releases processed so far, oldest first. The next run starts after its last line.
+
+**Seeding.** A release usually shares nearly all of its closure with the previous release in the same channel, and very little with older ones. Each new release is therefore seeded with the previous release's closure only. For per-release channels, the seed comes from the previous release's `-closure.nfib`. For cumulative-only channels, it is filtered out of the cumulative bundle. With the seed, only narinfos that are new are fetched.
+
+**Recovery.** If a run fails after publishing some per-release bundles but before updating `releases.txt`, the next run reuses those bundles instead of indexing them again. Merging a release that is already in a cumulative bundle is a no-op.
+
+**Using the bundles.** The workflow doesn't ingest anything. To load published bundles into a query service:
+
+```sh
+D=https://github.com/techninja1008/nix-fetch-indexer-data/releases/download
+# Catch up on a whole channel:
+nfi-admin ingest $D/nixos-26.05/26.05-closure-cumulative.nfib $D/nixos-26.05/26.05-packages-cumulative.nfib --wait
+# Then add releases one at a time:
+nfi-admin ingest $D/nixos-26.05.889.b51242d7d436/nixos-26.05.889.b51242d7d436-closure.nfib --wait
+```
+
+The script can also run locally. Set `NFI_STORE=dir:<path>` to write to a directory instead of GitHub, and `NFI_INDEX_ARGS="--sample 30"` for a quick test.
 
 ## Interchange format
 

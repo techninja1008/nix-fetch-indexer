@@ -85,9 +85,11 @@ pub async fn index_releases_with_report(
     }
     let seed_sections = seed.clone();
 
-    let mut package_entries = Vec::new();
-    let mut outpath_entries = Vec::new();
-    let mut program_entries = Vec::new();
+    // Deduplicated as each release is added: consecutive releases share most
+    // entries, and a whole channel would otherwise hold ~100x the entries.
+    let mut package_entries = ops::Dedup::packages();
+    let mut outpath_entries = ops::Dedup::outpaths();
+    let mut program_entries = ops::Dedup::programs();
     let mut new_releases = Vec::new();
 
     for loc in locations {
@@ -196,17 +198,17 @@ pub async fn index_releases_with_report(
     }
     if opts.datasets.contains(&Dataset::Packages) {
         bundle.packages = Some(PackagesSection {
-            entries: package_entries,
+            entries: package_entries.into_entries(),
         });
     }
     if opts.datasets.contains(&Dataset::Outpaths) {
         bundle.outpaths = Some(OutpathsSection {
-            entries: outpath_entries,
+            entries: outpath_entries.into_entries(),
         });
     }
     if opts.datasets.contains(&Dataset::Programs) {
         bundle.programs = Some(ProgramsSection {
-            entries: program_entries,
+            entries: program_entries.into_entries(),
         });
     }
 

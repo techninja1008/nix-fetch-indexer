@@ -72,14 +72,13 @@ pub fn revcount(name: &str) -> u64 {
     if parts.len() < 2 {
         return 0;
     }
+    // Stable: `nixos-25.05.813814.<hash>`; pre-releases put the count after
+    // a marker: `nixos-26.11pre880000.<hash>`, `nixos-25.05beta772522.<hash>`.
     let candidate = parts[parts.len() - 2];
-    let digits: String = candidate
-        .rsplit("pre")
-        .next()
-        .unwrap_or(candidate)
-        .chars()
-        .filter(|c| c.is_ascii_digit())
-        .collect();
+    let start = candidate
+        .rfind(|c: char| !c.is_ascii_digit())
+        .map_or(0, |i| i + 1);
+    let digits = &candidate[start..];
     digits.parse().unwrap_or(0)
 }
 
@@ -92,6 +91,21 @@ pub async fn list_channel(
     prefix: &str,
 ) -> Result<Vec<ReleaseLocation>> {
     let prefix = format!("{}/", prefix.trim_matches('/'));
+    let mut names = list_children(fetcher, s3_base, &prefix)
+        .await
+        .context("listing releases")?;
+    names.sort_by_key(|n| (revcount(n), n.clone()));
+    let base = releases_base.trim_end_matches('/');
+    names
+        .into_iter()
+        .map(|n| ReleaseLocation::parse(&format!("{base}/{prefix}{n}")))
+        .collect()
+}
+
+/// List the immediate "directories" under an S3 prefix (e.g. the channels
+/// under `nixos/`), sorted by name.
+pub async fn list_children(fetcher: &Fetcher, s3_base: &str, prefix: &str) -> Result<Vec<String>> {
+    let prefix = format!("{}/", prefix.trim_matches('/'));
     let mut marker: Option<String> = None;
     let mut names = Vec::new();
     loop {
@@ -99,17 +113,12 @@ pub async fn list_channel(
         if let Some(m) = &marker {
             url.push_str(&format!("&marker={m}"));
         }
-        let xml = fetcher.get_text(&url).await.context("listing releases")?;
+        let xml = fetcher.get_text(&url).await?;
         let page = parse_list(&xml);
         for p in &page.prefixes {
-            let name = p
-                .trim_end_matches('/')
-                .rsplit('/')
-                .next()
-                .unwrap_or("")
-                .to_string();
-            if !name.is_empty() {
-                names.push(name);
+            let name = p.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+            if !name.is_empty() && format!("{prefix}{name}/") == *p {
+                names.push(name.to_string());
             }
         }
         if page.truncated {
@@ -121,13 +130,9 @@ pub async fn list_channel(
             break;
         }
     }
-    names.sort_by_key(|n| (revcount(n), n.clone()));
+    names.sort();
     names.dedup();
-    let base = releases_base.trim_end_matches('/');
-    names
-        .into_iter()
-        .map(|n| ReleaseLocation::parse(&format!("{base}/{prefix}{n}")))
-        .collect()
+    Ok(names)
 }
 
 pub struct ListPage {
@@ -194,6 +199,10 @@ mod tests {
     fn revcounts() {
         assert_eq!(revcount("nixos-25.05.813814.ac62194c3917"), 813814);
         assert_eq!(revcount("nixos-26.11pre880000.abcdef"), 880000);
+        assert_eq!(revcount("nixos-25.05beta772522.1e5b653dff12"), 772522);
+        assert!(
+            revcount("nixos-25.05beta772522.1e5b653dff12") < revcount("nixos-26.11pre1092090.b25309931cfd")
+        );
         assert_eq!(revcount("garbage"), 0);
     }
 
