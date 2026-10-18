@@ -44,6 +44,13 @@ enum Cmd {
         #[arg(long, default_value = DEFAULT_S3_LIST_BASE, env = "NFI_S3_LIST_BASE")]
         s3_list_base: String,
     },
+    /// List the channels under a release prefix (e.g. nixos), one per line.
+    ListChannels {
+        #[arg(default_value = "nixos")]
+        prefix: String,
+        #[arg(long, default_value = DEFAULT_S3_LIST_BASE, env = "NFI_S3_LIST_BASE")]
+        s3_list_base: String,
+    },
     /// Merge bundles.
     Merge {
         inputs: Vec<String>,
@@ -383,6 +390,13 @@ async fn main() -> Result<()> {
             }
             for l in listed {
                 println!("{}\t{}", l.name, l.url);
+            }
+            Ok(())
+        }
+        Cmd::ListChannels { prefix, s3_list_base } => {
+            let fetcher = Fetcher::new(6)?;
+            for name in release::list_children(&fetcher, &s3_list_base, &prefix).await? {
+                println!("{name}");
             }
             Ok(())
         }

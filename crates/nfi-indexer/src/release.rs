@@ -91,6 +91,21 @@ pub async fn list_channel(
     prefix: &str,
 ) -> Result<Vec<ReleaseLocation>> {
     let prefix = format!("{}/", prefix.trim_matches('/'));
+    let mut names = list_children(fetcher, s3_base, &prefix)
+        .await
+        .context("listing releases")?;
+    names.sort_by_key(|n| (revcount(n), n.clone()));
+    let base = releases_base.trim_end_matches('/');
+    names
+        .into_iter()
+        .map(|n| ReleaseLocation::parse(&format!("{base}/{prefix}{n}")))
+        .collect()
+}
+
+/// List the immediate "directories" under an S3 prefix (e.g. the channels
+/// under `nixos/`), sorted by name.
+pub async fn list_children(fetcher: &Fetcher, s3_base: &str, prefix: &str) -> Result<Vec<String>> {
+    let prefix = format!("{}/", prefix.trim_matches('/'));
     let mut marker: Option<String> = None;
     let mut names = Vec::new();
     loop {
@@ -98,17 +113,12 @@ pub async fn list_channel(
         if let Some(m) = &marker {
             url.push_str(&format!("&marker={m}"));
         }
-        let xml = fetcher.get_text(&url).await.context("listing releases")?;
+        let xml = fetcher.get_text(&url).await?;
         let page = parse_list(&xml);
         for p in &page.prefixes {
-            let name = p
-                .trim_end_matches('/')
-                .rsplit('/')
-                .next()
-                .unwrap_or("")
-                .to_string();
-            if !name.is_empty() {
-                names.push(name);
+            let name = p.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+            if !name.is_empty() && format!("{prefix}{name}/") == *p {
+                names.push(name.to_string());
             }
         }
         if page.truncated {
@@ -120,13 +130,9 @@ pub async fn list_channel(
             break;
         }
     }
-    names.sort_by_key(|n| (revcount(n), n.clone()));
+    names.sort();
     names.dedup();
-    let base = releases_base.trim_end_matches('/');
-    names
-        .into_iter()
-        .map(|n| ReleaseLocation::parse(&format!("{base}/{prefix}{n}")))
-        .collect()
+    Ok(names)
 }
 
 pub struct ListPage {

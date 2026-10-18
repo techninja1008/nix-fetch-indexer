@@ -1,0 +1,6 @@
+{
+  "oldest": "24.05",
+  "per_release_from": "26.05",
+  "unstable_start": "latest",
+  "datasets": "closure,packages,programs"
+}

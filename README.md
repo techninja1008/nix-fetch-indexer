@@ -69,19 +69,27 @@ nfi-indexer split ab.nfib -o per-release/
 nfi-indexer filter ab.nfib --channel nixos-25.05 --section closure,packages -o f.nfib
 nfi-indexer convert ab.nfib --format json -o ab.json
 nfi-indexer inspect ab.nfib
+nfi-indexer list-channels nixos   # 24.05, 26.05, unstable, ...
 nfi-indexer list-releases nixos/26.05 --since nixos-26.05.590.ec942ba042da  # name<TAB>url, oldest first
 nfi-indexer bench-compression ab.nfib
 ```
 
 ## Published indexes
 
-The `Index releases` workflow (`.github/workflows/index-releases.yml`) runs every six hours. It can also be started by hand, optionally for a single channel and with a cap on how many new releases to index. For each channel in [`ci/channels.json`](ci/channels.json), it runs [`ci/index-channel.sh`](ci/index-channel.sh), which indexes releases not yet published and uploads binary bundles (closure, packages and programs) as GitHub releases on the data repository [`techninja1008/nix-fetch-indexer-data`](https://github.com/techninja1008/nix-fetch-indexer-data).
+The `Index releases` workflow (`.github/workflows/index-releases.yml`) runs every six hours, and can also be started by hand for one channel with a cap on how many new releases to index. It only uploads: bundles are published as GitHub release assets on [`techninja1008/nix-fetch-indexer-data`](https://github.com/techninja1008/nix-fetch-indexer-data), and nothing is ingested anywhere.
+
+1. A plan job builds `nfi-indexer` once. [`ci/channels.sh`](ci/channels.sh) discovers the channels on releases.nixos.org, and [`ci/plan.sh`](ci/plan.sh) keeps those with releases not yet published.
+2. One job per such channel runs [`ci/index-channel.sh`](ci/index-channel.sh), which indexes the new releases and uploads binary bundles (closure, packages and programs).
+
+**Channels.** Channels are discovered automatically according to the policy in [`ci/config.json`](ci/config.json); `-small` and `-aarch64` channels are skipped.
 
 | Channel | Per-release bundles | Cumulative bundles | Starting point |
 |---|---|---|---|
-| nixos-unstable | yes | no | the newest release when first run |
-| nixos-26.05 | yes | yes | every release |
-| nixos-25.11, nixos-25.05, nixos-24.11, nixos-24.05 | no | yes | every release |
+| nixos-unstable | yes | no | the newest release when first run (`unstable_start`) |
+| nixos-YY.MM from 26.05 (`per_release_from`), including new channels such as 26.11 | yes | yes | every release |
+| nixos-24.05 (`oldest`) to nixos-25.11 | no | yes | every release |
+
+A stable channel only gets releases for about a month after the next one ships; 25.11's last release, for example, was on 2026-07-01. Channels before 26.05 had stopped updating before publishing started, so they only get cumulative bundles. Every release from now on, in any stable channel, gets both per-release and cumulative bundles.
 
 **Assets**
 
@@ -93,7 +101,7 @@ The `Index releases` workflow (`.github/workflows/index-releases.yml`) runs ever
 
 **Recovery.** If a run fails after publishing some per-release bundles but before updating `releases.txt`, the next run reuses those bundles instead of indexing them again. Merging a release that is already in a cumulative bundle is a no-op.
 
-**Consuming.**
+**Using the bundles.** The workflow doesn't ingest anything. To load published bundles into a query service:
 
 ```sh
 D=https://github.com/techninja1008/nix-fetch-indexer-data/releases/download
@@ -108,9 +116,7 @@ nfi-admin ingest $D/nixos-26.05.889.b51242d7d436/nixos-26.05.889.b51242d7d436-cl
 1. Create the data repository with at least one commit, because GitHub releases need a commit to tag.
 2. Create a fine-grained personal access token. Scope it to the data repository with **Contents: read and write**, then store it as the `NFI_DATA_REPO_TOKEN` Actions secret on this repository.
 3. Optional: to publish somewhere else, set the `NFI_DATA_REPO` Actions variable to `owner/repo`.
-4. Optional: run the workflow by hand to backfill. Backfilling a whole old channel can exceed the job's time limit. Set `max_releases` to backfill in batches; every run picks up where the last one stopped.
-
-When a new stable channel appears (e.g. nixos-26.11), add it to `ci/channels.json` with `per_release: true`. Then set the channel it replaces to `per_release: false`. Its existing per-release bundles stay where they are, and its cumulative bundles keep being updated.
+4. Optional: run the workflow by hand to speed up the backfill. Each run indexes at most 20 new releases per channel (`max_releases`), so that a whole channel doesn't exceed the job's time limit. Later runs continue where the previous one stopped, so the scheduled runs finish the backfill of every stable channel from 24.05 within a day or two.
 
 The script can also run locally. Set `NFI_STORE=dir:<path>` to write to a directory instead of GitHub, and `NFI_INDEX_ARGS="--sample 30"` for a quick test.
 

@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Index new releases of one channel and publish the bundles.
+# Index new releases of one channel and publish the bundles. Nothing is
+# ingested anywhere: the bundles are only uploaded.
 #
-# Usage: ci/index-channel.sh <channel>        (e.g. nixos-26.05)
+# Usage: ci/index-channel.sh [--check] <channel>    (e.g. nixos-26.05)
 #
-# The channel's settings come from ci/channels.json:
-#   prefix       release prefix on releases.nixos.org (e.g. nixos/26.05)
-#   series       short name used for cumulative assets (e.g. 26.05)
+#   --check  only print the number of new releases, and exit
+#
+# The channel's settings come from ci/channels.sh (policy: ci/config.json):
 #   per_release  publish each release as its own GitHub release (tag = release
 #                name) with one asset per dataset: <release>-<dataset>.nfib
 #   cumulative   maintain <series>-<dataset>-cumulative.nfib assets on the
@@ -21,18 +22,20 @@
 #   NFI_STORE         gh:<owner>/<repo> (GitHub releases, needs GH_TOKEN) or
 #                     dir:<path> (local directory, for testing)
 #   NFI_INDEXER       nfi-indexer binary (default: nfi-indexer on PATH)
-#   NFI_CHANNELS      channel config (default: channels.json next to this script)
-#   NFI_DATASETS      default: closure,packages,programs
+#   NFI_CONFIG        policy (default: config.json next to this script)
+#   NFI_DATASETS      default: `datasets` from the policy
 #   NFI_MAX_RELEASES  index at most this many new releases per run (default: all)
 #   NFI_INDEX_ARGS    extra arguments for `nfi-indexer all` (e.g. --sample 50)
 #   NFI_WORK          work directory (default: a temporary directory)
 set -euo pipefail
 
-channel=${1:?usage: index-channel.sh <channel>}
+check=false
+if [[ ${1:-} == --check ]]; then check=true; shift; fi
+channel=${1:?usage: index-channel.sh [--check] <channel>}
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 NFI=${NFI_INDEXER:-nfi-indexer}
-CHANNELS=${NFI_CHANNELS:-$here/channels.json}
-DATASETS=${NFI_DATASETS:-closure,packages,programs}
+export NFI_CONFIG=${NFI_CONFIG:-$here/config.json}
+DATASETS=${NFI_DATASETS:-$(jq -r '.datasets // "closure,packages,programs"' "$NFI_CONFIG")}
 MAX=${NFI_MAX_RELEASES:-0}
 STORE=${NFI_STORE:?set NFI_STORE to gh:<owner>/<repo> or dir:<path>}
 read -r -a INDEX_ARGS <<<"${NFI_INDEX_ARGS:-}"
@@ -40,13 +43,13 @@ IFS=, read -r -a datasets <<<"$DATASETS"
 
 log() { echo "[$channel] $*" >&2; }
 
-cfg=$(jq -ec --arg c "$channel" '.[] | select(.channel == $c)' "$CHANNELS") ||
-  { echo "channel $channel not found in $CHANNELS" >&2; exit 2; }
+cfg=$(NFI_INDEXER=$NFI "$here/channels.sh" "$channel")
+[[ -n $cfg ]] || { echo "channel $channel is not configured (see ci/channels.sh)" >&2; exit 2; }
 prefix=$(jq -r .prefix <<<"$cfg")
 series=$(jq -r .series <<<"$cfg")
-per_release=$(jq -r '.per_release // false' <<<"$cfg")
-cumulative=$(jq -r '.cumulative // false' <<<"$cfg")
-start=$(jq -r '.start // "all"' <<<"$cfg")
+per_release=$(jq -r .per_release <<<"$cfg")
+cumulative=$(jq -r .cumulative <<<"$cfg")
+start=$(jq -r .start <<<"$cfg")
 
 work=${NFI_WORK:-$(mktemp -d)}
 mkdir -p "$work"
@@ -96,6 +99,10 @@ if ((MAX > 0)); then
   head -n "$MAX" "$work/new.tsv" >"$work/new.tmp" && mv "$work/new.tmp" "$work/new.tsv"
 fi
 count=$(wc -l <"$work/new.tsv")
+if [[ $check == true ]]; then
+  echo "$count"
+  exit 0
+fi
 if ((count == 0)); then
   log "up to date (last: ${last:-none})"
   exit 0
