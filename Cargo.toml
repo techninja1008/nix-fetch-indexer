@@ -25,14 +25,14 @@ tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "http2", "json", "stream", "gzip"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "json", "query", "stream", "gzip"] }
 futures = "0.3"
 tempfile = "3"
 tar = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 axum = "0.8"
 tower-http = { version = "0.6", features = ["fs", "trace"] }
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate", "json", "chrono"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "postgres", "macros", "migrate", "json", "chrono"] }
 chrono = { version = "0.4", features = ["serde"] }
 bytes = "1"
 tokio-util = { version = "0.7", features = ["io"] }
