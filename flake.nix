@@ -41,6 +41,10 @@
             nativeCheckInputs = [
               pkgs.postgresql
               pkgs.meilisearch
+              # reqwest's platform verifier refuses to build a client without
+              # CA certificates, even for plain-HTTP test servers; cacert's
+              # setup hook sets SSL_CERT_FILE inside the sandbox.
+              pkgs.cacert
             ];
             env.NFI_TEST_REQUIRE_SERVICES = "1";
             # Tests bind localhost ports.
