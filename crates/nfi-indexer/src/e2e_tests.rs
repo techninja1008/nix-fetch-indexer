@@ -166,8 +166,8 @@ async fn index_two_releases_end_to_end() {
         locs.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(),
         vec!["nixos-25.05.100.aaaaaaaaaaaa", "nixos-25.05.200.bbbbbbbbbbbb"]
     );
-    // Everything that does not need Nix (eval errors come from helper
-    // probes; see helper_probe_closures).
+    // Every dataset that can be requested (eval errors are recorded by
+    // helper probes; see helper_probe_closures).
     let datasets: Vec<Dataset> = Dataset::ALL
         .into_iter()
         .filter(|d| *d != Dataset::EvalErrors)
@@ -180,6 +180,8 @@ async fn index_two_releases_end_to_end() {
     assert_eq!(b.releases[0].commit, "a".repeat(40));
     assert_eq!(b.releases[0].channel, "nixos-25.05");
     assert_eq!(b.releases[0].datasets, datasets);
+    // No helper probes ran, so there is no eval errors section.
+    assert!(b.eval_errors.is_none());
     let c = b.closure.as_ref().unwrap();
     assert_eq!(names(c, 0), vec!["p1", "p2", "p3", "p4"]);
     assert_eq!(names(c, 1), vec!["p1", "p2", "p3", "p5"]);
@@ -297,11 +299,7 @@ esac
         "fake-nix",
         &format!("cat {}\n", dir.path().join("graph.json").display()),
     );
-    let mut o = opts(
-        &base,
-        vec![Dataset::Closure, Dataset::EvalErrors],
-        Path::new("/bin/false"),
-    );
+    let mut o = opts(&base, vec![Dataset::Closure], Path::new("/bin/false"));
     o.closure_types = vec![STORE_PATHS.into(), HELPERS_DIRECT.into(), HELPERS_FULL.into()];
     o.probes = ProbeOptions {
         systems: vec!["x86_64-linux".into()],
@@ -352,6 +350,15 @@ esac
         }]
     );
     assert!(b.releases[0].datasets.contains(&Dataset::EvalErrors));
+
+    // Eval errors are only recorded by the evaluations producing them.
+    o.datasets = vec![Dataset::EvalErrors];
+    let a = ReleaseLocation::parse(&format!(
+        "{base}/releases/nixos/25.05/nixos-25.05.100.aaaaaaaaaaaa"
+    ))
+    .unwrap();
+    let err = index_releases(&fetcher, &[a], &o, None).await.unwrap_err();
+    assert!(err.to_string().contains("not indexed on their own"), "{err}");
 }
 
 /// Opt-in live smoke test (`NFI_LIVE_TESTS=1`): index a small sample of a real

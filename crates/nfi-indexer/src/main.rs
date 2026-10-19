@@ -35,8 +35,6 @@ enum Cmd {
     Outpaths(IndexCmd),
     /// Index programs.sqlite (command-not-found) from the nixexprs tarball.
     Programs(IndexCmd),
-    /// Index the helper probes that fail to evaluate (needs Nix).
-    EvalErrors(IndexCmd),
     /// Index several datasets in one run (default: closure, packages, programs).
     All(IndexCmd),
     /// List the releases under a channel prefix (e.g. nixos/26.05), oldest
@@ -86,7 +84,7 @@ enum Cmd {
         /// Channels to keep (e.g. nixos-25.05).
         #[arg(long = "channel")]
         channels: Vec<String>,
-        /// Sections to keep (closure, packages, outpaths, programs).
+        /// Sections to keep (closure, packages, outpaths, programs, eval-errors).
         #[arg(long = "section", value_delimiter = ',')]
         sections: Vec<Dataset>,
         /// Closure types to keep (e.g. store-paths, helpers-direct).
@@ -417,7 +415,6 @@ async fn main() -> Result<()> {
         Cmd::Packages(c) => run_index(c, &[Dataset::Packages], v2).await,
         Cmd::Outpaths(c) => run_index(c, &[Dataset::Outpaths], v2).await,
         Cmd::Programs(c) => run_index(c, &[Dataset::Programs], v2).await,
-        Cmd::EvalErrors(c) => run_index(c, &[Dataset::EvalErrors], v2).await,
         Cmd::All(c) => run_index(c, &[Dataset::Closure, Dataset::Packages, Dataset::Programs], v2).await,
         Cmd::ListReleases {
             prefix,

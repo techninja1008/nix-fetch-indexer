@@ -73,6 +73,19 @@ pub async fn index_releases_with_report(
     opts: &IndexOptions,
     seed: Option<Bundle>,
 ) -> Result<(Bundle, IndexReport)> {
+    if opts.datasets.contains(&Dataset::EvalErrors) {
+        anyhow::bail!(
+            "eval errors are not indexed on their own: they are recorded by the evaluations that \
+             produce them (the {HELPERS_DIRECT} and {HELPERS_FULL} closure types)"
+        );
+    }
+    // Helper probes are evaluated once per release, for both helper closure
+    // types; their eval errors are recorded alongside.
+    let run_probes = opts.datasets.contains(&Dataset::Closure)
+        && opts
+            .closure_types
+            .iter()
+            .any(|t| t == HELPERS_DIRECT || t == HELPERS_FULL);
     let run_started = std::time::Instant::now();
     let mut report = IndexReport::default();
     let mut bundle = Bundle::default();
@@ -117,14 +130,7 @@ pub async fn index_releases_with_report(
         let mut tar: Option<bytes::Bytes> = None;
         let mut unpacked: Option<(tempfile::TempDir, std::path::PathBuf)> = None;
 
-        // Helper probes are evaluated once per release, for the helper
-        // closure types and for the eval-errors dataset.
-        let closure_probes = opts.datasets.contains(&Dataset::Closure)
-            && opts
-                .closure_types
-                .iter()
-                .any(|t| t == HELPERS_DIRECT || t == HELPERS_FULL);
-        let probe_roots = if closure_probes || opts.datasets.contains(&Dataset::EvalErrors) {
+        let probe_roots = if run_probes {
             let dir = unpack(fetcher, loc, &mut tar, &mut unpacked).await?;
             Some(
                 probes::run_probes(dir, &opts.probes)
@@ -177,8 +183,7 @@ pub async fn index_releases_with_report(
             rr.closure_secs = secs(t);
             bundle.releases[idx].add_dataset(Dataset::Closure);
         }
-        if opts.datasets.contains(&Dataset::EvalErrors) {
-            let pr = probe_roots.as_ref().expect("probes run for eval errors");
+        if let Some(pr) = &probe_roots {
             let e = eval_errors.ensure_eval(idx as u32, HELPER_PROBES);
             for (attr, system) in &pr.errors {
                 eval_errors.add_error(attr, system, e);
@@ -269,7 +274,7 @@ pub async fn index_releases_with_report(
             entries: program_entries.into_entries(),
         });
     }
-    if opts.datasets.contains(&Dataset::EvalErrors) {
+    if run_probes {
         let mut b = EvalErrorsBuilder::default();
         b.extend_section(&eval_errors, &Some);
         bundle.eval_errors = Some(b.finish());

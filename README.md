@@ -53,9 +53,6 @@ nfi-indexer closure --release-url $R2 --seed closure.nfib -o closure-2.nfib
 
 # Build inputs of nixpkgs helpers (needs Nix), alongside the runtime closures:
 nfi-indexer closure --release-url $R --closure-types store-paths,helpers-direct,helpers-full -o closures.nfib
-
-# Helper probes that fail to evaluate (needs Nix):
-nfi-indexer eval-errors --release-url $R -o eval-errors.nfib
 ```
 
 **Closure types**
@@ -73,12 +70,12 @@ Build-only paths like these are in no runtime closure of `store-paths.xz`, so wi
 - **Calls:** each probe calls a helper twice with every argument changed (URL, revision, hash, name, source) and instantiates both calls against the release's nixexprs. Only derivations shared by both calls count, so anything built from the probe's own arguments drops out.
 - **Coverage:** fetchurl, fetchzip and fetchpatch; fetchgit (plain, with submodules, `leaveDotGit`, LFS and sparse checkout); fetchFromGitHub and fetchFromGitLab; fetchsvn, fetchhg, fetchbzr and fetchcvs; fetchCargoVendor (or fetchCargoTarball), buildGoModule's vendor derivation, fetchNpmDeps and fetchYarnDeps; and stdenv/stdenvNoCC as targets.
 - **Versions:** probes check which helpers and arguments a nixpkgs version has, so the same file works from 24.05 to unstable. A probe for a helper or argument that a version lacks is left out: it doesn't apply, so nothing is missed.
-- **Eval errors:** a probe that applies but fails to evaluate is an **eval error** of the release's `helper-probes` evaluation, kept in the separate `eval-errors` dataset (see below). It is identified by probe name and system only; evaluation is deterministic, so the message is not kept. On 24.05 and 26.05 every applicable probe evaluates.
+- **Eval errors:** a probe that applies but fails to evaluate is an **eval error** of the release's `helper-probes` evaluation. Indexing a helper closure type records the probes' eval errors in the bundle's `eval-errors` section (see below). It is identified by probe name and system only; evaluation is deterministic, so the message is not kept. On 24.05 and 26.05 every applicable probe evaluates.
 - **Systems:** `--probe-systems` (default `x86_64-linux,aarch64-linux`). Probes need `nix-instantiate` and `nix` (`--nix-instantiate`, `--nix`); a release takes about 15–30 s to probe.
 
 **Eval errors**
 
-The `eval-errors` dataset records attributes that failed to evaluate, per **evaluation**: one way of evaluating a release, named by an **eval type**. Eval types, evaluations and eval errors are to evaluation what closure types, closures and missing paths are to closures. An evaluation with no errors is still recorded: it says the evaluation ran. The only eval type so far is `helper-probes`; evaluation-based indexers added later can record their failures the same way.
+The `eval-errors` section records attributes that failed to evaluate, per **evaluation**: one way of evaluating a release, named by an **eval type**. Eval types, evaluations and eval errors are to evaluation what closure types, closures and missing paths are to closures. An evaluation with no errors is still recorded: it says the evaluation ran. Eval errors only come from indexing something by evaluating it, so they can't be indexed on their own: they are written by the indexer that ran the evaluation. The only eval type so far is `helper-probes`, written when indexing the `helpers-direct` or `helpers-full` closure types; evaluation-based indexers added later can record their failures the same way.
 
 **Indexer options**
 
@@ -109,7 +106,7 @@ nfi-indexer bench-compression ab.nfib
 The `Index releases` workflow (`.github/workflows/index-releases.yml`) runs every six hours, and can also be started by hand for one channel with a cap on how many new releases to index. It only uploads: bundles are published as GitHub release assets on [`techninja1008/nix-fetch-indexer-data`](https://github.com/techninja1008/nix-fetch-indexer-data), and nothing is ingested anywhere.
 
 1. A plan job builds `nfi-indexer` once. [`ci/channels.sh`](ci/channels.sh) discovers the channels on releases.nixos.org, and [`ci/plan.sh`](ci/plan.sh) keeps those with releases not yet published.
-2. One job per such channel runs [`ci/index-channel.sh`](ci/index-channel.sh), which indexes the new releases and uploads binary bundles, one per dataset: `closure` (the `store-paths` closures), `helpers-direct`, `helpers-full`, `eval-errors`, `packages` and `programs`. The helper datasets are separate assets because `helpers-full` is much larger: it reaches the whole stdenv bootstrap.
+2. One job per such channel runs [`ci/index-channel.sh`](ci/index-channel.sh), which indexes the new releases and uploads binary bundles, one per dataset: `closure` (the `store-paths` closures), `helpers-direct`, `helpers-full`, `packages` and `programs`. The helper datasets are separate assets because `helpers-full` is much larger: it reaches the whole stdenv bootstrap. Both helper assets also carry the probes' eval errors.
 
 **Channels.** Channels are discovered automatically according to the policy in [`ci/config.json`](ci/config.json); `-small` and `-aarch64` channels are skipped.
 
@@ -123,13 +120,13 @@ A stable channel only gets releases for about a month after the next one ships; 
 
 **Assets**
 
-- **Per-release bundles.** Release tag `<release>` (e.g. `nixos-26.05.590.ec942ba042da`). One asset per dataset: `<release>-closure.nfib`, `<release>-helpers-direct.nfib`, `<release>-helpers-full.nfib`, `<release>-eval-errors.nfib`, `<release>-packages.nfib` and `<release>-programs.nfib`. The release notes summarise path, package and program counts, each closure's paths and missing paths, and each evaluation's errors.
+- **Per-release bundles.** Release tag `<release>` (e.g. `nixos-26.05.590.ec942ba042da`). One asset per dataset: `<release>-closure.nfib`, `<release>-helpers-direct.nfib`, `<release>-helpers-full.nfib`, `<release>-packages.nfib` and `<release>-programs.nfib`. The release notes summarise path, package and program counts, each closure's paths and missing paths, and each evaluation's errors.
 - **Cumulative bundles.** Release tag `<channel>` (e.g. `nixos-26.05`). One asset per dataset covering every release processed so far: `<series>-<dataset>-cumulative.nfib`, e.g. `26.05-closure-cumulative.nfib`.
 - **Manifest.** Each channel's release (tag `<channel>`) also holds `releases.txt`, which lists the releases processed so far, oldest first. The next run starts after its last line.
 
 **Seeding.** A release usually shares nearly all of its closures with the previous release in the same channel, and very little with older ones. Each new release is therefore seeded with the previous release's closures only, of every closure type. For per-release channels, the seed comes from the previous release's closure assets. For cumulative-only channels, it is filtered out of the cumulative bundles. With the seed, only narinfos that are new are fetched.
 
-**Backfill.** Datasets added later, such as the helper datasets, can be added to releases that are already recorded: set the workflow's `backfill_datasets` input (or `NFI_BACKFILL_DATASETS`) to e.g. `helpers-direct,helpers-full,eval-errors`. Instead of indexing new releases, the run indexes only those datasets for recorded releases that lack them, uploads their per-release assets, and folds them into the cumulative bundles.
+**Backfill.** Datasets added later, such as the helper datasets, can be added to releases that are already recorded: set the workflow's `backfill_datasets` input (or `NFI_BACKFILL_DATASETS`) to e.g. `helpers-direct,helpers-full`. Instead of indexing new releases, the run indexes only those datasets for recorded releases that lack them, uploads their per-release assets, and folds them into the cumulative bundles.
 
 **Recovery.** If a run fails after publishing some per-release bundles but before updating `releases.txt`, the next run reuses those bundles instead of indexing them again. Merging a release that is already in a cumulative bundle is a no-op.
 

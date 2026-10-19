@@ -13,7 +13,7 @@
 # Datasets are the indexer's sections, except that closure sections are split
 # by closure type: `closure` holds the store-paths closures, `helpers-direct`
 # and `helpers-full` the helper probe closures (indexing them needs Nix).
-# `eval-errors` holds the helper probes that fail to evaluate (also needs Nix).
+# Both helper datasets also carry the eval errors of the probes they come from.
 #   cumulative   maintain <series>-<dataset>-cumulative.nfib assets on the
 #                channel's GitHub release (tag = channel name)
 #   start        "all" to backfill every release on first run, "latest" to
@@ -32,7 +32,7 @@
 #   NFI_MAX_RELEASES  index at most this many new releases per run (default: all)
 #   NFI_BACKFILL_DATASETS
 #                     instead of indexing new releases, add these datasets (e.g.
-#                     helpers-direct,helpers-full,eval-errors) to releases already recorded
+#                     helpers-direct,helpers-full) to releases already recorded
 #                     that lack them
 #   NFI_INDEX_ARGS    extra arguments for `nfi-indexer all` (e.g. --sample 50)
 #   NFI_WORK          work directory (default: a temporary directory)
@@ -66,11 +66,14 @@ for ds in "${datasets[@]}"; do
 done
 INDEX_DATASETS=$(IFS=,; echo "${sections[*]}")
 CLOSURE_TYPES=$(IFS=,; echo "${closure_types[*]}")
-# filter_ds <bundle> <dataset> <out>: the dataset's part of a bundle.
+# filter_ds <bundle> <dataset> <out>: the dataset's part of a bundle. Helper
+# datasets keep the eval errors of the probes that produced them.
 filter_ds() {
-  local ct
+  local ct sec
   ct=$(ds_closure_type "$2")
-  "$NFI" filter "$1" --section "$(ds_section "$2")" ${ct:+--closure-type "$ct"} -o "$3"
+  sec=$(ds_section "$2")
+  [[ $2 == helpers-* ]] && sec+=,eval-errors
+  "$NFI" filter "$1" --section "$sec" ${ct:+--closure-type "$ct"} -o "$3"
 }
 # index <out> <url>...: index releases into one bundle (seeded from $seed).
 index() {

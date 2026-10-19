@@ -125,8 +125,8 @@ EvalErrorsSection {
   - `probes.nix` (embedded in the indexer) defines probes against the release's unpacked nixexprs, for each `--probe-systems` system (default `x86_64-linux,aarch64-linux`):
     - **fetch probes** call a helper twice with every argument changed. Only derivations shared by both calls are kept, so anything built from the probe's own arguments drops out. Option variants (e.g. fetchgit with submodules or LFS) are separate probes, unioned.
     - **target probes** are roots themselves (stdenv, stdenvNoCC).
-  - Probes guard on helper and argument availability per nixpkgs version; a probe that doesn't apply is left out of `probes'`. Each remaining probe is instantiated separately, so one that fails to evaluate (`nix-instantiate` exits non-zero) doesn't stop the others. It is recorded as an eval error of the release's `helper-probes` evaluation when the `eval-errors` dataset is indexed. Failures to run the tools at all, or unexpected output, fail the run.
-  - Probes run once per release for both helper closure types and the eval-errors dataset.
+  - Probes guard on helper and argument availability per nixpkgs version; a probe that doesn't apply is left out of `probes'`. Each remaining probe is instantiated separately, so one that fails to evaluate (`nix-instantiate` exits non-zero) doesn't stop the others. It is recorded as an eval error of the release's `helper-probes` evaluation. Failures to run the tools at all, or unexpected output, fail the run.
+  - Probes run once per release for both helper closure types, and their eval errors go in the bundle's eval-errors section. Eval errors can't be requested on their own (`--datasets eval-errors` is refused): they only come from the evaluation that produced them.
   - `nix derivation show --recursive` gives the probes' graphs. `helpers-direct` roots are the consumed outputs of shared direct inputs (and target outputs); `helpers-full` roots are all outputs of every shared derivation in the build graphs, including bootstrap stages and fixed-output sources.
 - **`packages`**
   - Fetch `packages.json.br`, stream-decode brotli, and emit package metadata.

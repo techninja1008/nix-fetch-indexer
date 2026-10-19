@@ -23,7 +23,7 @@ on:
         required: false
         default: "0"
       backfill_datasets:
-        description: "Instead of new releases, add these datasets to recorded releases lacking them (e.g. helpers-direct,helpers-full,eval-errors)"
+        description: "Instead of new releases, add these datasets to recorded releases lacking them (e.g. helpers-direct,helpers-full)"
         required: false
         default: ""
 
