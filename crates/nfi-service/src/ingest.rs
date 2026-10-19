@@ -29,6 +29,9 @@ pub struct IngestReport {
     pub packages: usize,
     pub outpaths: usize,
     pub programs: usize,
+    /// `<release> <eval type>` for each evaluation ingested.
+    pub evals: Vec<String>,
+    pub eval_errors: usize,
     /// Attributes whose search documents need refreshing.
     #[serde(skip)]
     pub touched_attrs: BTreeSet<String>,
@@ -148,16 +151,15 @@ pub async fn ingest(
                 .bind(&cl.closure_type)
                 .execute(&mut *tx)
                 .await?;
+            // The no-op update makes RETURNING yield existing rows too.
             let id: i32 = sqlx::query_scalar(
-                "INSERT INTO closures (release_id, type_id, skipped)
-                 SELECT $1, t.id, $3 FROM closure_types t WHERE t.name = $2
-                 ON CONFLICT (release_id, type_id) DO UPDATE
-                    SET skipped = ARRAY(SELECT DISTINCT x FROM unnest(closures.skipped || EXCLUDED.skipped) x ORDER BY x)
+                "INSERT INTO closures (release_id, type_id)
+                 SELECT $1, t.id FROM closure_types t WHERE t.name = $2
+                 ON CONFLICT (release_id, type_id) DO UPDATE SET type_id = EXCLUDED.type_id
                  RETURNING id",
             )
             .bind(release_id)
             .bind(&cl.closure_type)
-            .bind(&cl.skipped)
             .fetch_one(&mut *tx)
             .await
             .with_context(|| format!("adding closure {}", cl.closure_type))?;
@@ -416,6 +418,60 @@ pub async fn ingest(
         exec(
             &mut tx,
             "INSERT INTO programs (release_id, name, system, attr) SELECT release_id, name, system, attr FROM t_prog ON CONFLICT DO NOTHING",
+        )
+        .await?;
+    }
+
+    // Eval errors.
+    if let Some(e) = &bundle.eval_errors {
+        // Database eval id of each of the bundle's evaluations (validate()
+        // ensures their releases carry the eval-errors dataset).
+        let mut eval_ids: Vec<i32> = Vec::with_capacity(e.evals.len());
+        for ev in &e.evals {
+            sqlx::query("INSERT INTO eval_types (name) VALUES ($1) ON CONFLICT DO NOTHING")
+                .bind(&ev.eval_type)
+                .execute(&mut *tx)
+                .await?;
+            let id: i32 = sqlx::query_scalar(
+                "INSERT INTO evals (release_id, type_id)
+                 SELECT $1, t.id FROM eval_types t WHERE t.name = $2
+                 ON CONFLICT (release_id, type_id) DO UPDATE SET type_id = EXCLUDED.type_id
+                 RETURNING id",
+            )
+            .bind(ids[ev.release as usize])
+            .bind(&ev.eval_type)
+            .fetch_one(&mut *tx)
+            .await
+            .with_context(|| format!("adding eval {}", ev.eval_type))?;
+            eval_ids.push(id);
+            report.evals.push(format!(
+                "{} {}",
+                bundle.releases[ev.release as usize].name, ev.eval_type
+            ));
+        }
+        progress(format!(
+            "eval errors: {} errors in {} evals",
+            e.errors.len(),
+            e.evals.len()
+        ));
+        exec(
+            &mut tx,
+            "CREATE TEMP TABLE t_eval_errors (attr text, system text, eval_id int) ON COMMIT DROP",
+        )
+        .await?;
+        let mut buf = CopyBuf::new();
+        for err in &e.errors {
+            for id in err.evals.iter().filter_map(|i| eval_ids.get(i).copied()) {
+                buf.field(&err.attr).field(&err.system).field(id);
+                buf.end_row();
+            }
+        }
+        report.eval_errors = buf.rows;
+        copy_in(&mut tx, "t_eval_errors", buf).await?;
+        exec(
+            &mut tx,
+            "INSERT INTO eval_errors (attr, system, eval_id) SELECT attr, system, eval_id FROM t_eval_errors
+             ON CONFLICT DO NOTHING",
         )
         .await?;
     }

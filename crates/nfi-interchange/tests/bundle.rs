@@ -97,6 +97,12 @@ fn sample_typed(name: &str, commit: &str, extra: bool, closure_type: &str) -> Bu
             releases: bits,
         }],
     });
+    let mut ev = EvalErrorsSection::default();
+    let e = ev.ensure_eval(r as u32, "helper-probes");
+    if extra {
+        ev.add_error("fetchhg", "x86_64-linux", e);
+    }
+    b.eval_errors = Some(ev);
     b
 }
 
@@ -289,7 +295,6 @@ fn v2_bundles_upgrade_with_the_given_closure_type() {
         vec![Closure {
             release: 0,
             closure_type: "helpers-direct".into(),
-            skipped: vec![],
         }]
     );
     assert!(
@@ -304,7 +309,8 @@ fn v2_bundles_upgrade_with_the_given_closure_type() {
 #[test]
 fn closure_types_merge_and_filter() {
     let rt = sample("r1", &"a".repeat(40), false);
-    let helpers = sample_typed("r1", &"a".repeat(40), true, "helpers-direct");
+    let mut helpers = sample_typed("r1", &"a".repeat(40), true, "helpers-direct");
+    helpers.eval_errors = rt.eval_errors.clone();
     let m = ops::merge([rt.clone(), helpers]);
     m.validate().unwrap();
     assert_eq!(m.releases.len(), 1);
@@ -338,4 +344,70 @@ fn validate_rejects_closures_of_releases_without_the_dataset() {
     let mut b = sample("r1", &"a".repeat(40), false);
     b.releases[0].datasets.retain(|d| *d != Dataset::Closure);
     assert!(b.validate().unwrap_err().contains("lacks the closure dataset"));
+}
+
+#[test]
+fn eval_errors_merge_filter_and_validate() {
+    let r1 = sample("r1", &"a".repeat(40), true);
+    let r2 = sample("r2", &"b".repeat(40), false);
+    let mut r3 = sample("r3", &"c".repeat(40), true);
+    // Same attribute failing on another system is a distinct error.
+    let e = r3.eval_errors.as_mut().unwrap();
+    e.add_error("fetchhg", "aarch64-linux", 0);
+    let m = ops::merge([r1, r2, r3]);
+    m.validate().unwrap();
+    let e = m.eval_errors.as_ref().unwrap();
+    // Evaluations without errors are kept: they say the evaluation ran.
+    assert_eq!(e.evals.len(), 3);
+    let keys: Vec<_> = e
+        .errors
+        .iter()
+        .map(|x| {
+            (
+                x.attr.as_str(),
+                x.system.as_str(),
+                x.evals.iter().collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            ("fetchhg", "aarch64-linux", vec![2]),
+            ("fetchhg", "x86_64-linux", vec![0, 2]),
+        ]
+    );
+    let st = ops::stats(&m);
+    assert_eq!(st.eval_errors, 2);
+    assert_eq!(st.evals.iter().map(|e| e.errors).collect::<Vec<_>>(), [1, 0, 2]);
+    assert_eq!(
+        st.releases.iter().map(|r| r.eval_errors).collect::<Vec<_>>(),
+        [1, 0, 2]
+    );
+
+    // Split and re-merge round trips.
+    let parts = ops::split(&m);
+    assert!(parts[1].eval_errors.as_ref().unwrap().errors.is_empty());
+    assert_eq!(parts[1].eval_errors.as_ref().unwrap().evals.len(), 1);
+    assert_eq!(ops::merge(parts), m);
+
+    // Filtering the section out drops it.
+    let no = ops::filter(&m, |_| true, Some(&[Dataset::Closure]), None);
+    assert!(no.eval_errors.is_none());
+    assert!(!no.releases[0].datasets.contains(&Dataset::EvalErrors));
+
+    let mut bad = m.clone();
+    bad.releases[0].datasets.retain(|d| *d != Dataset::EvalErrors);
+    assert!(
+        bad.validate()
+            .unwrap_err()
+            .contains("lacks the eval-errors dataset")
+    );
+    let mut bad = m.clone();
+    let dup = bad.eval_errors.as_ref().unwrap().errors[0].clone();
+    bad.eval_errors.as_mut().unwrap().errors.push(dup);
+    assert!(bad.validate().unwrap_err().contains("duplicate eval error"));
+    let mut bad = m;
+    bad.eval_errors.as_mut().unwrap().errors[0].evals.set(7);
+    assert!(bad.validate().unwrap_err().contains("out of range"));
 }

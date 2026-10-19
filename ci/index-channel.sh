@@ -13,6 +13,7 @@
 # Datasets are the indexer's sections, except that closure sections are split
 # by closure type: `closure` holds the store-paths closures, `helpers-direct`
 # and `helpers-full` the helper probe closures (indexing them needs Nix).
+# `eval-errors` holds the helper probes that fail to evaluate (also needs Nix).
 #   cumulative   maintain <series>-<dataset>-cumulative.nfib assets on the
 #                channel's GitHub release (tag = channel name)
 #   start        "all" to backfill every release on first run, "latest" to
@@ -31,7 +32,7 @@
 #   NFI_MAX_RELEASES  index at most this many new releases per run (default: all)
 #   NFI_BACKFILL_DATASETS
 #                     instead of indexing new releases, add these datasets (e.g.
-#                     helpers-direct,helpers-full) to releases already recorded
+#                     helpers-direct,helpers-full,eval-errors) to releases already recorded
 #                     that lack them
 #   NFI_INDEX_ARGS    extra arguments for `nfi-indexer all` (e.g. --sample 50)
 #   NFI_WORK          work directory (default: a temporary directory)
@@ -186,14 +187,18 @@ else
   log "$count new release(s) after ${last:-<start>}: $(cut -f1 "$work/new.tsv" | tr '\n' ' ')"
 fi
 
-notes_for() { # <bundle> -> markdown summary of its releases and closures
+notes_for() { # <bundle> -> markdown summary of its releases, closures and evals
   "$NFI" inspect --json "$1" | jq -r '
     "| release | commit | closure paths | packages | programs |",
     "|---|---|---:|---:|---:|",
     (.releases[] | "| \(.name) | `\(.commit)` | \(.closure_paths) | \(.packages) | \(.programs) |"),
     if (.closures | length) > 0 then
-      "", "| closure | paths | missing | skipped probes |", "|---|---:|---:|---:|",
-      (.closures[] | "| \(.release) \(.closure_type) | \(.paths) | \(.missing) | \(.skipped // 0) |")
+      "", "| closure | paths | missing |", "|---|---:|---:|",
+      (.closures[] | "| \(.release) \(.closure_type) | \(.paths) | \(.missing) |")
+    else empty end,
+    if ((.evals // []) | length) > 0 then
+      "", "| eval | errors |", "|---|---:|",
+      (.evals[] | "| \(.release) \(.eval_type) | \(.errors) |")
     else empty end'
 }
 

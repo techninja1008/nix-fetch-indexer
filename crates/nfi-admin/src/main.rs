@@ -108,11 +108,14 @@ impl From<bool> for Outcome {
 
 fn print_check(r: &nfi_api::CheckReport) {
     println!(
-        "{}: {} store paths, {} references, {} releases",
+        "{}: {} store paths, {} references, {} releases, {} closures, {} evals, {} eval errors",
         if r.ok { "ok" } else { "INCONSISTENT" },
         r.store_paths,
         r.references,
-        r.releases
+        r.releases,
+        r.closures,
+        r.evals,
+        r.eval_errors
     );
     for i in &r.issues {
         println!("  {} ({}): {}", i.kind, i.count, i.description);
@@ -275,29 +278,25 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 println!("{}", serde_json::to_string_pretty(&rels)?);
             } else {
                 println!(
-                    "{:<40} {:<18} {:<12} {:<42} {:<28} CLOSURES",
-                    "RELEASE", "CHANNEL", "SERIES", "COMMIT", "DATASETS"
+                    "{:<40} {:<18} {:<12} {:<42} {:<28} {:<44} EVALS",
+                    "RELEASE", "CHANNEL", "SERIES", "COMMIT", "DATASETS", "CLOSURES"
                 );
                 for r in &rels {
-                    let closures: Vec<String> = r
-                        .closures
+                    let closures: Vec<&str> = r.closures.iter().map(|c| c.closure_type.as_str()).collect();
+                    let evals: Vec<String> = r
+                        .evals
                         .iter()
-                        .map(|c| {
-                            if c.skipped.is_empty() {
-                                c.closure_type.clone()
-                            } else {
-                                format!("{} ({} skipped)", c.closure_type, c.skipped.len())
-                            }
-                        })
+                        .map(|e| format!("{} ({} errors)", e.eval_type, e.errors.len()))
                         .collect();
                     println!(
-                        "{:<40} {:<18} {:<12} {:<42} {:<28} {}",
+                        "{:<40} {:<18} {:<12} {:<42} {:<28} {:<44} {}",
                         r.name,
                         r.channel,
                         r.series,
                         r.commit,
                         r.datasets.join(","),
-                        closures.join(",")
+                        closures.join(","),
+                        evals.join(",")
                     );
                 }
             }

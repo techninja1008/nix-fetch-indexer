@@ -35,6 +35,8 @@ enum Cmd {
     Outpaths(IndexCmd),
     /// Index programs.sqlite (command-not-found) from the nixexprs tarball.
     Programs(IndexCmd),
+    /// Index the helper probes that fail to evaluate (needs Nix).
+    EvalErrors(IndexCmd),
     /// Index several datasets in one run (default: closure, packages, programs).
     All(IndexCmd),
     /// List the releases under a channel prefix (e.g. nixos/26.05), oldest
@@ -289,6 +291,9 @@ fn log_summary(
         if let Some(n) = r.outpaths {
             parts.push(format!("outpaths: {n} in {:.1}s", r.outpaths_secs));
         }
+        if let Some(n) = r.eval_errors {
+            parts.push(format!("eval errors: {n}"));
+        }
         tracing::info!(release = %r.name, commit = %r.commit, "summary: {}", parts.join("; "));
     }
     let fetched: usize = report
@@ -412,6 +417,7 @@ async fn main() -> Result<()> {
         Cmd::Packages(c) => run_index(c, &[Dataset::Packages], v2).await,
         Cmd::Outpaths(c) => run_index(c, &[Dataset::Outpaths], v2).await,
         Cmd::Programs(c) => run_index(c, &[Dataset::Programs], v2).await,
+        Cmd::EvalErrors(c) => run_index(c, &[Dataset::EvalErrors], v2).await,
         Cmd::All(c) => run_index(c, &[Dataset::Closure, Dataset::Packages, Dataset::Programs], v2).await,
         Cmd::ListReleases {
             prefix,
@@ -527,13 +533,19 @@ async fn main() -> Result<()> {
                         .join(", ")
                 );
                 println!(
-                    "closure: {} paths, {} edges, {} missing; packages: {}; outpaths: {}; programs: {}",
-                    s.closure_paths, s.closure_edges, s.missing_paths, s.packages, s.outpaths, s.programs
+                    "closure: {} paths, {} edges, {} missing; packages: {}; outpaths: {}; programs: {}; eval errors: {}",
+                    s.closure_paths,
+                    s.closure_edges,
+                    s.missing_paths,
+                    s.packages,
+                    s.outpaths,
+                    s.programs,
+                    s.eval_errors
                 );
                 println!("releases ({}):", s.releases.len());
                 for r in &s.releases {
                     println!(
-                        "  {} [{}] {} datasets={} closure={} missing={} packages={} outpaths={} programs={}",
+                        "  {} [{}] {} datasets={} closure={} missing={} packages={} outpaths={} programs={} eval_errors={}",
                         r.name,
                         r.channel,
                         r.commit,
@@ -546,16 +558,23 @@ async fn main() -> Result<()> {
                         r.missing_paths,
                         r.packages,
                         r.outpaths,
-                        r.programs
+                        r.programs,
+                        r.eval_errors
                     );
                 }
                 if !s.closures.is_empty() {
                     println!("closures ({}):", s.closures.len());
                     for c in &s.closures {
                         println!(
-                            "  {} {}: paths={} missing={} skipped={}",
-                            c.release, c.closure_type, c.paths, c.missing, c.skipped
+                            "  {} {}: paths={} missing={}",
+                            c.release, c.closure_type, c.paths, c.missing
                         );
+                    }
+                }
+                if !s.evals.is_empty() {
+                    println!("evals ({}):", s.evals.len());
+                    for e in &s.evals {
+                        println!("  {} {}: errors={}", e.release, e.eval_type, e.errors);
                     }
                 }
             }

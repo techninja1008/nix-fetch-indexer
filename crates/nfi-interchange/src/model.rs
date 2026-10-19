@@ -42,20 +42,22 @@ macro_rules! compact_binary {
 
 /// The kinds of dataset a bundle section can hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum Dataset {
     Closure,
     Packages,
     Outpaths,
     Programs,
+    EvalErrors,
 }
 
 impl Dataset {
-    pub const ALL: [Dataset; 4] = [
+    pub const ALL: [Dataset; 5] = [
         Dataset::Closure,
         Dataset::Packages,
         Dataset::Outpaths,
         Dataset::Programs,
+        Dataset::EvalErrors,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -64,6 +66,7 @@ impl Dataset {
             Dataset::Packages => "packages",
             Dataset::Outpaths => "outpaths",
             Dataset::Programs => "programs",
+            Dataset::EvalErrors => "eval-errors",
         }
     }
 }
@@ -72,7 +75,7 @@ impl std::str::FromStr for Dataset {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, String> {
         Dataset::ALL.into_iter().find(|d| d.as_str() == s).ok_or_else(|| {
-            format!("unknown dataset {s:?} (expected closure, packages, outpaths or programs)")
+            format!("unknown dataset {s:?} (expected closure, packages, outpaths, programs or eval-errors)")
         })
     }
 }
@@ -118,15 +121,10 @@ pub struct Closure {
     /// Index into `Bundle::releases`.
     pub release: u32,
     pub closure_type: String,
-    /// Roots that could not be collected, with the reason (e.g. a helper
-    /// probe that does not evaluate on this release).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub skipped: Vec<String>,
 }
 compact_binary!(Closure {
     release,
-    closure_type,
-    skipped
+    closure_type
 });
 
 /// An indexed store path, with its runtime references.
@@ -195,10 +193,76 @@ impl ClosureSection {
             self.closures.push(Closure {
                 release,
                 closure_type: closure_type.to_string(),
-                skipped: Vec::new(),
             });
             self.closures.len() - 1
         })
+    }
+}
+
+/// One evaluation of a release: a set of attributes evaluated in one way
+/// (e.g. `helper-probes`). Evaluations are to eval errors what closures are
+/// to missing paths.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(remote = "Self")]
+pub struct Eval {
+    /// Index into `Bundle::releases`.
+    pub release: u32,
+    pub eval_type: String,
+}
+compact_binary!(Eval { release, eval_type });
+
+/// An attribute that failed to evaluate. Evaluation is deterministic, so the
+/// attribute and system identify the failure; the message is not kept.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(remote = "Self")]
+pub struct EvalError {
+    pub attr: String,
+    pub system: String,
+    /// Indices into `EvalErrorsSection::evals`.
+    pub evals: Bitset,
+}
+compact_binary!(EvalError { attr, system, evals });
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvalErrorsSection {
+    /// The evaluations that error bitsets refer to. An evaluation with no
+    /// errors is listed too: it ran and everything evaluated.
+    pub evals: Vec<Eval>,
+    pub errors: Vec<EvalError>,
+}
+
+impl EvalErrorsSection {
+    pub fn eval_index(&self, release: u32, eval_type: &str) -> Option<usize> {
+        self.evals
+            .iter()
+            .position(|e| e.release == release && e.eval_type == eval_type)
+    }
+
+    /// Index of the evaluation, adding it to the table if absent.
+    pub fn ensure_eval(&mut self, release: u32, eval_type: &str) -> usize {
+        self.eval_index(release, eval_type).unwrap_or_else(|| {
+            self.evals.push(Eval {
+                release,
+                eval_type: eval_type.to_string(),
+            });
+            self.evals.len() - 1
+        })
+    }
+
+    /// Record a failed attribute in an evaluation.
+    pub fn add_error(&mut self, attr: &str, system: &str, eval: usize) {
+        match self
+            .errors
+            .iter_mut()
+            .find(|e| e.attr == attr && e.system == system)
+        {
+            Some(e) => e.evals.set(eval),
+            None => self.errors.push(EvalError {
+                attr: attr.to_string(),
+                system: system.to_string(),
+                evals: Bitset::single(eval),
+            }),
+        }
     }
 }
 
@@ -311,6 +375,8 @@ pub struct Bundle {
     pub outpaths: Option<OutpathsSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub programs: Option<ProgramsSection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eval_errors: Option<EvalErrorsSection>,
 }
 
 impl Default for Bundle {
@@ -322,6 +388,7 @@ impl Default for Bundle {
             packages: None,
             outpaths: None,
             programs: None,
+            eval_errors: None,
         }
     }
 }
@@ -358,6 +425,9 @@ impl Bundle {
         if self.programs.is_some() {
             v.push(Dataset::Programs);
         }
+        if self.eval_errors.is_some() {
+            v.push(Dataset::EvalErrors);
+        }
         v
     }
 
@@ -377,7 +447,6 @@ impl Bundle {
                     c.closures.push(Closure {
                         release: i as u32,
                         closure_type: v2_closure_type.to_string(),
-                        skipped: Vec::new(),
                     });
                 }
             }
@@ -480,6 +549,36 @@ impl Bundle {
         if let Some(s) = &self.programs {
             for e in &s.entries {
                 check_bits(&e.releases, &e.name)?;
+            }
+        }
+        if let Some(s) = &self.eval_errors {
+            let ne = s.evals.len();
+            let mut seen = std::collections::HashSet::new();
+            for ev in &s.evals {
+                let Some(r) = self.releases.get(ev.release as usize) else {
+                    return Err(format!("eval {ev:?}: release index out of range ({n} releases)"));
+                };
+                if !r.datasets.contains(&Dataset::EvalErrors) {
+                    return Err(format!(
+                        "eval {ev:?}: release {} lacks the eval-errors dataset",
+                        r.name
+                    ));
+                }
+                if ev.eval_type.is_empty() || !seen.insert((ev.release, &ev.eval_type)) {
+                    return Err(format!("eval {ev:?}: empty or duplicate eval type"));
+                }
+            }
+            let mut keys = std::collections::HashSet::new();
+            for e in &s.errors {
+                if !keys.insert((&e.attr, &e.system)) {
+                    return Err(format!("duplicate eval error {}@{}", e.attr, e.system));
+                }
+                if let Some(i) = e.evals.iter().last().filter(|&i| i >= ne) {
+                    return Err(format!(
+                        "{}@{}: eval bit {i} out of range ({ne} evals)",
+                        e.attr, e.system
+                    ));
+                }
             }
         }
         Ok(())

@@ -218,15 +218,23 @@ pub struct ReleaseInfo {
     /// The release's closures, by type.
     #[serde(default)]
     pub closures: Vec<ClosureInfo>,
+    /// The release's evaluations, by type.
+    #[serde(default)]
+    pub evals: Vec<EvalInfo>,
     pub indexed_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClosureInfo {
     pub closure_type: String,
-    /// Roots that could not be collected, with the reason.
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EvalInfo {
+    pub eval_type: String,
+    /// Attributes that failed to evaluate, as `<attr>@<system>`.
     #[serde(default)]
-    pub skipped: Vec<String>,
+    pub errors: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -314,6 +322,10 @@ pub struct CheckReport {
     pub releases: u64,
     #[serde(default)]
     pub closures: u64,
+    #[serde(default)]
+    pub evals: u64,
+    #[serde(default)]
+    pub eval_errors: u64,
     /// Only kinds with at least one occurrence are listed.
     pub issues: Vec<CheckIssue>,
 }

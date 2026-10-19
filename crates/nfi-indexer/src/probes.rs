@@ -12,6 +12,10 @@
 //!   including bootstrap stages and fixed-output sources.
 //!
 //! The roots go through the same closure walk as store-paths.xz roots.
+//!
+//! Probes that do not apply to a nixpkgs version (a helper or argument it
+//! does not have) are left out by `probes.nix` itself. A probe that applies
+//! but fails to evaluate is an eval error of the `helper-probes` evaluation.
 
 use anyhow::{Context, Result, bail};
 use futures::stream::{self, StreamExt};
@@ -23,6 +27,8 @@ use std::process::Stdio;
 
 pub const HELPERS_DIRECT: &str = "helpers-direct";
 pub const HELPERS_FULL: &str = "helpers-full";
+/// The eval type of probe evaluation, for the eval-errors dataset.
+pub const HELPER_PROBES: &str = "helper-probes";
 
 const PROBES_NIX: &str = include_str!("probes.nix");
 /// Files the probes' dummy sources contain (for language vendoring helpers).
@@ -63,8 +69,8 @@ pub enum ProbeDrvs {
 pub struct ProbeRoots {
     pub direct: BTreeSet<StorePath>,
     pub full: BTreeSet<StorePath>,
-    /// `<probe>@<system>: <error>` for probes that could not be evaluated.
-    pub skipped: Vec<String>,
+    /// `(probe, system)` for probes that failed to evaluate.
+    pub errors: Vec<(String, String)>,
 }
 
 /// Input derivations of `drv` and everything they depend on (not `drv`).
@@ -151,15 +157,26 @@ fn command(cmd: &[String]) -> Result<tokio::process::Command> {
 }
 
 /// Run a command, returning stdout, or the tail of stderr as the error.
-async fn run(mut cmd: tokio::process::Command, what: &str) -> Result<String> {
+async fn run(cmd: tokio::process::Command, what: &str) -> Result<String> {
+    run_checked(cmd, what).await?.map_err(anyhow::Error::msg)
+}
+
+/// Run a command. The outer error is a failure to run it at all; the inner
+/// one is the command failing, with the tail of its stderr.
+async fn run_checked(
+    mut cmd: tokio::process::Command,
+    what: &str,
+) -> Result<std::result::Result<String, String>> {
     let out = cmd.output().await.with_context(|| format!("running {what}"))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let msg: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
         let tail = msg[msg.len().saturating_sub(3)..].join(" | ");
-        bail!("{what} failed ({}): {tail}", out.status);
+        return Ok(Err(format!("{what} failed ({}): {tail}", out.status)));
     }
-    String::from_utf8(out.stdout).with_context(|| format!("{what}: non-UTF-8 output"))
+    Ok(Ok(
+        String::from_utf8(out.stdout).with_context(|| format!("{what}: non-UTF-8 output"))?
+    ))
 }
 
 struct ProbeFile {
@@ -209,7 +226,8 @@ fn instantiate_cmd(
     Ok(c)
 }
 
-/// Instantiate one probe, returning its derivations.
+/// Instantiate one probe, returning its derivations, or the evaluation
+/// error if it does not evaluate.
 async fn instantiate(
     opts: &ProbeOptions,
     pf: &ProbeFile,
@@ -217,7 +235,7 @@ async fn instantiate(
     system: &str,
     name: &str,
     kind: &str,
-) -> Result<ProbeDrvs> {
+) -> Result<std::result::Result<ProbeDrvs, String>> {
     let mut c = instantiate_cmd(opts, pf, nixpkgs, system)?;
     let attrs: Vec<String> = match kind {
         "fetch" => vec![format!("probes'.{name}.a"), format!("probes'.{name}.b")],
@@ -227,7 +245,10 @@ async fn instantiate(
     for a in &attrs {
         c.arg("-A").arg(a);
     }
-    let out = run(c, "nix-instantiate").await?;
+    let out = match run_checked(c, "nix-instantiate").await? {
+        Ok(out) => out,
+        Err(e) => return Ok(Err(e)),
+    };
     let drvs: Vec<String> = out
         .lines()
         .map(str::trim)
@@ -235,11 +256,11 @@ async fn instantiate(
         .map(|l| l.split('!').next().unwrap_or(l).to_string())
         .collect();
     match (kind, drvs.as_slice()) {
-        ("fetch", [a, b]) => Ok(ProbeDrvs::Fetch {
+        ("fetch", [a, b]) => Ok(Ok(ProbeDrvs::Fetch {
             a: a.clone(),
             b: b.clone(),
-        }),
-        ("target", ts) if !ts.is_empty() => Ok(ProbeDrvs::Target(ts.to_vec())),
+        })),
+        ("target", ts) if !ts.is_empty() => Ok(Ok(ProbeDrvs::Target(ts.to_vec()))),
         _ => bail!("unexpected nix-instantiate output for {name}: {out:?}"),
     }
 }
@@ -253,24 +274,25 @@ pub async fn run_probes(nixpkgs: &Path, opts: &ProbeOptions) -> Result<ProbeRoot
         c.args(["--eval", "--json", "--strict", "-A", "kinds"]);
         let kinds: BTreeMap<String, String> =
             serde_json::from_str(&run(c, "listing probes").await?).context("parsing probe list")?;
-        let results: Vec<(String, Result<ProbeDrvs>)> = stream::iter(kinds.iter())
-            .map(|(name, kind)| {
-                let pf = &pf;
-                async move {
-                    let r = instantiate(opts, pf, nixpkgs, system, name, kind).await;
-                    (name.clone(), r)
-                }
-            })
-            .buffer_unordered(opts.jobs.max(1))
-            .collect()
-            .await;
+        let results: Vec<(String, Result<std::result::Result<ProbeDrvs, String>>)> =
+            stream::iter(kinds.iter())
+                .map(|(name, kind)| {
+                    let pf = &pf;
+                    async move {
+                        let r = instantiate(opts, pf, nixpkgs, system, name, kind).await;
+                        (name.clone(), r)
+                    }
+                })
+                .buffer_unordered(opts.jobs.max(1))
+                .collect()
+                .await;
         let mut probes = Vec::new();
         for (name, r) in results {
-            match r {
+            match r.with_context(|| format!("probe {name} on {system}"))? {
                 Ok(p) => probes.push((name, p)),
                 Err(e) => {
-                    tracing::warn!(probe = %name, %system, error = %format!("{e:#}"), "probe skipped");
-                    roots.skipped.push(format!("{name}@{system}: {e:#}"));
+                    tracing::warn!(probe = %name, %system, error = %e, "probe failed to evaluate");
+                    roots.errors.push((name, system.clone()));
                 }
             }
         }
@@ -312,7 +334,7 @@ pub async fn run_probes(nixpkgs: &Path, opts: &ProbeOptions) -> Result<ProbeRoot
         }
         tracing::info!(%system, probes = probes.len(), direct = nd, full = nf, "helper probes evaluated");
     }
-    roots.skipped.sort();
+    roots.errors.sort();
     Ok(roots)
 }
 

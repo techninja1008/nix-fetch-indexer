@@ -63,25 +63,33 @@ Bundle {
   packages: Option<PackagesSection>,
   outpaths: Option<OutpathsSection>,
   programs: Option<ProgramsSection>,
+  eval_errors: Option<EvalErrorsSection>,
 }
-Release { name, commit, channel, series, url, datasets: [closure|packages|outpaths|programs] }
+Release { name, commit, channel, series, url, datasets: [closure|packages|outpaths|programs|eval-errors] }
 
 ClosureSection {
-  closures: [Closure { release: release index, closure_type, skipped: [String] }],
+  closures: [Closure { release: release index, closure_type }],
   paths: [ClosurePath { hash, name, references: [path index], nar_size, file_size, deriver: Option<String>, closures: Bitset }],
   missing: [MissingPath { hash, name, closures: Bitset }]   // roots that are 404 on the cache
 }
 PackagesSection { entries: [Package { attr, name, pname, version, system, description, homepage, license, main_program, broken, unfree, releases: Bitset }] }
 OutpathsSection { entries: [Outpaths { attr, system, drv_path, outputs: {name: store path}, releases: Bitset }] }
 ProgramsSection { entries: [Program { name, system, attr, releases: Bitset }] }
+EvalErrorsSection {
+  evals: [Eval { release: release index, eval_type }],
+  errors: [EvalError { attr, system, evals: Bitset }]      // attributes that failed to evaluate
+}
 ```
 
 - `datasets` on a release records which sections contain data for it.
   - A release can be present in a section and still have zero entries.
 - **Closures (format version 3).** A release can have several closures, one per **closure type**: `store-paths` (runtime closures of `store-paths.xz`), `helpers-direct` and `helpers-full` (build inputs of nixpkgs helpers, found by probes), and later possibly `eval` or `fods`. Closure path and missing-path bitsets index the closure table; other sections' bitsets index releases.
-  - `skipped` records roots a closure could not collect, e.g. a probe that does not evaluate on that release.
   - A closure's release must carry the closure dataset.
-  - Version 2 bundles have no closure table; their closure bits are release indices. Readers upgrade them, with one closure per release with the closure dataset, of a type the caller chooses (`--v2-closure-type`, default `store-paths`), so no bitset is rewritten.
+- **Evaluations.** The eval-errors section mirrors the closure section: evaluations (release, **eval type**, e.g. `helper-probes`) play the role of closures, and eval errors that of missing paths. Error bitsets index the section's own evaluation table, so the section stands alone.
+  - An error is keyed by (attr, system). Evaluation is deterministic, so no message is kept.
+  - An evaluation's release must carry the eval-errors dataset. An evaluation with no errors is kept: it records that the evaluation ran.
+  - Out paths are partly the evaluation counterpart of closure paths; folding them into evaluations later would only change the out paths' own details.
+- **Version 2 bundles** have no closure table; their closure bits are release indices. Readers upgrade them, with one closure per release with the closure dataset, of a type the caller chooses (`--v2-closure-type`, default `store-paths`), so no bitset is rewritten.
 - **References** are indices into `paths`, which keeps the binary form compact. Paths outside the indexed set do not exist, because the closure is followed transitively.
 - **Bitsets** are encoded as little-endian byte strings.
 - **Binary form:**
@@ -98,6 +106,7 @@ ProgramsSection { entries: [Program { name, system, attr, releases: Bitset }] }
   - packages: (attr, version, system, metadata)
   - outpaths: (attr, system, drv_path)
   - programs: (name, system, attr)
+  - eval errors: (attr, system), after unioning the evaluation tables by (release, type)
 - **Split / filter:** select a subset of releases, sections and/or closure types, then drop the entries whose bitset becomes empty. A release left without closures loses the closure dataset.
 
 ## Indexers (`nfi-indexer`)
@@ -116,7 +125,8 @@ ProgramsSection { entries: [Program { name, system, attr, releases: Bitset }] }
   - `probes.nix` (embedded in the indexer) defines probes against the release's unpacked nixexprs, for each `--probe-systems` system (default `x86_64-linux,aarch64-linux`):
     - **fetch probes** call a helper twice with every argument changed. Only derivations shared by both calls are kept, so anything built from the probe's own arguments drops out. Option variants (e.g. fetchgit with submodules or LFS) are separate probes, unioned.
     - **target probes** are roots themselves (stdenv, stdenvNoCC).
-  - Probes guard on helper and argument availability per nixpkgs version. Each is instantiated separately, so a failing probe is skipped and recorded in the closure's `skipped`.
+  - Probes guard on helper and argument availability per nixpkgs version; a probe that doesn't apply is left out of `probes'`. Each remaining probe is instantiated separately, so one that fails to evaluate (`nix-instantiate` exits non-zero) doesn't stop the others. It is recorded as an eval error of the release's `helper-probes` evaluation when the `eval-errors` dataset is indexed. Failures to run the tools at all, or unexpected output, fail the run.
+  - Probes run once per release for both helper closure types and the eval-errors dataset.
   - `nix derivation show --recursive` gives the probes' graphs. `helpers-direct` roots are the consumed outputs of shared direct inputs (and target outputs); `helpers-full` roots are all outputs of every shared derivation in the build graphs, including bootstrap stages and fixed-output sources.
 - **`packages`**
   - Fetch `packages.json.br`, stream-decode brotli, and emit package metadata.
@@ -162,11 +172,14 @@ ProgramsSection { entries: [Program { name, system, attr, releases: Bitset }] }
 releases(id, name unique, commit unique, channel, series, url, indexed_at)
 release_datasets(release_id, dataset)
 closure_types(id, name unique)          -- store-paths, helpers-direct, helpers-full, ...
-closures(id, release_id, type_id, skipped text[], unique (release_id, type_id))
+closures(id, release_id, type_id, unique (release_id, type_id))
 store_paths(id bigserial, hash char(32) unique, name, nar_size, file_size, deriver,
             closures int[],   -- sorted ids of the closures containing the path
             refs bigint[])    -- ids of the path's runtime references
 missing_paths(hash, name, closure_id)
+eval_types(id, name unique)             -- helper-probes, ...
+evals(id, release_id, type_id, unique (release_id, type_id))
+eval_errors(attr, system, eval_id)      -- one row per (error, evaluation), like missing_paths
 packages(id, attr, version, system, name, pname, description, homepage, license, main_program, broken, unfree)
 package_releases(package_id, release_id)
 package_outputs(attr, system, release_id, output, path_hash, drv_path)   -- joined from outpaths at ingest
@@ -180,11 +193,11 @@ Membership and references are arrays on the path row, not one row per (path, clo
 1. Load the bundle's paths into a temporary table.
 2. Resolve existing paths by hash. Allocate ids for new paths from the sequence; this is safe because writers hold the advisory lock.
 3. Insert the new paths with their references in one statement.
-4. Add the bundle's closure ids to the arrays of existing paths. Closure types and closures are created as needed; skipped roots are unioned.
+4. Add the bundle's closure ids to the arrays of existing paths. Closure types and closures are created as needed.
 
 A store path's references never change, so they are written only once, when the path is new.
 
-**Prune** removes the pruned closures' ids from the arrays, then deletes paths that are left with no closures. It removes whole releases, or with `closure_types` only those closures of the selected releases.
+**Prune** removes the pruned closures' ids from the arrays, then deletes paths that are left with no closures. It removes whole releases (their evaluations and eval errors cascade), or with `closure_types` only those closures of the selected releases.
 
 **Invariants.** These replace the foreign keys:
 - every reference resolves to an existing path;

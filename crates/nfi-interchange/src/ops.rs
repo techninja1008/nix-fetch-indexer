@@ -43,13 +43,7 @@ impl ClosureBuilder {
         let map: Vec<Option<usize>> = section
             .closures
             .iter()
-            .map(|c| {
-                remap(c.release as usize).map(|r| {
-                    let i = self.ensure_closure(r, &c.closure_type);
-                    self.add_skipped(i, &c.skipped);
-                    i
-                })
-            })
+            .map(|c| remap(c.release as usize).map(|r| self.ensure_closure(r, &c.closure_type)))
             .collect();
         let cremap = |i: usize| map.get(i).copied().flatten();
         for p in &section.paths {
@@ -92,22 +86,10 @@ impl ClosureBuilder {
                 self.closures.push(Closure {
                     release,
                     closure_type: closure_type.to_string(),
-                    skipped: Vec::new(),
                 });
                 self.closures.len() - 1
             }
         }
-    }
-
-    /// Record roots of a closure that could not be collected.
-    pub fn add_skipped(&mut self, closure: usize, skipped: &[String]) {
-        let s = &mut self.closures[closure].skipped;
-        for x in skipped {
-            if !s.contains(x) {
-                s.push(x.clone());
-            }
-        }
-        s.sort();
     }
 
     pub fn closures(&self) -> &[Closure] {
@@ -239,6 +221,51 @@ impl ClosureBuilder {
     }
 }
 
+/// Builder for eval errors sections, merging errors by attribute and system.
+#[derive(Default)]
+pub struct EvalErrorsBuilder {
+    section: EvalErrorsSection,
+    index: HashMap<(String, String), usize>,
+}
+
+impl EvalErrorsBuilder {
+    /// Add a section, remapping release indices (evaluations of releases
+    /// mapped to `None` are dropped).
+    pub fn extend_section(&mut self, section: &EvalErrorsSection, remap: &dyn Fn(usize) -> Option<usize>) {
+        let map: Vec<Option<usize>> = section
+            .evals
+            .iter()
+            .map(|e| remap(e.release as usize).map(|r| self.section.ensure_eval(r as u32, &e.eval_type)))
+            .collect();
+        let eremap = |i: usize| map.get(i).copied().flatten();
+        for e in &section.errors {
+            let bits = e.evals.remap(eremap);
+            if bits.is_empty() {
+                continue;
+            }
+            let k = (e.attr.clone(), e.system.clone());
+            match self.index.get(&k) {
+                Some(&i) => self.section.errors[i].evals.union_with(&bits),
+                None => {
+                    self.index.insert(k, self.section.errors.len());
+                    self.section.errors.push(EvalError {
+                        evals: bits,
+                        ..e.clone()
+                    });
+                }
+            }
+        }
+    }
+
+    /// The section, with errors sorted by attribute and system.
+    pub fn finish(self) -> EvalErrorsSection {
+        let mut s = self.section;
+        s.errors
+            .sort_by(|a, b| (&a.attr, &a.system).cmp(&(&b.attr, &b.system)));
+        s
+    }
+}
+
 /// Accumulates entries, OR-ing the release bits of entries with equal keys,
 /// so many releases' entries can be collected without holding duplicates.
 pub struct Dedup<K, T> {
@@ -343,6 +370,7 @@ pub fn merge(inputs: impl IntoIterator<Item = Bundle>) -> Bundle {
     let mut packages: Option<(HashMap<Package, usize>, Vec<Package>)> = None;
     let mut outpaths: Option<(HashMap<_, usize>, Vec<Outpaths>)> = None;
     let mut programs: Option<(HashMap<_, usize>, Vec<Program>)> = None;
+    let mut eval_errors: Option<EvalErrorsBuilder> = None;
 
     for input in inputs {
         let map: Vec<usize> = input
@@ -355,6 +383,11 @@ pub fn merge(inputs: impl IntoIterator<Item = Bundle>) -> Bundle {
             closure
                 .get_or_insert_with(ClosureBuilder::new)
                 .extend_section(c, &remap);
+        }
+        if let Some(e) = &input.eval_errors {
+            eval_errors
+                .get_or_insert_with(EvalErrorsBuilder::default)
+                .extend_section(e, &remap);
         }
         if let Some(s) = input.packages {
             let (idx, v) = packages.get_or_insert_with(Default::default);
@@ -403,6 +436,7 @@ pub fn merge(inputs: impl IntoIterator<Item = Bundle>) -> Bundle {
     out.packages = packages.map(|(_, entries)| PackagesSection { entries });
     out.outpaths = outpaths.map(|(_, entries)| OutpathsSection { entries });
     out.programs = programs.map(|(_, entries)| ProgramsSection { entries });
+    out.eval_errors = eval_errors.map(EvalErrorsBuilder::finish);
     normalize(&mut out);
     out
 }
@@ -521,6 +555,11 @@ pub fn filter(
             missing,
         });
     }
+    if let Some(e) = b.eval_errors.as_ref().filter(|_| want(Dataset::EvalErrors)) {
+        let mut builder = EvalErrorsBuilder::default();
+        builder.extend_section(e, &remap);
+        out.eval_errors = Some(builder.finish());
+    }
     if let Some(s) = b.packages.as_ref().filter(|_| want(Dataset::Packages)) {
         out.packages = Some(PackagesSection {
             entries: s
@@ -583,6 +622,7 @@ pub struct ReleaseStats {
     pub packages: usize,
     pub outpaths: usize,
     pub programs: usize,
+    pub eval_errors: usize,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -591,8 +631,13 @@ pub struct ClosureStats {
     pub closure_type: String,
     pub paths: usize,
     pub missing: usize,
-    /// Roots that could not be collected (e.g. skipped helper probes).
-    pub skipped: usize,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct EvalStats {
+    pub release: String,
+    pub eval_type: String,
+    pub errors: usize,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -605,8 +650,10 @@ pub struct Stats {
     pub packages: usize,
     pub outpaths: usize,
     pub programs: usize,
+    pub eval_errors: usize,
     pub releases: Vec<ReleaseStats>,
     pub closures: Vec<ClosureStats>,
+    pub evals: Vec<EvalStats>,
 }
 
 pub fn stats(b: &Bundle) -> Stats {
@@ -647,7 +694,6 @@ pub fn stats(b: &Bundle) -> Stats {
                     .map(|r| r.name.clone())
                     .unwrap_or_default(),
                 closure_type: cl.closure_type.clone(),
-                skipped: cl.skipped.len(),
                 ..Default::default()
             })
             .collect();
@@ -687,6 +733,32 @@ pub fn stats(b: &Bundle) -> Stats {
         for e in &p.entries {
             count(&e.releases, |r| &mut r.programs);
         }
+    }
+    if let Some(e) = &b.eval_errors {
+        s.eval_errors = e.errors.len();
+        let mut evals: Vec<EvalStats> = e
+            .evals
+            .iter()
+            .map(|ev| EvalStats {
+                release: b
+                    .releases
+                    .get(ev.release as usize)
+                    .map(|r| r.name.clone())
+                    .unwrap_or_default(),
+                eval_type: ev.eval_type.clone(),
+                errors: 0,
+            })
+            .collect();
+        let releases_of =
+            |bits: &Bitset| -> Bitset { bits.remap(|j| e.evals.get(j).map(|ev| ev.release as usize)) };
+        for err in &e.errors {
+            count(&releases_of(&err.evals), |r| &mut r.eval_errors);
+            let n = evals.len();
+            for j in err.evals.iter().filter(|&j| j < n) {
+                evals[j].errors += 1;
+            }
+        }
+        s.evals = evals;
     }
     s.releases = releases;
     s

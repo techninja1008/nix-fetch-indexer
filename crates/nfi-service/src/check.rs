@@ -67,6 +67,10 @@ pub async fn check(pool: &PgPool) -> Result<CheckReport> {
     let closures: i64 = sqlx::query_scalar("SELECT count(*) FROM closures")
         .fetch_one(&mut *tx)
         .await?;
+    let (evals, eval_errors): (i64, i64) =
+        sqlx::query_as("SELECT (SELECT count(*) FROM evals), (SELECT count(*) FROM eval_errors)")
+            .fetch_one(&mut *tx)
+            .await?;
     let mut issues = Vec::new();
     for c in CHECKS {
         // A plain count can use parallel workers; examples are only fetched
@@ -96,6 +100,8 @@ pub async fn check(pool: &PgPool) -> Result<CheckReport> {
         references: references.unwrap_or(0) as u64,
         releases: releases as u64,
         closures: closures as u64,
+        evals: evals as u64,
+        eval_errors: eval_errors as u64,
         issues,
     })
 }

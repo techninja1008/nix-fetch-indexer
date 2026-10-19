@@ -12,8 +12,6 @@ CREATE TABLE closures (
     id          serial PRIMARY KEY,
     release_id  int    NOT NULL REFERENCES releases ON DELETE CASCADE,
     type_id     int    NOT NULL REFERENCES closure_types,
-    -- Roots that could not be collected, with the reason.
-    skipped     text[] NOT NULL DEFAULT '{}',
     UNIQUE (release_id, type_id)
 );
 
@@ -39,3 +37,28 @@ ALTER TABLE missing_paths
 
 -- Minimise's close-miss check looks paths up by name.
 CREATE INDEX store_paths_name ON store_paths (name);
+
+-- Evaluations: a release can be evaluated in several ways (helper probes,
+-- ...). Eval types, evaluations and eval errors are to evaluation what
+-- closure types, closures and missing paths are to closures.
+CREATE TABLE eval_types (
+    id    serial PRIMARY KEY,
+    name  text NOT NULL UNIQUE
+);
+
+CREATE TABLE evals (
+    id          serial PRIMARY KEY,
+    release_id  int NOT NULL REFERENCES releases ON DELETE CASCADE,
+    type_id     int NOT NULL REFERENCES eval_types,
+    UNIQUE (release_id, type_id)
+);
+
+-- Attributes that failed to evaluate. Evaluation is deterministic, so the
+-- attribute and system identify the failure; no message is kept.
+CREATE TABLE eval_errors (
+    attr     text NOT NULL,
+    system   text NOT NULL,
+    eval_id  int  NOT NULL REFERENCES evals ON DELETE CASCADE,
+    PRIMARY KEY (attr, system, eval_id)
+);
+CREATE INDEX eval_errors_eval ON eval_errors (eval_id);

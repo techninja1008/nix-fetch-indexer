@@ -214,18 +214,34 @@ async fn releases(State(s): State<AppState>) -> R<Vec<ReleaseInfo>> {
     )
     .fetch_all(&s.pool)
     .await?;
-    let closures: Vec<(i32, String, Vec<String>)> = sqlx::query_as(
-        "SELECT c.release_id, t.name, c.skipped FROM closures c JOIN closure_types t ON t.id = c.type_id
+    let closures: Vec<(i32, String)> = sqlx::query_as(
+        "SELECT c.release_id, t.name FROM closures c JOIN closure_types t ON t.id = c.type_id
          ORDER BY c.release_id, t.id",
     )
     .fetch_all(&s.pool)
     .await?;
     let mut by_release: std::collections::HashMap<i32, Vec<ClosureInfo>> = Default::default();
-    for (release, closure_type, skipped) in closures {
-        by_release.entry(release).or_default().push(ClosureInfo {
-            closure_type,
-            skipped,
-        });
+    for (release, closure_type) in closures {
+        by_release
+            .entry(release)
+            .or_default()
+            .push(ClosureInfo { closure_type });
+    }
+    let evals: Vec<(i32, String, Vec<String>)> = sqlx::query_as(
+        "SELECT e.release_id, t.name,
+                ARRAY(SELECT x.attr || '@' || x.system FROM eval_errors x WHERE x.eval_id = e.id
+                       ORDER BY x.attr, x.system)
+           FROM evals e JOIN eval_types t ON t.id = e.type_id
+          ORDER BY e.release_id, t.id",
+    )
+    .fetch_all(&s.pool)
+    .await?;
+    let mut evals_by_release: std::collections::HashMap<i32, Vec<EvalInfo>> = Default::default();
+    for (release, eval_type, errors) in evals {
+        evals_by_release
+            .entry(release)
+            .or_default()
+            .push(EvalInfo { eval_type, errors });
     }
     Ok(Json(
         rows.into_iter()
@@ -238,6 +254,7 @@ async fn releases(State(s): State<AppState>) -> R<Vec<ReleaseInfo>> {
                     url,
                     datasets,
                     closures: by_release.remove(&id).unwrap_or_default(),
+                    evals: evals_by_release.remove(&id).unwrap_or_default(),
                     indexed_at,
                 },
             )

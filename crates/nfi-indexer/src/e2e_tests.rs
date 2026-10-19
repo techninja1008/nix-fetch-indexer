@@ -4,7 +4,7 @@ use crate::closure::ClosureOptions;
 use crate::fetch::Fetcher;
 use crate::index::{IndexOptions, index_releases};
 use crate::outpaths::OutpathsOptions;
-use crate::probes::{HELPERS_DIRECT, HELPERS_FULL, ProbeOptions};
+use crate::probes::{HELPER_PROBES, HELPERS_DIRECT, HELPERS_FULL, ProbeOptions};
 use crate::release::{self, ReleaseLocation};
 use nfi_interchange::*;
 use std::io::Write;
@@ -166,14 +166,20 @@ async fn index_two_releases_end_to_end() {
         locs.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(),
         vec!["nixos-25.05.100.aaaaaaaaaaaa", "nixos-25.05.200.bbbbbbbbbbbb"]
     );
-    let b = index_releases(&fetcher, &locs, &opts(&base, Dataset::ALL.to_vec(), &eval), None)
+    // Everything that does not need Nix (eval errors come from helper
+    // probes; see helper_probe_closures).
+    let datasets: Vec<Dataset> = Dataset::ALL
+        .into_iter()
+        .filter(|d| *d != Dataset::EvalErrors)
+        .collect();
+    let b = index_releases(&fetcher, &locs, &opts(&base, datasets.clone(), &eval), None)
         .await
         .unwrap();
     b.validate().unwrap();
     assert_eq!(b.releases.len(), 2);
     assert_eq!(b.releases[0].commit, "a".repeat(40));
     assert_eq!(b.releases[0].channel, "nixos-25.05");
-    assert_eq!(b.releases[0].datasets, Dataset::ALL.to_vec());
+    assert_eq!(b.releases[0].datasets, datasets);
     let c = b.closure.as_ref().unwrap();
     assert_eq!(names(c, 0), vec!["p1", "p2", "p3", "p4"]);
     assert_eq!(names(c, 1), vec!["p1", "p2", "p3", "p5"]);
@@ -291,7 +297,11 @@ esac
         "fake-nix",
         &format!("cat {}\n", dir.path().join("graph.json").display()),
     );
-    let mut o = opts(&base, vec![Dataset::Closure], Path::new("/bin/false"));
+    let mut o = opts(
+        &base,
+        vec![Dataset::Closure, Dataset::EvalErrors],
+        Path::new("/bin/false"),
+    );
     o.closure_types = vec![STORE_PATHS.into(), HELPERS_DIRECT.into(), HELPERS_FULL.into()];
     o.probes = ProbeOptions {
         systems: vec!["x86_64-linux".into()],
@@ -323,11 +333,25 @@ esac
     let direct = c.closure_index(0, HELPERS_DIRECT).unwrap();
     let tarball = c.missing.iter().find(|m| m.name == "curl.tar.xz").unwrap();
     assert!(tarball.closures.get(full) && !tarball.closures.get(direct));
-    for ct in [HELPERS_DIRECT, HELPERS_FULL] {
-        let cl = &c.closures[c.closure_index(0, ct).unwrap()];
-        assert_eq!(cl.skipped.len(), 1, "{ct}");
-        assert!(cl.skipped[0].starts_with("broken@x86_64-linux: ") && cl.skipped[0].contains("nope"));
-    }
+    // The probe that fails to evaluate is an eval error of the probes'
+    // evaluation; the message is not kept.
+    let e = b.eval_errors.as_ref().unwrap();
+    assert_eq!(
+        e.evals,
+        vec![Eval {
+            release: 0,
+            eval_type: HELPER_PROBES.into(),
+        }]
+    );
+    assert_eq!(
+        e.errors,
+        vec![EvalError {
+            attr: "broken".into(),
+            system: "x86_64-linux".into(),
+            evals: Bitset::single(0),
+        }]
+    );
+    assert!(b.releases[0].datasets.contains(&Dataset::EvalErrors));
 }
 
 /// Opt-in live smoke test (`NFI_LIVE_TESTS=1`): index a small sample of a real

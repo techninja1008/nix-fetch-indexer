@@ -3,7 +3,7 @@
 use crate::closure::{self, ClosureOptions};
 use crate::fetch::{Fetched, Fetcher};
 use crate::outpaths::{self, OutpathsOptions};
-use crate::probes::{self, HELPERS_DIRECT, HELPERS_FULL, ProbeOptions};
+use crate::probes::{self, HELPER_PROBES, HELPERS_DIRECT, HELPERS_FULL, ProbeOptions};
 use crate::release::ReleaseLocation;
 use crate::{packages, programs, tarball};
 use anyhow::{Context, Result};
@@ -36,6 +36,8 @@ pub struct ReleaseReport {
     pub programs_secs: f64,
     pub outpaths: Option<usize>,
     pub outpaths_secs: f64,
+    /// Helper probes that failed to evaluate.
+    pub eval_errors: Option<usize>,
 }
 
 /// What an indexing run did, for logging a summary.
@@ -96,6 +98,7 @@ pub async fn index_releases_with_report(
     let mut package_entries = ops::Dedup::packages();
     let mut outpath_entries = ops::Dedup::outpaths();
     let mut program_entries = ops::Dedup::programs();
+    let mut eval_errors = EvalErrorsSection::default();
     let mut new_releases = Vec::new();
 
     for loc in locations {
@@ -114,41 +117,50 @@ pub async fn index_releases_with_report(
         let mut tar: Option<bytes::Bytes> = None;
         let mut unpacked: Option<(tempfile::TempDir, std::path::PathBuf)> = None;
 
+        // Helper probes are evaluated once per release, for the helper
+        // closure types and for the eval-errors dataset.
+        let closure_probes = opts.datasets.contains(&Dataset::Closure)
+            && opts
+                .closure_types
+                .iter()
+                .any(|t| t == HELPERS_DIRECT || t == HELPERS_FULL);
+        let probe_roots = if closure_probes || opts.datasets.contains(&Dataset::EvalErrors) {
+            let dir = unpack(fetcher, loc, &mut tar, &mut unpacked).await?;
+            Some(
+                probes::run_probes(dir, &opts.probes)
+                    .await
+                    .with_context(|| format!("running helper probes for {}", release.name))?,
+            )
+        } else {
+            None
+        };
+
         if opts.datasets.contains(&Dataset::Closure) {
             let t = std::time::Instant::now();
-            let mut probe_roots: Option<probes::ProbeRoots> = None;
             for ct in &opts.closure_types {
-                let (roots, skipped) = match ct.as_str() {
+                let roots = match ct.as_str() {
                     STORE_PATHS => {
                         let xz = fetcher.get(&loc.file("store-paths.xz")).await?;
                         let mut roots = closure::parse_store_paths(&xz)?;
                         if let Some(n) = opts.closure.sample {
                             roots.truncate(n);
                         }
-                        (roots, Vec::new())
+                        roots
                     }
                     HELPERS_DIRECT | HELPERS_FULL => {
-                        if probe_roots.is_none() {
-                            let dir = unpack(fetcher, loc, &mut tar, &mut unpacked).await?;
-                            let r = probes::run_probes(dir, &opts.probes)
-                                .await
-                                .with_context(|| format!("running helper probes for {}", release.name))?;
-                            probe_roots = Some(r);
-                        }
-                        let pr = probe_roots.as_ref().expect("set above");
+                        let pr = probe_roots.as_ref().expect("probes run for helper closures");
                         let set = if ct == HELPERS_DIRECT {
                             &pr.direct
                         } else {
                             &pr.full
                         };
-                        (set.iter().cloned().collect(), pr.skipped.clone())
+                        set.iter().cloned().collect()
                     }
                     other => anyhow::bail!(
                         "unknown closure type {other:?} (expected {STORE_PATHS}, {HELPERS_DIRECT} or {HELPERS_FULL})"
                     ),
                 };
                 let cidx = builder.ensure_closure(idx, ct);
-                builder.add_skipped(cidx, &skipped);
                 let report =
                     closure::index_closure(fetcher, &opts.closure, &mut builder, &roots, cidx).await?;
                 tracing::info!(
@@ -158,13 +170,21 @@ pub async fn index_releases_with_report(
                     fetched = report.fetched,
                     reused = report.reused,
                     missing = report.missing,
-                    skipped = skipped.len(),
                     "closure indexed"
                 );
                 rr.closures.push((ct.clone(), report));
             }
             rr.closure_secs = secs(t);
             bundle.releases[idx].add_dataset(Dataset::Closure);
+        }
+        if opts.datasets.contains(&Dataset::EvalErrors) {
+            let pr = probe_roots.as_ref().expect("probes run for eval errors");
+            let e = eval_errors.ensure_eval(idx as u32, HELPER_PROBES);
+            for (attr, system) in &pr.errors {
+                eval_errors.add_error(attr, system, e);
+            }
+            rr.eval_errors = Some(pr.errors.len());
+            bundle.releases[idx].add_dataset(Dataset::EvalErrors);
         }
         if opts.datasets.contains(&Dataset::Packages) {
             let t = std::time::Instant::now();
@@ -248,6 +268,11 @@ pub async fn index_releases_with_report(
         bundle.programs = Some(ProgramsSection {
             entries: program_entries.into_entries(),
         });
+    }
+    if opts.datasets.contains(&Dataset::EvalErrors) {
+        let mut b = EvalErrorsBuilder::default();
+        b.extend_section(&eval_errors, &Some);
+        bundle.eval_errors = Some(b.finish());
     }
 
     let bundle = if let (true, Some(seed)) = (opts.include_seed, seed_sections) {

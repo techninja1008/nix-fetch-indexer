@@ -527,7 +527,6 @@ fn helpers_bundle() -> Bundle {
     let ra = b.ensure_release(r);
     let mut cb = ClosureBuilder::new();
     let ci = cb.ensure_closure(ra, "helpers-direct");
-    cb.add_skipped(ci, &["fetchhg@x86_64-linux: error: no hg".to_string()]);
     let bits = Bitset::single(ci);
     for (n, name, refs) in [(7u8, "curl-bootstrap-8.0", vec![1u8]), (1, "glibc-2.40", vec![1])] {
         cb.insert(
@@ -574,7 +573,6 @@ async fn closure_types_ingest_minimise_and_prune() {
     let a = releases().await;
     let types: Vec<_> = a.closures.iter().map(|c| c.closure_type.as_str()).collect();
     assert_eq!(types, ["store-paths", "helpers-direct"]);
-    assert_eq!(a.closures[1].skipped, ["fetchhg@x86_64-linux: error: no hg"]);
 
     // A build-only tool from a helpers closure is a hit.
     let drv = |n: u8, name: &str| format!("{}-{name}.drv", h(100 + n));
@@ -670,6 +668,87 @@ async fn closure_types_ingest_minimise_and_prune() {
     let report: CheckReport = serde_json::from_value(j.result.unwrap()).unwrap();
     assert!(report.ok, "{report:?}");
     assert_eq!(report.closures, 3);
+}
+
+/// Helper probe eval errors for both releases: fetchhg fails in A and B,
+/// fetchsvn only in A.
+fn eval_errors_bundle() -> Bundle {
+    let base = bundle();
+    let mut b = Bundle::default();
+    let mut e = EvalErrorsSection::default();
+    for (i, r) in base.releases.iter().enumerate() {
+        let mut r = r.clone();
+        r.datasets = vec![Dataset::EvalErrors];
+        let ri = b.ensure_release(r);
+        let ev = e.ensure_eval(ri as u32, "helper-probes");
+        e.add_error("fetchhg", "x86_64-linux", ev);
+        if i == 0 {
+            e.add_error("fetchsvn", "aarch64-linux", ev);
+        }
+    }
+    b.eval_errors = Some(e);
+    b.validate().unwrap();
+    b
+}
+
+#[tokio::test]
+async fn eval_errors_ingest_and_prune() {
+    let Some(c) = setup(None).await else { return };
+    c.ingest_bytes(encode(&bundle(), Format::Json)).await;
+    let job = c.ingest_bytes(encode(&eval_errors_bundle(), Format::Json)).await;
+    let result = job.result.unwrap();
+    assert_eq!(result["eval_errors"], 3);
+    assert_eq!(result["evals"].as_array().unwrap().len(), 2);
+    // Re-ingesting is a no-op.
+    c.ingest_bytes(encode(&eval_errors_bundle(), Format::Json)).await;
+
+    let releases = || async {
+        let mut rels: Vec<ReleaseInfo> = c
+            .admin(reqwest::Method::GET, "/admin/v1/releases")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        rels.sort_by(|a, b| a.commit.cmp(&b.commit));
+        rels
+    };
+    let rels = releases().await;
+    assert_eq!(rels[0].commit, A);
+    assert!(rels[0].datasets.contains(&"eval-errors".to_string()));
+    assert_eq!(rels[0].evals.len(), 1);
+    assert_eq!(rels[0].evals[0].eval_type, "helper-probes");
+    assert_eq!(
+        rels[0].evals[0].errors,
+        ["fetchhg@x86_64-linux", "fetchsvn@aarch64-linux"]
+    );
+    assert_eq!(rels[1].evals[0].errors, ["fetchhg@x86_64-linux"]);
+
+    let check = || async {
+        let r = c
+            .admin(reqwest::Method::POST, "/admin/v1/check")
+            .send()
+            .await
+            .unwrap();
+        let j = c.wait_job(r.json::<JobCreated>().await.unwrap().id).await;
+        serde_json::from_value::<CheckReport>(j.result.unwrap()).unwrap()
+    };
+    let report = check().await;
+    assert!(report.ok, "{report:?}");
+    assert_eq!((report.evals, report.eval_errors), (2, 3));
+
+    // Pruning a release removes its evaluations and their errors.
+    let r = c
+        .admin(reqwest::Method::POST, "/admin/v1/prune")
+        .json(&json!({"commits": [A]}))
+        .send()
+        .await
+        .unwrap();
+    let j = c.wait_job(r.json::<JobCreated>().await.unwrap().id).await;
+    assert_eq!(j.status, JobStatus::Succeeded, "{:?}", j.error);
+    let report = check().await;
+    assert_eq!((report.evals, report.eval_errors), (1, 1));
 }
 
 /// Migration 0003 turns existing release membership into store-paths
