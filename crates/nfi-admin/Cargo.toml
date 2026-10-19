@@ -4,6 +4,8 @@ description = "Admin CLI for the nix-fetch-indexer service"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+readme.workspace = true
 
 [dependencies]
 nfi-api = { workspace = true, features = ["client"] }

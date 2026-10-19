@@ -29,6 +29,7 @@
               fileset = lib.fileset.unions [
                 ./Cargo.toml
                 ./Cargo.lock
+                ./LICENSE
                 ./crates
               ];
             };
@@ -92,14 +93,14 @@
               Entrypoint = [ "${workspace}/bin/nfi-service" ];
               Env = [
                 "NFI_LISTEN=0.0.0.0:8080"
-                # Inside the container the admin listener must be reachable
-                # from the host network; do not publish this port publicly.
-                "NFI_ADMIN_LISTEN=0.0.0.0:8081"
+                # The admin listener stays inside the container by default.
+                # To reach it from outside, override NFI_ADMIN_LISTEN, set
+                # NFI_ADMIN_TOKEN and publish the port on a private address.
+                "NFI_ADMIN_LISTEN=127.0.0.1:8081"
                 "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
               ];
               ExposedPorts = {
                 "8080/tcp" = { };
-                "8081/tcp" = { };
               };
               User = "65534:65534";
             };
