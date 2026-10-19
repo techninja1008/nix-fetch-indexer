@@ -71,12 +71,12 @@ pub async fn cached_paths(pool: &PgPool, paths: &BTreeSet<String>) -> Result<BTr
     let parsed: Vec<StorePath> = paths.iter().filter_map(|p| StorePath::parse(p).ok()).collect();
     let hashes: Vec<String> = parsed.iter().map(|p| p.hash.to_string()).collect();
     let found: Vec<(String, String, i32)> =
-        sqlx::query_as("SELECT hash, name, cardinality(releases) FROM store_paths WHERE hash = ANY($1)")
+        sqlx::query_as("SELECT hash, name, cardinality(closures) FROM store_paths WHERE hash = ANY($1)")
             .bind(&hashes)
             .fetch_all(pool)
             .await?;
     if let Some((hash, name, _)) = found.iter().find(|(_, _, n)| *n == 0) {
-        return Err(Inconsistent(format!("store path {hash}-{name} belongs to no release")).into());
+        return Err(Inconsistent(format!("store path {hash}-{name} belongs to no closure")).into());
     }
     let found: HashMap<String, String> = found.into_iter().map(|(h, n, _)| (h, n)).collect();
     Ok(parsed
@@ -105,7 +105,7 @@ pub async fn closure(
              UNION
              SELECT unnest(s.refs) FROM store_paths s JOIN c ON s.id = c.id
          )
-         SELECT s.id, s.hash, s.name, s.nar_size, s.file_size, s.refs, cardinality(s.releases)
+         SELECT s.id, s.hash, s.name, s.nar_size, s.file_size, s.refs, cardinality(s.closures)
            FROM c JOIN store_paths s ON s.id = c.id ORDER BY s.hash",
     )
     .bind(&hashes)
@@ -118,10 +118,10 @@ pub async fn closure(
     // References to ids without a row would otherwise silently shrink the
     // closure (the recursive join drops them).
     let mut edges = Vec::new();
-    for (id, _, _, _, _, refs, releases) in &rows {
+    for (id, _, _, _, _, refs, closures) in &rows {
         let path = &by_id[id];
-        if *releases == 0 {
-            return Err(Inconsistent(format!("store path {path} belongs to no release")).into());
+        if *closures == 0 {
+            return Err(Inconsistent(format!("store path {path} belongs to no closure")).into());
         }
         for r in refs {
             let Some(target) = by_id.get(r) else {

@@ -128,7 +128,17 @@ async fn minimise(State(s): State<AppState>, Json(v): Json<serde_json::Value>) -
     Ok(Json(query::minimise(&s.pool, &graph).await?))
 }
 
-async fn ingest(State(s): State<AppState>, headers: HeaderMap, body: Body) -> Result<Response, AppError> {
+#[derive(Deserialize)]
+struct IngestParams {
+    v2_closure_type: Option<String>,
+}
+
+async fn ingest(
+    State(s): State<AppState>,
+    Query(p): Query<IngestParams>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, AppError> {
     let is_json = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -139,14 +149,16 @@ async fn ingest(State(s): State<AppState>, headers: HeaderMap, body: Body) -> Re
             .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
         let req: IngestUrlRequest = serde_json::from_slice(&bytes)
             .map_err(|e| err(StatusCode::BAD_REQUEST, format!("expected {{\"url\": ...}}: {e}")))?;
+        let v2 = req.v2_closure_type.or(p.v2_closure_type);
         jobs::enqueue(
             &s.pool,
             "ingest",
-            serde_json::json!({"source": "url", "url": req.url}),
+            serde_json::json!({"source": "url", "url": req.url, "v2_closure_type": v2}),
         )
         .await?
     } else {
-        jobs::enqueue_upload(&s.pool, body.into_data_stream()).await?
+        let params = serde_json::json!({"v2_closure_type": p.v2_closure_type});
+        jobs::enqueue_upload(&s.pool, body.into_data_stream(), params).await?
     };
     Ok((StatusCode::ACCEPTED, Json(JobCreated { id })).into_response())
 }
@@ -170,26 +182,49 @@ async fn get_job(State(s): State<AppState>, Path(id): Path<i64>) -> R<JobInfo> {
 }
 
 async fn releases(State(s): State<AppState>) -> R<Vec<ReleaseInfo>> {
-    let rows: Vec<(String, String, String, String, Option<String>, Vec<String>, chrono::DateTime<chrono::Utc>)> =
-        sqlx::query_as(
-            "SELECT r.name, r.commit, r.channel, r.series, r.url,
-                    COALESCE(array_agg(d.dataset ORDER BY d.dataset) FILTER (WHERE d.dataset IS NOT NULL), '{}'),
-                    r.indexed_at
-             FROM releases r LEFT JOIN release_datasets d ON d.release_id = r.id
-             GROUP BY r.id ORDER BY r.channel, r.indexed_at, r.name",
-        )
-        .fetch_all(&s.pool)
-        .await?;
+    type Row = (
+        i32,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Vec<String>,
+        chrono::DateTime<chrono::Utc>,
+    );
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT r.id, r.name, r.commit, r.channel, r.series, r.url,
+                COALESCE(array_agg(d.dataset ORDER BY d.dataset) FILTER (WHERE d.dataset IS NOT NULL), '{}'),
+                r.indexed_at
+         FROM releases r LEFT JOIN release_datasets d ON d.release_id = r.id
+         GROUP BY r.id ORDER BY r.channel, r.indexed_at, r.name",
+    )
+    .fetch_all(&s.pool)
+    .await?;
+    let closures: Vec<(i32, String, Vec<String>)> = sqlx::query_as(
+        "SELECT c.release_id, t.name, c.skipped FROM closures c JOIN closure_types t ON t.id = c.type_id
+         ORDER BY c.release_id, t.id",
+    )
+    .fetch_all(&s.pool)
+    .await?;
+    let mut by_release: std::collections::HashMap<i32, Vec<ClosureInfo>> = Default::default();
+    for (release, closure_type, skipped) in closures {
+        by_release.entry(release).or_default().push(ClosureInfo {
+            closure_type,
+            skipped,
+        });
+    }
     Ok(Json(
         rows.into_iter()
             .map(
-                |(name, commit, channel, series, url, datasets, indexed_at)| ReleaseInfo {
+                |(id, name, commit, channel, series, url, datasets, indexed_at)| ReleaseInfo {
                     name,
                     commit,
                     channel,
                     series,
                     url,
                     datasets,
+                    closures: by_release.remove(&id).unwrap_or_default(),
                     indexed_at,
                 },
             )

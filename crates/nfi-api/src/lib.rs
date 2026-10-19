@@ -211,12 +211,27 @@ pub struct ReleaseInfo {
     pub series: String,
     pub url: Option<String>,
     pub datasets: Vec<String>,
+    /// The release's closures, by type.
+    #[serde(default)]
+    pub closures: Vec<ClosureInfo>,
     pub indexed_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClosureInfo {
+    pub closure_type: String,
+    /// Roots that could not be collected, with the reason.
+    #[serde(default)]
+    pub skipped: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IngestUrlRequest {
     pub url: String,
+    /// Closure type to read a version 2 bundle (which predates closure
+    /// types) as; default `store-paths`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v2_closure_type: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -227,6 +242,11 @@ pub struct PruneRequest {
     pub commits: Vec<String>,
     #[serde(default)]
     pub channels: Vec<String>,
+    /// Only remove closures of these types from the selected releases
+    /// (the releases themselves and their other data are kept). Empty
+    /// removes the selected releases entirely.
+    #[serde(default)]
+    pub closure_types: Vec<String>,
 }
 
 impl PruneRequest {
@@ -272,7 +292,7 @@ pub struct JobInfo {
 /// One kind of index inconsistency found by a consistency check.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckIssue {
-    /// `dangling_refs`, `unknown_releases`, `orphan_paths` or `open_closures`.
+    /// `dangling_refs`, `unknown_closures`, `orphan_paths` or `open_closures`.
     pub kind: String,
     pub description: String,
     pub count: u64,
@@ -288,6 +308,8 @@ pub struct CheckReport {
     pub store_paths: u64,
     pub references: u64,
     pub releases: u64,
+    #[serde(default)]
+    pub closures: u64,
     /// Only kinds with at least one occurrence are listed.
     pub issues: Vec<CheckIssue>,
 }

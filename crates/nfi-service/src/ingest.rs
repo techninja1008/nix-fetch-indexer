@@ -19,6 +19,8 @@ pub const WRITE_LOCK: i64 = 0x6e66_6900;
 #[derive(Debug, Default, Serialize)]
 pub struct IngestReport {
     pub releases: Vec<String>,
+    /// `<release> <closure type>` for each closure ingested.
+    pub closures: Vec<String>,
     pub store_paths: usize,
     /// Store paths not previously in the database.
     pub new_store_paths: usize,
@@ -135,15 +137,48 @@ pub async fn ingest(
     // Closure.
     //
     // A store path's references never change, so they are only written when
-    // the path is new to the database; existing paths just gain release ids.
+    // the path is new to the database; existing paths just gain closure ids.
     if let Some(c) = &bundle.closure {
-        let rel = with(Dataset::Closure);
-        let rel_mask = mask(&rel);
-        progress(format!("closure: {} paths", c.paths.len()));
+        // Database closure id of each of the bundle's closures (validate()
+        // ensures their releases carry the closure dataset).
+        let mut closure_ids: Vec<i32> = Vec::with_capacity(c.closures.len());
+        for cl in &c.closures {
+            let release_id = ids[cl.release as usize];
+            sqlx::query("INSERT INTO closure_types (name) VALUES ($1) ON CONFLICT DO NOTHING")
+                .bind(&cl.closure_type)
+                .execute(&mut *tx)
+                .await?;
+            let id: i32 = sqlx::query_scalar(
+                "INSERT INTO closures (release_id, type_id, skipped)
+                 SELECT $1, t.id, $3 FROM closure_types t WHERE t.name = $2
+                 ON CONFLICT (release_id, type_id) DO UPDATE
+                    SET skipped = ARRAY(SELECT DISTINCT x FROM unnest(closures.skipped || EXCLUDED.skipped) x ORDER BY x)
+                 RETURNING id",
+            )
+            .bind(release_id)
+            .bind(&cl.closure_type)
+            .bind(&cl.skipped)
+            .fetch_one(&mut *tx)
+            .await
+            .with_context(|| format!("adding closure {}", cl.closure_type))?;
+            closure_ids.push(id);
+            report.closures.push(format!(
+                "{} {}",
+                bundle.releases[cl.release as usize].name, cl.closure_type
+            ));
+        }
+        let to_ids = |bits: &nfi_interchange::Bitset| -> Vec<i32> {
+            bits.iter().filter_map(|i| closure_ids.get(i).copied()).collect()
+        };
+        progress(format!(
+            "closure: {} paths in {} closures",
+            c.paths.len(),
+            c.closures.len()
+        ));
         exec(
             &mut tx,
             "CREATE TEMP TABLE t_paths (idx int, hash text, name text, nar_size bigint, file_size bigint,
-               deriver text, releases int[], id bigint, existing int[]) ON COMMIT DROP",
+               deriver text, closures int[], id bigint, existing int[]) ON COMMIT DROP",
         )
         .await?;
         exec(
@@ -153,29 +188,29 @@ pub async fn ingest(
         .await?;
         exec(
             &mut tx,
-            "CREATE TEMP TABLE t_missing (hash text, name text, release_id int) ON COMMIT DROP",
+            "CREATE TEMP TABLE t_missing (hash text, name text, closure_id int) ON COMMIT DROP",
         )
         .await?;
         let (mut paths, mut refs, mut missing) = (CopyBuf::new(), CopyBuf::new(), CopyBuf::new());
-        let mut releases_text = String::new();
+        let mut closures_text = String::new();
         for (i, p) in c.paths.iter().enumerate() {
-            let ids = release_ids(&p.releases, &rel_mask);
-            // Paths in none of the releases whose closure is ingested are not
-            // stored (they would be orphans). The bundle's closures are closed
-            // (checked by validate()), so no stored path references them.
+            let ids = to_ids(&p.closures);
+            // Paths in no closure are not stored (they would be orphans). The
+            // bundle's closures are closed (checked by validate()), so no
+            // stored path references them.
             if ids.is_empty() {
                 continue;
             }
             let hash = p.hash.to_string();
-            releases_text.clear();
-            releases_text.push('{');
+            closures_text.clear();
+            closures_text.push('{');
             for (n, id) in ids.into_iter().enumerate() {
                 if n > 0 {
-                    releases_text.push(',');
+                    closures_text.push(',');
                 }
-                releases_text.push_str(&id.to_string());
+                closures_text.push_str(&id.to_string());
             }
-            releases_text.push('}');
+            closures_text.push('}');
             paths
                 .field(i as i64)
                 .field(&hash)
@@ -183,7 +218,7 @@ pub async fn ingest(
                 .field(p.nar_size)
                 .field(p.file_size)
                 .field(&p.deriver)
-                .field(releases_text.as_str());
+                .field(closures_text.as_str());
             paths.end_row();
             for &r in &p.references {
                 refs.field(i as i64).field(r);
@@ -192,7 +227,7 @@ pub async fn ingest(
         }
         for m in &c.missing {
             let hash = m.hash.to_string();
-            for id in release_ids(&m.releases, &rel_mask) {
+            for id in to_ids(&m.closures) {
                 missing.field(&hash).field(&m.name).field(id);
                 missing.end_row();
             }
@@ -202,7 +237,7 @@ pub async fn ingest(
         report.missing = missing.rows;
         copy_in(
             &mut tx,
-            "t_paths (idx, hash, name, nar_size, file_size, deriver, releases)",
+            "t_paths (idx, hash, name, nar_size, file_size, deriver, closures)",
             paths,
         )
         .await?;
@@ -216,7 +251,7 @@ pub async fn ingest(
         progress("closure: resolving paths".into());
         exec(
             &mut tx,
-            "UPDATE t_paths t SET id = s.id, existing = s.releases FROM store_paths s WHERE s.hash = t.hash",
+            "UPDATE t_paths t SET id = s.id, existing = s.closures FROM store_paths s WHERE s.hash = t.hash",
         )
         .await?;
         let new_paths = sqlx::query(
@@ -232,8 +267,8 @@ pub async fn ingest(
             copy_in(&mut tx, "t_refs", refs).await?;
             exec(
                 &mut tx,
-                "INSERT INTO store_paths (id, hash, name, nar_size, file_size, deriver, releases, refs)
-                 SELECT t.id, t.hash, t.name, t.nar_size, t.file_size, t.deriver, t.releases,
+                "INSERT INTO store_paths (id, hash, name, nar_size, file_size, deriver, closures, refs)
+                 SELECT t.id, t.hash, t.name, t.nar_size, t.file_size, t.deriver, t.closures,
                         COALESCE(r.refs, '{}')
                    FROM t_paths t
                    LEFT JOIN (SELECT r.idx, array_agg(b.id ORDER BY b.id) AS refs
@@ -246,18 +281,18 @@ pub async fn ingest(
             .await?;
         }
 
-        progress("closure: adding releases to existing paths".into());
+        progress("closure: adding closures to existing paths".into());
         exec(
             &mut tx,
             "UPDATE store_paths s
-                SET releases = ARRAY(SELECT DISTINCT x FROM unnest(t.existing || t.releases) x ORDER BY x)
+                SET closures = ARRAY(SELECT DISTINCT x FROM unnest(t.existing || t.closures) x ORDER BY x)
                FROM t_paths t
-              WHERE t.existing IS NOT NULL AND NOT t.existing @> t.releases AND s.id = t.id",
+              WHERE t.existing IS NOT NULL AND NOT t.existing @> t.closures AND s.id = t.id",
         )
         .await?;
         exec(
             &mut tx,
-            "INSERT INTO missing_paths (hash, name, release_id) SELECT hash, name, release_id FROM t_missing ON CONFLICT DO NOTHING",
+            "INSERT INTO missing_paths (hash, name, closure_id) SELECT hash, name, closure_id FROM t_missing ON CONFLICT DO NOTHING",
         )
         .await?;
     }

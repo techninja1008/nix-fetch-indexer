@@ -4,6 +4,7 @@ use crate::closure::ClosureOptions;
 use crate::fetch::Fetcher;
 use crate::index::{IndexOptions, index_releases};
 use crate::outpaths::OutpathsOptions;
+use crate::probes::{HELPERS_DIRECT, HELPERS_FULL, ProbeOptions};
 use crate::release::{self, ReleaseLocation};
 use nfi_interchange::*;
 use std::io::Write;
@@ -95,11 +96,13 @@ async fn serve(root: &Path) -> String {
 fn opts(base: &str, datasets: Vec<Dataset>, eval: &Path) -> IndexOptions {
     IndexOptions {
         datasets,
+        closure_types: vec![STORE_PATHS.into()],
         closure: ClosureOptions {
             cache_url: format!("{base}/cache"),
             concurrency: 4,
             sample: None,
         },
+        probes: ProbeOptions::default(),
         outpaths: OutpathsOptions {
             command: vec![eval.display().to_string()],
             systems: vec!["x86_64-linux".into()],
@@ -127,10 +130,17 @@ fn fake_eval(dir: &Path) -> std::path::PathBuf {
 }
 
 fn names(c: &ClosureSection, release: usize) -> Vec<String> {
+    typed_names(c, release, STORE_PATHS)
+}
+
+fn typed_names(c: &ClosureSection, release: usize, closure_type: &str) -> Vec<String> {
+    let ci = c
+        .closure_index(release as u32, closure_type)
+        .expect("closure exists");
     let mut v: Vec<String> = c
         .paths
         .iter()
-        .filter(|p| p.releases.get(release))
+        .filter(|p| p.closures.get(ci))
         .map(|p| p.name.clone())
         .collect();
     v.sort();
@@ -168,7 +178,11 @@ async fn index_two_releases_end_to_end() {
     assert_eq!(names(c, 0), vec!["p1", "p2", "p3", "p4"]);
     assert_eq!(names(c, 1), vec!["p1", "p2", "p3", "p5"]);
     assert_eq!(c.missing.len(), 1);
-    assert!(c.missing[0].releases.get(0) && !c.missing[0].releases.get(1));
+    let (c0, c1) = (
+        c.closure_index(0, STORE_PATHS).unwrap(),
+        c.closure_index(1, STORE_PATHS).unwrap(),
+    );
+    assert!(c.missing[0].closures.get(c0) && !c.missing[0].closures.get(c1));
     let p1 = c.paths.iter().find(|p| p.name == "p1").unwrap();
     assert_eq!(p1.nar_size, Some(100));
     assert_eq!(p1.references.len(), 2);
@@ -224,6 +238,98 @@ async fn seeded_run_reuses_known_paths() {
     assert_eq!(both.releases.len(), 2);
 }
 
+fn script(dir: &Path, name: &str, body: &str) -> String {
+    let p = dir.join(name);
+    std::fs::write(&p, format!("#!/bin/sh\n{body}")).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    p.display().to_string()
+}
+
+/// Helper closure types, with fake `nix-instantiate` and `nix`: probes
+/// `fetchurl` (two calls sharing a curl-like input built from an uncached
+/// source tarball), `stdenv` (a target) and `broken` (fails to evaluate).
+#[tokio::test]
+async fn helper_probe_closures() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture(dir.path());
+    let base = serve(dir.path()).await;
+    let fetcher = Fetcher::new(1).unwrap();
+    let drv = |n: u32, name: &str| format!("/nix/store/{}-{name}.drv", hash(n));
+    let out = |n: u32, name: &str| format!("/nix/store/{}-{name}", hash(n));
+    let instantiate = script(
+        dir.path(),
+        "fake-nix-instantiate",
+        &format!(
+            r#"case "$*" in
+  *--eval*) echo '{{"broken":"fetch","fetchurl":"fetch","stdenv":"target"}}' ;;
+  *"probes'.broken."*) echo "error: attribute 'nope' missing" >&2; exit 1 ;;
+  *"probes'.fetchurl."*) echo {a}; echo {b} ;;
+  *"probes'.stdenv."*) echo {s} ;;
+  *) exit 2 ;;
+esac
+"#,
+            a = drv(2001, "probe-a.tar.gz"),
+            b = drv(2002, "probe-b.tar.gz"),
+            s = drv(2003, "stdenv"),
+        ),
+    );
+    let graph = serde_json::json!({"derivations": {
+        drv(2001, "probe-a.tar.gz"): {"outputs": {"out": {"path": out(91, "probe-a.tar.gz")}},
+            "inputs": {"drvs": {drv(2004, "curl"): {"outputs": ["out"]}, drv(2006, "arg-a"): {"outputs": ["out"]}}, "srcs": []}},
+        drv(2002, "probe-b.tar.gz"): {"outputs": {"out": {"path": out(92, "probe-b.tar.gz")}},
+            "inputs": {"drvs": {drv(2004, "curl"): {"outputs": ["out"]}}, "srcs": []}},
+        drv(2004, "curl"): {"outputs": {"out": {"path": out(4, "p4")}},
+            "inputs": {"drvs": {drv(2005, "curl.tar.xz"): {"outputs": ["out"]}}, "srcs": []}},
+        drv(2005, "curl.tar.xz"): {"outputs": {"out": {"path": out(98, "curl.tar.xz")}}, "inputs": {"drvs": {}, "srcs": []}},
+        drv(2006, "arg-a"): {"outputs": {"out": {"path": out(97, "arg-a")}}, "inputs": {"drvs": {}, "srcs": []}},
+        drv(2003, "stdenv"): {"outputs": {"out": {"path": out(5, "p5")}}, "inputs": {"drvs": {}, "srcs": []}},
+    }, "version": 4});
+    std::fs::write(dir.path().join("graph.json"), graph.to_string()).unwrap();
+    let nix = script(
+        dir.path(),
+        "fake-nix",
+        &format!("cat {}\n", dir.path().join("graph.json").display()),
+    );
+    let mut o = opts(&base, vec![Dataset::Closure], Path::new("/bin/false"));
+    o.closure_types = vec![STORE_PATHS.into(), HELPERS_DIRECT.into(), HELPERS_FULL.into()];
+    o.probes = ProbeOptions {
+        systems: vec!["x86_64-linux".into()],
+        nix_instantiate: vec![instantiate],
+        nix: vec![nix],
+        jobs: 2,
+    };
+    let a = ReleaseLocation::parse(&format!(
+        "{base}/releases/nixos/25.05/nixos-25.05.100.aaaaaaaaaaaa"
+    ))
+    .unwrap();
+    let b = index_releases(&fetcher, &[a], &o, None).await.unwrap();
+    b.validate().unwrap();
+    let c = b.closure.as_ref().unwrap();
+    assert_eq!(c.closures.len(), 3);
+    assert_eq!(names(c, 0), vec!["p1", "p2", "p3", "p4"]);
+    // curl (p4) and stdenv (p5), with their runtime closures; not the
+    // argument-specific derivation (97) or the fetches themselves.
+    assert_eq!(
+        typed_names(c, 0, HELPERS_DIRECT),
+        vec!["p1", "p2", "p3", "p4", "p5"]
+    );
+    assert_eq!(
+        typed_names(c, 0, HELPERS_FULL),
+        vec!["p1", "p2", "p3", "p4", "p5"]
+    );
+    // The uncached source tarball is missing from helpers-full only.
+    let full = c.closure_index(0, HELPERS_FULL).unwrap();
+    let direct = c.closure_index(0, HELPERS_DIRECT).unwrap();
+    let tarball = c.missing.iter().find(|m| m.name == "curl.tar.xz").unwrap();
+    assert!(tarball.closures.get(full) && !tarball.closures.get(direct));
+    for ct in [HELPERS_DIRECT, HELPERS_FULL] {
+        let cl = &c.closures[c.closure_index(0, ct).unwrap()];
+        assert_eq!(cl.skipped.len(), 1, "{ct}");
+        assert!(cl.skipped[0].starts_with("broken@x86_64-linux: ") && cl.skipped[0].contains("nope"));
+    }
+}
+
 /// Opt-in live smoke test (`NFI_LIVE_TESTS=1`): index a small sample of a real
 /// release's closure plus its packages and programs.
 #[tokio::test]
@@ -238,6 +344,8 @@ async fn live_smoke() {
     let loc = ReleaseLocation::parse(&url).unwrap();
     let opts = IndexOptions {
         datasets: vec![Dataset::Closure, Dataset::Packages, Dataset::Programs],
+        closure_types: vec![STORE_PATHS.into()],
+        probes: ProbeOptions::default(),
         closure: ClosureOptions {
             sample: Some(25),
             ..Default::default()
@@ -258,7 +366,7 @@ async fn live_smoke() {
         nfi_interchange::Format::Binary(nfi_interchange::Compression::DEFAULT),
     )
     .unwrap();
-    assert_eq!(nfi_interchange::codec::read(&buf[..]).unwrap(), b);
+    assert_eq!(nfi_interchange::codec::read(&buf[..], STORE_PATHS).unwrap(), b);
 }
 
 /// Runs the real nix-eval-jobs (when on PATH and able to evaluate) over a

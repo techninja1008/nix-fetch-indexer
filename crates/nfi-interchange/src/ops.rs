@@ -6,8 +6,10 @@ use crate::store_path::StoreHash;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Builder for closure sections keyed by hash, with references as hashes.
+/// Path and missing bits index the builder's closure table.
 #[derive(Default)]
 pub struct ClosureBuilder {
+    closures: Vec<Closure>,
     index: HashMap<StoreHash, usize>,
     paths: Vec<(ClosurePath, Vec<StoreHash>)>,
     missing: HashMap<StoreHash, MissingPath>,
@@ -29,7 +31,8 @@ impl ClosureBuilder {
         Self::default()
     }
 
-    /// Seed the builder from an existing closure section, remapping release bits.
+    /// Seed the builder from an existing closure section, remapping release
+    /// indices (closures of releases mapped to `None` are dropped).
     pub fn from_section(section: &ClosureSection, remap: &dyn Fn(usize) -> Option<usize>) -> Self {
         let mut b = Self::new();
         b.extend_section(section, remap);
@@ -37,6 +40,18 @@ impl ClosureBuilder {
     }
 
     pub fn extend_section(&mut self, section: &ClosureSection, remap: &dyn Fn(usize) -> Option<usize>) {
+        let map: Vec<Option<usize>> = section
+            .closures
+            .iter()
+            .map(|c| {
+                remap(c.release as usize).map(|r| {
+                    let i = self.ensure_closure(r, &c.closure_type);
+                    self.add_skipped(i, &c.skipped);
+                    i
+                })
+            })
+            .collect();
+        let cremap = |i: usize| map.get(i).copied().flatten();
         for p in &section.paths {
             let refs = p
                 .references
@@ -52,12 +67,51 @@ impl ClosureBuilder {
                     file_size: p.file_size,
                     deriver: p.deriver.clone(),
                 },
-                &p.releases.remap(remap),
+                &p.closures.remap(cremap),
             );
         }
         for m in &section.missing {
-            self.add_missing(m.hash, &m.name, &m.releases.remap(remap));
+            let bits = m.closures.remap(cremap);
+            if !bits.is_empty() {
+                self.add_missing(m.hash, &m.name, &bits);
+            }
         }
+    }
+
+    /// Index of the closure of `release` (a bundle release index) of the
+    /// given type, adding it if absent.
+    pub fn ensure_closure(&mut self, release: usize, closure_type: &str) -> usize {
+        let release = release as u32;
+        match self
+            .closures
+            .iter()
+            .position(|c| c.release == release && c.closure_type == closure_type)
+        {
+            Some(i) => i,
+            None => {
+                self.closures.push(Closure {
+                    release,
+                    closure_type: closure_type.to_string(),
+                    skipped: Vec::new(),
+                });
+                self.closures.len() - 1
+            }
+        }
+    }
+
+    /// Record roots of a closure that could not be collected.
+    pub fn add_skipped(&mut self, closure: usize, skipped: &[String]) {
+        let s = &mut self.closures[closure].skipped;
+        for x in skipped {
+            if !s.contains(x) {
+                s.push(x.clone());
+            }
+        }
+        s.sort();
+    }
+
+    pub fn closures(&self) -> &[Closure] {
+        &self.closures
     }
 
     pub fn contains(&self, hash: &StoreHash) -> bool {
@@ -77,11 +131,11 @@ impl ClosureBuilder {
         self.paths.is_empty()
     }
 
-    /// Insert or update a path, OR-ing in the given release bits.
-    pub fn insert(&mut self, info: PathInfo, releases: &Bitset) {
+    /// Insert or update a path, OR-ing in the given closure bits.
+    pub fn insert(&mut self, info: PathInfo, closures: &Bitset) {
         if let Some(&i) = self.index.get(&info.hash) {
             let (p, refs) = &mut self.paths[i];
-            p.releases.union_with(releases);
+            p.closures.union_with(closures);
             if refs.is_empty() && !info.references.is_empty() {
                 *refs = info.references;
             }
@@ -100,42 +154,42 @@ impl ClosureBuilder {
                     nar_size: info.nar_size,
                     file_size: info.file_size,
                     deriver: info.deriver,
-                    releases: releases.clone(),
+                    closures: closures.clone(),
                 },
                 info.references,
             ));
         }
     }
 
-    /// Mark an already-known path as present in a release.
-    pub fn mark(&mut self, hash: &StoreHash, release: usize) -> bool {
+    /// Mark an already-known path as present in a closure.
+    pub fn mark(&mut self, hash: &StoreHash, closure: usize) -> bool {
         match self.index.get(hash) {
             Some(&i) => {
-                self.paths[i].0.releases.set(release);
+                self.paths[i].0.closures.set(closure);
                 true
             }
             None => false,
         }
     }
 
-    pub fn add_missing(&mut self, hash: StoreHash, name: &str, releases: &Bitset) {
+    pub fn add_missing(&mut self, hash: StoreHash, name: &str, closures: &Bitset) {
         self.missing
             .entry(hash)
             .or_insert_with(|| MissingPath {
                 hash,
                 name: name.to_string(),
-                releases: Bitset::new(),
+                closures: Bitset::new(),
             })
-            .releases
-            .union_with(releases);
+            .closures
+            .union_with(closures);
     }
 
-    /// Mark the whole runtime closure of `roots` as present in `release`.
+    /// Mark the whole runtime closure of `roots` as present in `closure`.
     /// Returns the hashes of references that are not known to the builder.
     pub fn mark_closure(
         &mut self,
         roots: impl IntoIterator<Item = StoreHash>,
-        release: usize,
+        closure: usize,
     ) -> Vec<StoreHash> {
         let mut unknown = Vec::new();
         let mut seen = HashSet::new();
@@ -146,7 +200,7 @@ impl ClosureBuilder {
             }
             match self.index.get(&h) {
                 Some(&i) => {
-                    self.paths[i].0.releases.set(release);
+                    self.paths[i].0.closures.set(closure);
                     stack.extend(self.paths[i].1.iter().copied());
                 }
                 None => unknown.push(h),
@@ -177,7 +231,11 @@ impl ClosureBuilder {
             .collect();
         let mut missing: Vec<MissingPath> = self.missing.into_values().collect();
         missing.sort_by_key(|m| m.hash);
-        ClosureSection { paths, missing }
+        ClosureSection {
+            closures: self.closures,
+            paths,
+            missing,
+        }
     }
 }
 
@@ -366,10 +424,16 @@ pub fn normalize(b: &mut Bundle) {
     }
 }
 
-/// Keep only the releases matching `keep` and the sections in `sections`
-/// (all sections when `None`). Entries left without releases are dropped;
-/// closure paths are kept when referenced by a kept path.
-pub fn filter(b: &Bundle, keep: impl Fn(&Release) -> bool, sections: Option<&[Dataset]>) -> Bundle {
+/// Keep only the releases matching `keep`, the sections in `sections` and
+/// the closures whose type is in `closure_types` (all when `None`). Entries
+/// left without releases or closures are dropped; closure paths are kept
+/// when referenced by a kept path.
+pub fn filter(
+    b: &Bundle,
+    keep: impl Fn(&Release) -> bool,
+    sections: Option<&[Dataset]>,
+    closure_types: Option<&[String]>,
+) -> Bundle {
     let want = |d: Dataset| sections.is_none_or(|s| s.contains(&d));
     let mut map = vec![None; b.releases.len()];
     let mut releases = Vec::new();
@@ -388,13 +452,26 @@ pub fn filter(b: &Bundle, keep: impl Fn(&Release) -> bool, sections: Option<&[Da
     };
 
     if let Some(c) = b.closure.as_ref().filter(|_| want(Dataset::Closure)) {
-        // Paths with remaining release bits, plus everything they reference.
+        let mut cmap = vec![None; c.closures.len()];
+        let mut closures = Vec::new();
+        for (j, cl) in c.closures.iter().enumerate() {
+            let type_ok = closure_types.is_none_or(|t| t.contains(&cl.closure_type));
+            if let Some(r) = remap(cl.release as usize).filter(|_| type_ok) {
+                cmap[j] = Some(closures.len());
+                closures.push(Closure {
+                    release: r as u32,
+                    ..cl.clone()
+                });
+            }
+        }
+        let cremap = |i: usize| cmap.get(i).copied().flatten();
+        // Paths with remaining closure bits, plus everything they reference.
         let mut keep_idx = vec![false; c.paths.len()];
         let mut stack: Vec<usize> = c
             .paths
             .iter()
             .enumerate()
-            .filter(|(_, p)| !p.releases.remap(remap).is_empty())
+            .filter(|(_, p)| !p.closures.remap(cremap).is_empty())
             .map(|(i, _)| i)
             .collect();
         while let Some(i) = stack.pop() {
@@ -415,7 +492,7 @@ pub fn filter(b: &Bundle, keep: impl Fn(&Release) -> bool, sections: Option<&[Da
             if keep_idx[i] {
                 newidx[i] = paths.len() as u32;
                 paths.push(ClosurePath {
-                    releases: p.releases.remap(remap),
+                    closures: p.closures.remap(cremap),
                     ..p.clone()
                 });
             }
@@ -427,12 +504,22 @@ pub fn filter(b: &Bundle, keep: impl Fn(&Release) -> bool, sections: Option<&[Da
             .missing
             .iter()
             .map(|m| MissingPath {
-                releases: m.releases.remap(remap),
+                closures: m.closures.remap(cremap),
                 ..m.clone()
             })
-            .filter(|m| !m.releases.is_empty())
+            .filter(|m| !m.closures.is_empty())
             .collect();
-        out.closure = Some(ClosureSection { paths, missing });
+        // A release keeps the closure dataset only while it has closures.
+        for (i, r) in out.releases.iter_mut().enumerate() {
+            if !closures.iter().any(|c| c.release as usize == i) {
+                r.datasets.retain(|d| *d != Dataset::Closure);
+            }
+        }
+        out.closure = Some(ClosureSection {
+            closures,
+            paths,
+            missing,
+        });
     }
     if let Some(s) = b.packages.as_ref().filter(|_| want(Dataset::Packages)) {
         out.packages = Some(PackagesSection {
@@ -480,7 +567,7 @@ pub fn filter(b: &Bundle, keep: impl Fn(&Release) -> bool, sections: Option<&[Da
 pub fn split(b: &Bundle) -> Vec<Bundle> {
     b.releases
         .iter()
-        .map(|r| filter(b, |x| x.name == r.name, None))
+        .map(|r| filter(b, |x| x.name == r.name, None, None))
         .collect()
 }
 
@@ -499,6 +586,14 @@ pub struct ReleaseStats {
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct ClosureStats {
+    pub release: String,
+    pub closure_type: String,
+    pub paths: usize,
+    pub missing: usize,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct Stats {
     pub format_version: u32,
     pub sections: Vec<Dataset>,
@@ -509,6 +604,7 @@ pub struct Stats {
     pub outpaths: usize,
     pub programs: usize,
     pub releases: Vec<ReleaseStats>,
+    pub closures: Vec<ClosureStats>,
 }
 
 pub fn stats(b: &Bundle) -> Stats {
@@ -539,12 +635,37 @@ pub fn stats(b: &Bundle) -> Stats {
         s.closure_paths = c.paths.len();
         s.closure_edges = c.paths.iter().map(|p| p.references.len()).sum();
         s.missing_paths = c.missing.len();
+        let mut closures: Vec<ClosureStats> = c
+            .closures
+            .iter()
+            .map(|cl| ClosureStats {
+                release: b
+                    .releases
+                    .get(cl.release as usize)
+                    .map(|r| r.name.clone())
+                    .unwrap_or_default(),
+                closure_type: cl.closure_type.clone(),
+                ..Default::default()
+            })
+            .collect();
+        // Per release, a path counts once however many of its closures hold it.
+        let releases_of =
+            |bits: &Bitset| -> Bitset { bits.remap(|j| c.closures.get(j).map(|cl| cl.release as usize)) };
         for p in &c.paths {
-            count(&p.releases, |r| &mut r.closure_paths);
+            count(&releases_of(&p.closures), |r| &mut r.closure_paths);
+            let n = closures.len();
+            for j in p.closures.iter().filter(|&j| j < n) {
+                closures[j].paths += 1;
+            }
         }
-        for p in &c.missing {
-            count(&p.releases, |r| &mut r.missing_paths);
+        for m in &c.missing {
+            count(&releases_of(&m.closures), |r| &mut r.missing_paths);
+            let n = closures.len();
+            for j in m.closures.iter().filter(|&j| j < n) {
+                closures[j].missing += 1;
+            }
         }
+        s.closures = closures;
     }
     if let Some(p) = &b.packages {
         s.packages = p.entries.len();

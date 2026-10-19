@@ -5,7 +5,12 @@ use crate::store_path::StoreHash;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
+
+/// The closure type of the runtime closures of a release's `store-paths.xz`,
+/// and the usual type to read version 2 bundles (which predate closure
+/// types) as.
+pub const STORE_PATHS: &str = "store-paths";
 
 /// Entry types serialise as named-field objects in human-readable formats
 /// (JSON) and as positional arrays in the binary form, which keeps field
@@ -105,6 +110,25 @@ impl Release {
     }
 }
 
+/// One closure of a release: the set of paths collected from one kind of
+/// root (e.g. `store-paths`, `helpers-direct`, `helpers-full`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(remote = "Self")]
+pub struct Closure {
+    /// Index into `Bundle::releases`.
+    pub release: u32,
+    pub closure_type: String,
+    /// Roots that could not be collected, with the reason (e.g. a helper
+    /// probe that does not evaluate on this release).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<String>,
+}
+compact_binary!(Closure {
+    release,
+    closure_type,
+    skipped
+});
+
 /// An indexed store path, with its runtime references.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(remote = "Self")]
@@ -121,7 +145,9 @@ pub struct ClosurePath {
     /// Basename of the deriver (`<hash>-<name>.drv`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deriver: Option<String>,
-    pub releases: Bitset,
+    /// Indices into `ClosureSection::closures` (release indices in version 2).
+    #[serde(alias = "releases")]
+    pub closures: Bitset,
 }
 compact_binary!(ClosurePath {
     hash,
@@ -130,24 +156,50 @@ compact_binary!(ClosurePath {
     nar_size,
     file_size,
     deriver,
-    releases
+    closures
 });
 
-/// A path listed in a release's store-paths but not present in the cache.
+/// A root of a closure that is not present in the cache.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(remote = "Self")]
 pub struct MissingPath {
     pub hash: StoreHash,
     pub name: String,
-    pub releases: Bitset,
+    /// Indices into `ClosureSection::closures` (release indices in version 2).
+    #[serde(alias = "releases")]
+    pub closures: Bitset,
 }
-compact_binary!(MissingPath { hash, name, releases });
+compact_binary!(MissingPath { hash, name, closures });
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClosureSection {
+    /// The closures that path and missing bitsets refer to (empty in
+    /// version 2 bundles, whose bits are release indices).
+    #[serde(default)]
+    pub closures: Vec<Closure>,
     pub paths: Vec<ClosurePath>,
     #[serde(default)]
     pub missing: Vec<MissingPath>,
+}
+
+impl ClosureSection {
+    pub fn closure_index(&self, release: u32, closure_type: &str) -> Option<usize> {
+        self.closures
+            .iter()
+            .position(|c| c.release == release && c.closure_type == closure_type)
+    }
+
+    /// Index of the closure, adding it to the table if absent.
+    pub fn ensure_closure(&mut self, release: u32, closure_type: &str) -> usize {
+        self.closure_index(release, closure_type).unwrap_or_else(|| {
+            self.closures.push(Closure {
+                release,
+                closure_type: closure_type.to_string(),
+                skipped: Vec::new(),
+            });
+            self.closures.len() - 1
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -309,8 +361,45 @@ impl Bundle {
         v
     }
 
+    /// Convert a version 2 bundle to the current format. Version 2 closure
+    /// bits are release indices; each release with the closure dataset
+    /// becomes one closure of type `v2_closure_type`.
+    pub fn upgrade(&mut self, v2_closure_type: &str) {
+        if self.format_version >= 3 {
+            return;
+        }
+        if let Some(c) = &mut self.closure {
+            let mut map = vec![None; self.releases.len()];
+            c.closures.clear();
+            for (i, r) in self.releases.iter().enumerate() {
+                if r.datasets.contains(&Dataset::Closure) {
+                    map[i] = Some(c.closures.len());
+                    c.closures.push(Closure {
+                        release: i as u32,
+                        closure_type: v2_closure_type.to_string(),
+                        skipped: Vec::new(),
+                    });
+                }
+            }
+            let remap = |i: usize| map.get(i).copied().flatten();
+            for p in &mut c.paths {
+                p.closures = p.closures.remap(remap);
+            }
+            for m in &mut c.missing {
+                m.closures = m.closures.remap(remap);
+            }
+        }
+        self.format_version = FORMAT_VERSION;
+    }
+
     /// Check internal consistency (reference indices, bitset ranges).
     pub fn validate(&self) -> Result<(), String> {
+        if self.format_version != FORMAT_VERSION {
+            return Err(format!(
+                "format version {} (expected {FORMAT_VERSION}; upgrade before use)",
+                self.format_version
+            ));
+        }
         let n = self.releases.len();
         let check_bits = |b: &Bitset, what: &str| -> Result<(), String> {
             match b.iter().last() {
@@ -325,28 +414,57 @@ impl Bundle {
             }
         }
         if let Some(c) = &self.closure {
+            let nc = c.closures.len();
+            let mut seen = std::collections::HashSet::new();
+            for cl in &c.closures {
+                if cl.release as usize >= n {
+                    return Err(format!(
+                        "closure {cl:?}: release index out of range ({n} releases)"
+                    ));
+                }
+                if !self.releases[cl.release as usize]
+                    .datasets
+                    .contains(&Dataset::Closure)
+                {
+                    return Err(format!(
+                        "closure {cl:?}: release {} lacks the closure dataset",
+                        self.releases[cl.release as usize].name
+                    ));
+                }
+                if cl.closure_type.is_empty() || !seen.insert((cl.release, &cl.closure_type)) {
+                    return Err(format!("closure {cl:?}: empty or duplicate closure type"));
+                }
+            }
+            let check_closure_bits = |b: &Bitset, what: &str| -> Result<(), String> {
+                match b.iter().last() {
+                    Some(i) if i >= nc => {
+                        Err(format!("{what}: closure bit {i} out of range ({nc} closures)"))
+                    }
+                    _ => Ok(()),
+                }
+            };
             let len = c.paths.len() as u32;
             for p in &c.paths {
-                check_bits(&p.releases, &p.name)?;
+                check_closure_bits(&p.closures, &p.name)?;
                 if let Some(r) = p.references.iter().find(|&&r| r >= len) {
                     return Err(format!("{}: reference index {r} out of range", p.name));
                 }
             }
             // Closures must be closed: a path's references belong to every
-            // release the path belongs to.
+            // closure the path belongs to.
             for p in &c.paths {
                 for &r in &p.references {
                     let t = &c.paths[r as usize];
-                    if !p.releases.is_subset(&t.releases) {
+                    if !p.closures.is_subset(&t.closures) {
                         return Err(format!(
-                            "{}-{} (releases {:?}) references {}-{} which is missing from some of them ({:?})",
-                            p.hash, p.name, p.releases, t.hash, t.name, t.releases
+                            "{}-{} (closures {:?}) references {}-{} which is missing from some of them ({:?})",
+                            p.hash, p.name, p.closures, t.hash, t.name, t.closures
                         ));
                     }
                 }
             }
             for m in &c.missing {
-                check_bits(&m.releases, &m.name)?;
+                check_closure_bits(&m.closures, &m.name)?;
             }
         }
         if let Some(s) = &self.packages {

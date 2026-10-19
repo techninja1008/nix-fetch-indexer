@@ -79,26 +79,34 @@ impl Client {
 
     // ----- admin -----
 
-    pub async fn ingest_file(&self, path: &Path) -> Result<JobCreated> {
+    /// Upload a bundle; `v2_closure_type` is the closure type to read a
+    /// version 2 bundle as (server default `store-paths`).
+    pub async fn ingest_file(&self, path: &Path, v2_closure_type: Option<&str>) -> Result<JobCreated> {
         let f = tokio::fs::File::open(path)
             .await
             .with_context(|| format!("opening {}", path.display()))?;
         let len = f.metadata().await?.len();
         let stream = tokio_util::io::ReaderStream::with_capacity(f, 1 << 20);
         let body = reqwest::Body::wrap_stream(stream);
+        let mut rb = self.req(reqwest::Method::POST, "/admin/v1/ingest");
+        if let Some(t) = v2_closure_type {
+            rb = rb.query(&[("v2_closure_type", t)]);
+        }
         self.send(
-            self.req(reqwest::Method::POST, "/admin/v1/ingest")
-                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            rb.header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
                 .header(reqwest::header::CONTENT_LENGTH, len)
                 .body(body),
         )
         .await
     }
 
-    pub async fn ingest_url(&self, url: &str) -> Result<JobCreated> {
+    pub async fn ingest_url(&self, url: &str, v2_closure_type: Option<&str>) -> Result<JobCreated> {
         self.send(
             self.req(reqwest::Method::POST, "/admin/v1/ingest")
-                .json(&IngestUrlRequest { url: url.into() }),
+                .json(&IngestUrlRequest {
+                    url: url.into(),
+                    v2_closure_type: v2_closure_type.map(str::to_string),
+                }),
         )
         .await
     }

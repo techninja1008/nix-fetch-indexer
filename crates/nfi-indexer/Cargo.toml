@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 nfi-interchange.workspace = true
+nfi-api.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

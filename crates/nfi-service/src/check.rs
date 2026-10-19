@@ -28,26 +28,26 @@ const CHECKS: &[Check] = &[
         example: "format('%s-%s references missing id %s', s.hash, s.name, x)",
     },
     Check {
-        kind: "unknown_releases",
-        description: "membership in release ids that do not exist",
-        from: "FROM store_paths s, unnest(s.releases) x
-               WHERE NOT EXISTS (SELECT 1 FROM releases r WHERE r.id = x)",
-        example: "format('%s-%s is in missing release id %s', s.hash, s.name, x)",
+        kind: "unknown_closures",
+        description: "membership in closure ids that do not exist",
+        from: "FROM store_paths s, unnest(s.closures) x
+               WHERE NOT EXISTS (SELECT 1 FROM closures c WHERE c.id = x)",
+        example: "format('%s-%s is in missing closure id %s', s.hash, s.name, x)",
     },
     Check {
         kind: "orphan_paths",
-        description: "store paths that belong to no release",
-        from: "FROM store_paths s WHERE s.releases = '{}'",
+        description: "store paths that belong to no closure",
+        from: "FROM store_paths s WHERE s.closures = '{}'",
         example: "format('%s-%s', s.hash, s.name)",
     },
     Check {
         kind: "open_closures",
-        description: "references to paths missing from a release the referrer belongs to",
+        description: "references to paths missing from a closure the referrer belongs to",
         from: "FROM store_paths s, unnest(s.refs) x
                JOIN store_paths t ON t.id = x
-               WHERE NOT t.releases @> s.releases",
-        example: "format('%s-%s (releases %s) references %s-%s (releases %s)',
-                         s.hash, s.name, s.releases, t.hash, t.name, t.releases)",
+               WHERE NOT t.closures @> s.closures",
+        example: "format('%s-%s (closures %s) references %s-%s (closures %s)',
+                         s.hash, s.name, s.closures, t.hash, t.name, t.closures)",
     },
 ];
 
@@ -62,6 +62,9 @@ pub async fn check(pool: &PgPool) -> Result<CheckReport> {
             .fetch_one(&mut *tx)
             .await?;
     let releases: i64 = sqlx::query_scalar("SELECT count(*) FROM releases")
+        .fetch_one(&mut *tx)
+        .await?;
+    let closures: i64 = sqlx::query_scalar("SELECT count(*) FROM closures")
         .fetch_one(&mut *tx)
         .await?;
     let mut issues = Vec::new();
@@ -92,6 +95,7 @@ pub async fn check(pool: &PgPool) -> Result<CheckReport> {
         store_paths: store_paths as u64,
         references: references.unwrap_or(0) as u64,
         releases: releases as u64,
+        closures: closures as u64,
         issues,
     })
 }

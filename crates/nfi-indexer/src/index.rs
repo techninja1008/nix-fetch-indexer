@@ -3,6 +3,7 @@
 use crate::closure::{self, ClosureOptions};
 use crate::fetch::{Fetched, Fetcher};
 use crate::outpaths::{self, OutpathsOptions};
+use crate::probes::{self, HELPERS_DIRECT, HELPERS_FULL, ProbeOptions};
 use crate::release::ReleaseLocation;
 use crate::{packages, programs, tarball};
 use anyhow::{Context, Result};
@@ -11,7 +12,11 @@ use nfi_interchange::*;
 #[derive(Clone, Debug)]
 pub struct IndexOptions {
     pub datasets: Vec<Dataset>,
+    /// Closure types to index for the closure dataset (`store-paths`,
+    /// `helpers-direct`, `helpers-full`).
+    pub closure_types: Vec<String>,
     pub closure: ClosureOptions,
+    pub probes: ProbeOptions,
     pub outpaths: OutpathsOptions,
     /// Keep the seed bundle's releases in the output.
     pub include_seed: bool,
@@ -22,7 +27,8 @@ pub struct IndexOptions {
 pub struct ReleaseReport {
     pub name: String,
     pub commit: String,
-    pub closure: Option<closure::ClosureReport>,
+    /// Per closure type.
+    pub closures: Vec<(String, closure::ClosureReport)>,
     pub closure_secs: f64,
     pub packages: Option<usize>,
     pub packages_secs: f64,
@@ -104,25 +110,60 @@ pub async fn index_releases_with_report(
             ..Default::default()
         };
 
+        // The nixexprs tarball, fetched (and unpacked) at most once.
+        let mut tar: Option<bytes::Bytes> = None;
+        let mut unpacked: Option<(tempfile::TempDir, std::path::PathBuf)> = None;
+
         if opts.datasets.contains(&Dataset::Closure) {
             let t = std::time::Instant::now();
-            let xz = fetcher.get(&loc.file("store-paths.xz")).await?;
-            let mut roots = closure::parse_store_paths(&xz)?;
-            if let Some(n) = opts.closure.sample {
-                roots.truncate(n);
+            let mut probe_roots: Option<probes::ProbeRoots> = None;
+            for ct in &opts.closure_types {
+                let (roots, skipped) = match ct.as_str() {
+                    STORE_PATHS => {
+                        let xz = fetcher.get(&loc.file("store-paths.xz")).await?;
+                        let mut roots = closure::parse_store_paths(&xz)?;
+                        if let Some(n) = opts.closure.sample {
+                            roots.truncate(n);
+                        }
+                        (roots, Vec::new())
+                    }
+                    HELPERS_DIRECT | HELPERS_FULL => {
+                        if probe_roots.is_none() {
+                            let dir = unpack(fetcher, loc, &mut tar, &mut unpacked).await?;
+                            let r = probes::run_probes(dir, &opts.probes)
+                                .await
+                                .with_context(|| format!("running helper probes for {}", release.name))?;
+                            probe_roots = Some(r);
+                        }
+                        let pr = probe_roots.as_ref().expect("set above");
+                        let set = if ct == HELPERS_DIRECT {
+                            &pr.direct
+                        } else {
+                            &pr.full
+                        };
+                        (set.iter().cloned().collect(), pr.skipped.clone())
+                    }
+                    other => anyhow::bail!(
+                        "unknown closure type {other:?} (expected {STORE_PATHS}, {HELPERS_DIRECT} or {HELPERS_FULL})"
+                    ),
+                };
+                let cidx = builder.ensure_closure(idx, ct);
+                builder.add_skipped(cidx, &skipped);
+                let report =
+                    closure::index_closure(fetcher, &opts.closure, &mut builder, &roots, cidx).await?;
+                tracing::info!(
+                    release = %release.name,
+                    closure_type = %ct,
+                    roots = report.roots,
+                    fetched = report.fetched,
+                    reused = report.reused,
+                    missing = report.missing,
+                    skipped = skipped.len(),
+                    "closure indexed"
+                );
+                rr.closures.push((ct.clone(), report));
             }
-            let report = closure::index_closure(fetcher, &opts.closure, &mut builder, &roots, idx).await?;
             rr.closure_secs = secs(t);
-            tracing::info!(
-                release = %release.name,
-                roots = report.roots,
-                fetched = report.fetched,
-                reused = report.reused,
-                missing = report.missing,
-                secs = format!("{:.1}", rr.closure_secs),
-                "closure indexed"
-            );
-            rr.closure = Some(report);
             bundle.releases[idx].add_dataset(Dataset::Closure);
         }
         if opts.datasets.contains(&Dataset::Packages) {
@@ -140,13 +181,11 @@ pub async fn index_releases_with_report(
             package_entries.extend(entries);
             bundle.releases[idx].add_dataset(Dataset::Packages);
         }
-        let want_tar =
-            opts.datasets.contains(&Dataset::Programs) || opts.datasets.contains(&Dataset::Outpaths);
-        if want_tar {
-            let t = std::time::Instant::now();
-            let tar = fetcher.get(&loc.file("nixexprs.tar.xz")).await?;
+        {
             if opts.datasets.contains(&Dataset::Programs) {
-                match tarball::read_top_level_file(&tar, "programs.sqlite")? {
+                let t = std::time::Instant::now();
+                let tar = fetch_tar(fetcher, loc, &mut tar).await?;
+                match tarball::read_top_level_file(tar, "programs.sqlite")? {
                     Some(db) => {
                         let entries = programs::read_programs_db(&db, idx)?;
                         rr.programs_secs = secs(t);
@@ -168,9 +207,8 @@ pub async fn index_releases_with_report(
             }
             if opts.datasets.contains(&Dataset::Outpaths) {
                 let t = std::time::Instant::now();
-                let dir = tempfile::tempdir()?;
-                let top = tarball::extract(&tar, dir.path())?;
-                let entries = outpaths::evaluate(&top, &opts.outpaths, idx)
+                let top = unpack(fetcher, loc, &mut tar, &mut unpacked).await?;
+                let entries = outpaths::evaluate(top, &opts.outpaths, idx)
                     .await
                     .with_context(|| format!("evaluating {}", release.name))?;
                 rr.outpaths_secs = secs(t);
@@ -227,7 +265,7 @@ pub async fn index_releases_with_report(
         let mut b = if seed_releases.is_empty() {
             bundle
         } else {
-            ops::filter(&bundle, |r| new_releases.contains(&r.name), None)
+            ops::filter(&bundle, |r| new_releases.contains(&r.name), None, None)
         };
         let closure = b.closure.take();
         let mut merged = ops::merge([b]);
@@ -238,6 +276,33 @@ pub async fn index_releases_with_report(
     report.total_secs = secs(run_started);
     tracing::info!(secs = format!("{:.1}", report.assemble_secs), "bundle assembled");
     Ok((bundle, report))
+}
+
+async fn fetch_tar<'a>(
+    fetcher: &Fetcher,
+    loc: &ReleaseLocation,
+    tar: &'a mut Option<bytes::Bytes>,
+) -> Result<&'a bytes::Bytes> {
+    if tar.is_none() {
+        *tar = Some(fetcher.get(&loc.file("nixexprs.tar.xz")).await?);
+    }
+    Ok(tar.as_ref().expect("set above"))
+}
+
+/// The release's nixexprs tree, unpacked into a temporary directory once.
+async fn unpack<'a>(
+    fetcher: &Fetcher,
+    loc: &ReleaseLocation,
+    tar: &mut Option<bytes::Bytes>,
+    unpacked: &'a mut Option<(tempfile::TempDir, std::path::PathBuf)>,
+) -> Result<&'a std::path::Path> {
+    if unpacked.is_none() {
+        let tar = fetch_tar(fetcher, loc, tar).await?;
+        let dir = tempfile::tempdir()?;
+        let top = tarball::extract(tar, dir.path())?;
+        *unpacked = Some((dir, top));
+    }
+    Ok(&unpacked.as_ref().expect("set above").1)
 }
 
 /// Check that a release directory exists (has a git-revision file).

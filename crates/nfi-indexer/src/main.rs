@@ -4,9 +4,10 @@ use nfi_indexer::closure::{ClosureOptions, DEFAULT_CACHE};
 use nfi_indexer::fetch::Fetcher;
 use nfi_indexer::index::{IndexOptions, index_releases_with_report};
 use nfi_indexer::outpaths::OutpathsOptions;
+use nfi_indexer::probes::ProbeOptions;
 use nfi_indexer::release::{self, DEFAULT_RELEASES_BASE, DEFAULT_S3_LIST_BASE, ReleaseLocation};
 use nfi_interchange::codec::{self, Compression, Format};
-use nfi_interchange::{Dataset, ops};
+use nfi_interchange::{Dataset, STORE_PATHS, ops};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -16,6 +17,10 @@ use std::path::PathBuf;
     about = "Index NixOS releases into interchange bundles"
 )]
 struct Cli {
+    /// Closure type to read version 2 bundles (which predate closure types)
+    /// as.
+    #[arg(long, global = true, default_value = STORE_PATHS, env = "NFI_V2_CLOSURE_TYPE")]
+    v2_closure_type: String,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -82,6 +87,9 @@ enum Cmd {
         /// Sections to keep (closure, packages, outpaths, programs).
         #[arg(long = "section", value_delimiter = ',')]
         sections: Vec<Dataset>,
+        /// Closure types to keep (e.g. store-paths, helpers-direct).
+        #[arg(long = "closure-type", value_delimiter = ',')]
+        closure_types: Vec<String>,
         #[command(flatten)]
         out: OutArgs,
     },
@@ -140,6 +148,23 @@ struct IndexCmd {
     /// Datasets (for `all`).
     #[arg(long, value_delimiter = ',')]
     datasets: Vec<Dataset>,
+    /// Closure types to index: store-paths (runtime closures of
+    /// store-paths.xz), helpers-direct and helpers-full (build inputs of
+    /// nixpkgs helpers, found by instantiating probes; needs Nix).
+    #[arg(long, value_delimiter = ',', default_value = STORE_PATHS)]
+    closure_types: Vec<String>,
+    /// Systems to run helper probes for.
+    #[arg(long, value_delimiter = ',', default_value = "x86_64-linux,aarch64-linux")]
+    probe_systems: Vec<String>,
+    /// nix-instantiate command (shell words), for helper probes.
+    #[arg(long, default_value = "nix-instantiate", env = "NFI_NIX_INSTANTIATE")]
+    nix_instantiate: String,
+    /// nix command (shell words), for helper probes.
+    #[arg(long, default_value = "nix", env = "NFI_NIX")]
+    nix: String,
+    /// Helper probes instantiated concurrently.
+    #[arg(long, default_value_t = 4)]
+    probe_jobs: usize,
     /// Existing bundle whose closure is reused to skip known narinfos.
     #[arg(long)]
     seed: Option<String>,
@@ -246,11 +271,14 @@ fn log_summary(
     let st = ops::stats(bundle);
     for r in &report.releases {
         let mut parts = Vec::new();
-        if let Some(c) = &r.closure {
+        for (ct, c) in &r.closures {
             parts.push(format!(
-                "closure: {} roots, {} narinfos fetched, {} reused, {} missing in {:.1}s",
-                c.roots, c.fetched, c.reused, c.missing, r.closure_secs
+                "closure {ct}: {} roots, {} narinfos fetched, {} reused, {} missing",
+                c.roots, c.fetched, c.reused, c.missing
             ));
+        }
+        if !r.closures.is_empty() {
+            parts.push(format!("closures in {:.1}s", r.closure_secs));
         }
         if let Some(n) = r.packages {
             parts.push(format!("packages: {n} in {:.1}s", r.packages_secs));
@@ -266,8 +294,8 @@ fn log_summary(
     let fetched: usize = report
         .releases
         .iter()
-        .filter_map(|r| r.closure.as_ref())
-        .map(|c| c.fetched)
+        .flat_map(|r| &r.closures)
+        .map(|(_, c)| c.fetched)
         .sum();
     tracing::info!(
         releases = st.releases.len(),
@@ -287,7 +315,7 @@ fn log_summary(
     );
 }
 
-async fn run_index(cmd: IndexCmd, default: &[Dataset]) -> Result<()> {
+async fn run_index(cmd: IndexCmd, default: &[Dataset], v2_closure_type: &str) -> Result<()> {
     let started = std::time::Instant::now();
     let datasets = if cmd.datasets.is_empty() {
         default.to_vec()
@@ -320,11 +348,18 @@ async fn run_index(cmd: IndexCmd, default: &[Dataset]) -> Result<()> {
     let seed = cmd
         .seed
         .as_deref()
-        .map(codec::read_path_or_stdin)
+        .map(|p| codec::read_path_or_stdin(p, v2_closure_type))
         .transpose()
         .context("reading seed")?;
     let opts = IndexOptions {
         datasets,
+        closure_types: cmd.closure_types.clone(),
+        probes: ProbeOptions {
+            systems: cmd.probe_systems.clone(),
+            nix_instantiate: shell_split(&cmd.nix_instantiate)?,
+            nix: shell_split(&cmd.nix)?,
+            jobs: cmd.probe_jobs,
+        },
         closure: ClosureOptions {
             cache_url: cmd.cache_url.clone(),
             concurrency: cmd.concurrency,
@@ -370,12 +405,14 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
+    let v2 = cli.v2_closure_type.as_str();
+    let read = |p: &str| codec::read_path_or_stdin(p, v2);
     match cli.cmd {
-        Cmd::Closure(c) => run_index(c, &[Dataset::Closure]).await,
-        Cmd::Packages(c) => run_index(c, &[Dataset::Packages]).await,
-        Cmd::Outpaths(c) => run_index(c, &[Dataset::Outpaths]).await,
-        Cmd::Programs(c) => run_index(c, &[Dataset::Programs]).await,
-        Cmd::All(c) => run_index(c, &[Dataset::Closure, Dataset::Packages, Dataset::Programs]).await,
+        Cmd::Closure(c) => run_index(c, &[Dataset::Closure], v2).await,
+        Cmd::Packages(c) => run_index(c, &[Dataset::Packages], v2).await,
+        Cmd::Outpaths(c) => run_index(c, &[Dataset::Outpaths], v2).await,
+        Cmd::Programs(c) => run_index(c, &[Dataset::Programs], v2).await,
+        Cmd::All(c) => run_index(c, &[Dataset::Closure, Dataset::Packages, Dataset::Programs], v2).await,
         Cmd::ListReleases {
             prefix,
             since,
@@ -407,7 +444,7 @@ async fn main() -> Result<()> {
             let n = inputs.len();
             let bundles = inputs.iter().enumerate().map_while(|(i, p)| {
                 tracing::info!(input = %p, "merging {}/{n}", i + 1);
-                match codec::read_path_or_stdin(p) {
+                match read(p) {
                     Ok(b) => Some(b),
                     Err(e) => {
                         error = Some(e);
@@ -428,7 +465,7 @@ async fn main() -> Result<()> {
             format,
             compression,
         } => {
-            let b = codec::read_path_or_stdin(&input)?;
+            let b = read(&input)?;
             let fmt = Format::parse(&format, compression.as_deref())?;
             std::fs::create_dir_all(&out_dir)?;
             let ext = if matches!(fmt, Format::Json) {
@@ -449,9 +486,10 @@ async fn main() -> Result<()> {
             commits,
             channels,
             sections,
+            closure_types,
             out,
         } => {
-            let b = codec::read_path_or_stdin(&input)?;
+            let b = read(&input)?;
             let any = releases.is_empty() && commits.is_empty() && channels.is_empty();
             let f = ops::filter(
                 &b,
@@ -465,12 +503,17 @@ async fn main() -> Result<()> {
                 } else {
                     Some(&sections)
                 },
+                if closure_types.is_empty() {
+                    None
+                } else {
+                    Some(&closure_types)
+                },
             );
             write_out(&f, &out).map(|_| ())
         }
-        Cmd::Convert { input, out } => write_out(&codec::read_path_or_stdin(&input)?, &out).map(|_| ()),
+        Cmd::Convert { input, out } => write_out(&read(&input)?, &out).map(|_| ()),
         Cmd::Inspect { input, json } => {
-            let s = ops::stats(&codec::read_path_or_stdin(&input)?);
+            let s = ops::stats(&read(&input)?);
             if json {
                 println!("{}", serde_json::to_string_pretty(&s)?);
             } else {
@@ -506,11 +549,20 @@ async fn main() -> Result<()> {
                         r.programs
                     );
                 }
+                if !s.closures.is_empty() {
+                    println!("closures ({}):", s.closures.len());
+                    for c in &s.closures {
+                        println!(
+                            "  {} {}: paths={} missing={}",
+                            c.release, c.closure_type, c.paths, c.missing
+                        );
+                    }
+                }
             }
             Ok(())
         }
         Cmd::BenchCompression { input, algos } => {
-            let b = codec::read_path_or_stdin(&input)?;
+            let b = read(&input)?;
             let algos = algos
                 .iter()
                 .map(|a| Compression::parse(a))

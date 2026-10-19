@@ -39,6 +39,10 @@ enum Cmd {
     Ingest {
         #[arg(required = true)]
         sources: Vec<String>,
+        /// Closure type to read version 2 bundles (which predate closure
+        /// types) as [service default: store-paths].
+        #[arg(long)]
+        v2_closure_type: Option<String>,
         /// Wait for each job to finish.
         #[arg(long)]
         wait: bool,
@@ -51,13 +55,14 @@ enum Cmd {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
-    /// List releases and the datasets present for each.
+    /// List releases with the datasets and closure types present for each.
     Releases {
         /// Only releases in this channel.
         #[arg(long)]
         channel: Option<String>,
     },
-    /// Remove releases by name, commit (prefix) or channel.
+    /// Remove releases by name, commit (prefix) or channel. With
+    /// --closure-type, only remove those closures of the selected releases.
     Prune {
         #[arg(long = "release")]
         releases: Vec<String>,
@@ -65,6 +70,10 @@ enum Cmd {
         commits: Vec<String>,
         #[arg(long = "channel")]
         channels: Vec<String>,
+        /// Only remove closures of these types (e.g. helpers-full), keeping
+        /// the releases and their other data.
+        #[arg(long = "closure-type", value_delimiter = ',')]
+        closure_types: Vec<String>,
         #[arg(long)]
         wait: bool,
     },
@@ -74,7 +83,7 @@ enum Cmd {
         wait: bool,
     },
     /// Check the closure index for inconsistencies (dangling references,
-    /// unknown releases, orphaned paths, open closures). With --wait, exits
+    /// unknown closures, orphaned paths, open closures). With --wait, exits
     /// with status 3 if any are found.
     Check {
         #[arg(long)]
@@ -219,13 +228,18 @@ async fn run(cli: Cli) -> Result<Outcome> {
         return check_cmd(&client, wait, cli.json).await;
     }
     let ok = match cli.cmd {
-        Cmd::Ingest { sources, wait } => {
+        Cmd::Ingest {
+            sources,
+            v2_closure_type,
+            wait,
+        } => {
             let mut ok = true;
+            let v2 = v2_closure_type.as_deref();
             for s in &sources {
                 let created = if s.starts_with("http://") || s.starts_with("https://") {
-                    client.ingest_url(s).await?
+                    client.ingest_url(s, v2).await?
                 } else {
-                    client.ingest_file(Path::new(s)).await?
+                    client.ingest_file(Path::new(s), v2).await?
                 };
                 eprintln!("{s}: job {}", created.id);
                 ok &= submitted(&client, created.id, wait, cli.json).await?;
@@ -261,17 +275,29 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 println!("{}", serde_json::to_string_pretty(&rels)?);
             } else {
                 println!(
-                    "{:<40} {:<18} {:<12} {:<42} DATASETS",
-                    "RELEASE", "CHANNEL", "SERIES", "COMMIT"
+                    "{:<40} {:<18} {:<12} {:<42} {:<28} CLOSURES",
+                    "RELEASE", "CHANNEL", "SERIES", "COMMIT", "DATASETS"
                 );
                 for r in &rels {
+                    let closures: Vec<String> = r
+                        .closures
+                        .iter()
+                        .map(|c| {
+                            if c.skipped.is_empty() {
+                                c.closure_type.clone()
+                            } else {
+                                format!("{} ({} skipped)", c.closure_type, c.skipped.len())
+                            }
+                        })
+                        .collect();
                     println!(
-                        "{:<40} {:<18} {:<12} {:<42} {}",
+                        "{:<40} {:<18} {:<12} {:<42} {:<28} {}",
                         r.name,
                         r.channel,
                         r.series,
                         r.commit,
-                        r.datasets.join(",")
+                        r.datasets.join(","),
+                        closures.join(",")
                     );
                 }
             }
@@ -281,12 +307,14 @@ async fn run(cli: Cli) -> Result<Outcome> {
             releases,
             commits,
             channels,
+            closure_types,
             wait,
         } => {
             let req = PruneRequest {
                 releases,
                 commits,
                 channels,
+                closure_types,
             };
             if req.is_empty() {
                 bail!("specify --release, --commit and/or --channel");
