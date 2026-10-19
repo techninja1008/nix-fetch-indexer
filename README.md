@@ -167,6 +167,14 @@ All options can also be set through the environment:
 - `NFI_LISTEN`, `NFI_ADMIN_LISTEN`, `NFI_ADMIN_TOKEN`
 - `NFI_NO_WORKER`
 
+**Container image:** `nfi-service-image` only listens on port 8080 from outside the container. The admin listener is bound to `127.0.0.1:8081` inside the container, so it can't be reached by default. To run admin commands from the host, set a token, listen on all interfaces inside the container, and publish the port on a loopback or private address only:
+
+```sh
+docker run -p 8080:8080 -p 127.0.0.1:8081:8081 \
+  -e NFI_ADMIN_LISTEN=0.0.0.0:8081 -e NFI_ADMIN_TOKEN=... \
+  -e NFI_DATABASE_URL=... -e NFI_MEILI_URL=... nfi-service:latest
+```
+
 Every replica serves queries. Every replica also runs a job worker, unless `--no-worker` is set.
 
 **Jobs and scaling**
@@ -346,3 +354,7 @@ NFI_LIVE_TESTS=1 NFI_LIVE_BUNDLE=full.nfib cargo test --release -p nfi --test li
 - The integration tests start Postgres from `pg_config --bindir`, `/usr/lib/postgresql/*/bin` or `NFI_TEST_PG_BINDIR`.
 - They start Meilisearch from `PATH` or `NFI_TEST_MEILI_BIN`.
 - To use existing servers instead, set `NFI_TEST_DATABASE_URL` and `NFI_TEST_MEILI_URL`.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
