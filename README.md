@@ -111,7 +111,7 @@ nfi-indexer bench-compression ab.nfib
 The `Index releases` workflow (`.github/workflows/index-releases.yml`) runs every six hours, and can also be started by hand for one channel with a cap on how many new releases to index. It only uploads: bundles are published as GitHub release assets on [`techninja1008/nix-fetch-indexer-data`](https://github.com/techninja1008/nix-fetch-indexer-data), and nothing is ingested anywhere.
 
 1. A plan job builds `nfi-indexer` once. [`ci/channels.sh`](ci/channels.sh) discovers the channels on releases.nixos.org, and [`ci/plan.sh`](ci/plan.sh) keeps those with releases not yet published.
-2. One job per such channel runs [`ci/index-channel.sh`](ci/index-channel.sh), which indexes the new releases and uploads binary bundles, one per dataset: `closure` (the `store-paths` closures), `helpers-direct` and `helpers-full` (the `helpers:direct` and `helpers:full` closures), `packages` and `programs`. The helper datasets are separate assets because `helpers-full` is much larger: it reaches the whole stdenv bootstrap. Each closure asset also carries its evaluator's eval errors, so both helper assets carry the `helpers` evaluation's.
+2. One job per such channel runs [`ci/index-channel.sh`](ci/index-channel.sh), which indexes the new releases and uploads binary bundles, one per dataset: `closure` (the `store-paths` closures), `helpers-direct` and `helpers-full` (the `helpers:direct` and `helpers:full` closures), `packages` and `programs`. The helper datasets are separate assets because `helpers-full` is much larger: it reaches the whole stdenv bootstrap. The `helpers` evaluator's eval errors are a fourth asset, `helpers-eval-errors`, added whenever a helper dataset is. Each release is indexed in one run (both helper closure types share one probe run) and then split into the assets.
 
 **Channels.** Channels are discovered automatically according to the policy in [`ci/config.json`](ci/config.json); `-small` and `-aarch64` channels are skipped.
 
@@ -125,7 +125,7 @@ A stable channel only gets releases for about a month after the next one ships; 
 
 **Assets**
 
-- **Per-release bundles.** Release tag `<release>` (e.g. `nixos-26.05.590.ec942ba042da`). One asset per dataset: `<release>-closure.nfib`, `<release>-helpers-direct.nfib`, `<release>-helpers-full.nfib`, `<release>-packages.nfib` and `<release>-programs.nfib`. The release notes summarise path, package and program counts, each closure's paths and missing paths, and each evaluation's errors.
+- **Per-release bundles.** Release tag `<release>` (e.g. `nixos-26.05.590.ec942ba042da`). One asset per dataset: `<release>-closure.nfib`, `<release>-helpers-direct.nfib`, `<release>-helpers-full.nfib`, `<release>-helpers-eval-errors.nfib`, `<release>-packages.nfib` and `<release>-programs.nfib`. The release notes summarise path, package and program counts, each closure's paths and missing paths, and each evaluation's errors.
 - **Cumulative bundles.** Release tag `<channel>` (e.g. `nixos-26.05`). One asset per dataset covering every release processed so far: `<series>-<dataset>-cumulative.nfib`, e.g. `26.05-closure-cumulative.nfib`.
 - **Manifest.** Each channel's release (tag `<channel>`) also holds `releases.txt`, which lists the releases processed so far, oldest first. The next run starts after its last line.
 

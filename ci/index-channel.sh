@@ -13,8 +13,10 @@
 # Published datasets map to indexer targets. Closures are split by closure
 # type: `closure` holds the `store-paths` closures, `helpers-direct` and
 # `helpers-full` the `helpers:direct` and `helpers:full` closures (indexing
-# them needs Nix). Closure datasets also carry the eval errors of their
-# evaluator, if it records any.
+# them needs Nix). An evaluator that records eval errors gets its own
+# `<evaluator>-eval-errors` dataset (e.g. `helpers-eval-errors`), added
+# whenever one of its closure datasets is. Each release is indexed in one
+# run, which is then split into the datasets.
 #   cumulative   maintain <series>-<dataset>-cumulative.nfib assets on the
 #                channel's GitHub release (tag = channel name)
 #   start        "all" to backfill every release on first run, "latest" to
@@ -55,29 +57,53 @@ IFS=, read -r -a datasets <<<"$DATASETS"
 
 log() { echo "[$channel] $*" >&2; }
 
+# Published dataset -> evaluator whose eval errors it holds (empty for other
+# datasets).
+ds_errors_of() { case $1 in *-eval-errors) echo "${1%-eval-errors}" ;; *) echo "" ;; esac; }
 # Published dataset -> closure type (empty for datasets that aren't closures).
 ds_closure_type() {
   case $1 in
+    *-eval-errors) echo "" ;;
     closure) echo store-paths ;;
     helpers-*) echo "helpers:${1#helpers-}" ;;
     *) echo "" ;;
   esac
 }
-# Published dataset -> indexer target.
-ds_target() { local ct; ct=$(ds_closure_type "$1"); echo "${ct:-$1}"; }
+# Evaluators that record eval errors.
+records_errors() { [[ $1 == helpers ]]; }
+# Add the eval errors dataset of every evaluator with a closure dataset.
+for ds in "${datasets[@]}"; do
+  ct=$(ds_closure_type "$ds")
+  ev=${ct%%:*}
+  if [[ -n $ct ]] && records_errors "$ev" && [[ " ${datasets[*]} " != *" $ev-eval-errors "* ]]; then
+    datasets+=("$ev-eval-errors")
+  fi
+done
+# Indexer targets: each closure dataset's closure type, the other datasets'
+# own names, and an eval errors dataset's evaluator only when none of its
+# closure types is indexed anyway (the evaluator records its errors).
 targets=() closure_datasets=()
 for ds in "${datasets[@]}"; do
-  targets+=("$(ds_target "$ds")")
-  [[ -n $(ds_closure_type "$ds") ]] && closure_datasets+=("$ds")
+  ct=$(ds_closure_type "$ds") ev=$(ds_errors_of "$ds")
+  if [[ -n $ct ]]; then
+    targets+=("$ct") closure_datasets+=("$ds")
+  elif [[ -z $ev ]]; then
+    targets+=("$ds")
+  fi
+done
+for ds in "${datasets[@]}"; do
+  ev=$(ds_errors_of "$ds")
+  [[ -n $ev && " ${targets[*]} " != *" $ev:"* ]] && targets+=("$ev")
 done
 TARGETS=$(IFS=,; echo "${targets[*]}")
-# filter_ds <bundle> <dataset> <out>: the dataset's part of a bundle. A
-# closure dataset keeps its evaluator's eval errors.
+# filter_ds <bundle> <dataset> <out>: the dataset's part of a bundle.
 filter_ds() {
-  local ct
-  ct=$(ds_closure_type "$2")
+  local ct ev
+  ct=$(ds_closure_type "$2") ev=$(ds_errors_of "$2")
   if [[ -n $ct ]]; then
-    "$NFI" filter "$1" --section closure,eval-errors --closure-type "$ct" -o "$3"
+    "$NFI" filter "$1" --section closure --closure-type "$ct" -o "$3"
+  elif [[ -n $ev ]]; then
+    "$NFI" filter "$1" --section eval-errors --closure-type "$ev" -o "$3"
   else
     "$NFI" filter "$1" --section "$2" -o "$3"
   fi
@@ -156,9 +182,11 @@ if [[ -n $BACKFILL ]]; then
     first=true
     for ds in "${datasets[@]}"; do
       if store_get "$channel" "$series-$ds-cumulative.nfib" "$work/cum-$ds.nfib"; then
-        ct=$(ds_closure_type "$ds")
-        "$NFI" inspect --json "$work/cum-$ds.nfib" | jq -r --arg ct "$ct" \
-          'if $ct == "" then .releases[].name else .closures[] | select(.closure_type == $ct) | .release end' \
+        ct=$(ds_closure_type "$ds") ev=$(ds_errors_of "$ds")
+        "$NFI" inspect --json "$work/cum-$ds.nfib" | jq -r --arg ct "$ct" --arg ev "$ev" '
+          if $ct != "" then .closures[] | select(.closure_type == $ct) | .release
+          elif $ev != "" then .evals[] | select(.eval_type == $ev and .errors != null) | .release
+          else .releases[].name end' \
           | sort -u >"$work/have-$ds.txt"
       else
         : >"$work/have-$ds.txt"
