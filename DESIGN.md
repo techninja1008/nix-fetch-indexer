@@ -10,7 +10,7 @@ A single Cargo workspace:
 | crate | kind | purpose |
 |---|---|---|
 | `nfi-interchange` | lib | Interchange bundle data model, CBOR + compression codec, JSON codec, merge/split/filter |
-| `nfi-indexer` | bin | Indexers (`closure`, `packages`, `outpaths`, `programs`), plus offline bundle tooling (`merge`, `split`, `convert`, `inspect`) |
+| `nfi-indexer` | bin | Indexers (`index --targets`: closures of the `store-paths` and `helpers` evaluators, `packages`, `outpaths`, `programs`), plus offline bundle tooling (`merge`, `split`, `filter`, `convert`, `inspect`) |
 | `nfi-service` | bin | Query service (axum HTTP/JSON, Postgres, Meilisearch) |
 | `nfi` | bin | Query CLI (non-administrative endpoints, fetch hook, flake-ref resolution) |
 | `nfi-admin` | bin | Admin CLI (ingest, list releases, prune, reindex, job status) |

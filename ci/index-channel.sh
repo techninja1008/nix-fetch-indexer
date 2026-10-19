@@ -11,9 +11,9 @@
 #                name) with one asset per dataset: <release>-<dataset>.nfib
 #
 # Published datasets map to indexer targets. Closures are split by closure
-# type: `closure` holds the `store-paths` closures, `helpers-direct` and
-# `helpers-full` the `helpers:direct` and `helpers:full` closures (indexing
-# them needs Nix). An evaluator that records eval errors gets its own
+# type: `store-paths`, `helpers-direct` and `helpers-full` hold the
+# `store-paths`, `helpers:direct` and `helpers:full` closures (the helper
+# ones need Nix). An evaluator that records eval errors gets its own
 # `<evaluator>-eval-errors` dataset (e.g. `helpers-eval-errors`), added
 # whenever one of its closure datasets is. Each release is indexed in one
 # run, which is then split into the datasets.
@@ -47,7 +47,7 @@ channel=${1:?usage: index-channel.sh [--check] <channel>}
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 NFI=${NFI_INDEXER:-nfi-indexer}
 export NFI_CONFIG=${NFI_CONFIG:-$here/config.json}
-DATASETS=${NFI_DATASETS:-$(jq -r '.datasets // "closure,packages,programs"' "$NFI_CONFIG")}
+DATASETS=${NFI_DATASETS:-$(jq -r '.datasets // "store-paths,packages,programs"' "$NFI_CONFIG")}
 BACKFILL=${NFI_BACKFILL_DATASETS:-}
 [[ -n $BACKFILL ]] && DATASETS=$BACKFILL
 MAX=${NFI_MAX_RELEASES:-0}
@@ -64,7 +64,7 @@ ds_errors_of() { case $1 in *-eval-errors) echo "${1%-eval-errors}" ;; *) echo "
 ds_closure_type() {
   case $1 in
     *-eval-errors) echo "" ;;
-    closure) echo store-paths ;;
+    store-paths) echo store-paths ;;
     helpers-*) echo "helpers:${1#helpers-}" ;;
     *) echo "" ;;
   esac

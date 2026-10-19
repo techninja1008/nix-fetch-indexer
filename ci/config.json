@@ -2,5 +2,5 @@
   "oldest": "24.05",
   "per_release_from": "26.05",
   "unstable_start": "latest",
-  "datasets": "closure,helpers-direct,helpers-full,packages,programs"
+  "datasets": "store-paths,helpers-direct,helpers-full,packages,programs"
 }
