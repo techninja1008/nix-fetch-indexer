@@ -29,6 +29,7 @@
               fileset = lib.fileset.unions [
                 ./Cargo.toml
                 ./Cargo.lock
+                ./LICENSE
                 ./crates
               ];
             };
