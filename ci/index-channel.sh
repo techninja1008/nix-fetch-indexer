@@ -8,19 +8,19 @@
 #
 # The channel's settings come from ci/channels.sh (policy: ci/config.json):
 #   per_release  publish each release as its own GitHub release (tag = release
-#                name) with one asset per dataset: <release>-<dataset>.nfib
-#
-# Published datasets map to indexer targets. Closures are split by closure
-# type: `store-paths`, `helpers-direct` and `helpers-full` hold the
-# `store-paths`, `helpers:direct` and `helpers:full` closures (the helper
-# ones need Nix). An evaluator that records eval errors gets its own
-# `<evaluator>-eval-errors` dataset (e.g. `helpers-eval-errors`), added
-# whenever one of its closure datasets is. Each release is indexed in one
-# run, which is then split into the datasets.
-#   cumulative   maintain <series>-<dataset>-cumulative.nfib assets on the
+#                name) with one asset per output: <release>-<output>.nfib
+#   cumulative   maintain <series>-<output>-cumulative.nfib assets on the
 #                channel's GitHub release (tag = channel name)
 #   start        "all" to backfill every release on first run, "latest" to
 #                start from the newest release
+#
+# What is indexed is given as indexer targets (`nfi-indexer index --targets`),
+# e.g. store-paths,helpers,packages,programs. Each release is indexed in one
+# run for all targets, then split into outputs, one file each:
+#   - one per closure type: `store-paths`, `helpers-direct`, `helpers-full`
+#     (`<eval type>[-<closure type>]`; the helpers ones need Nix);
+#   - one per evaluator that records eval errors: `helpers-eval-errors`;
+#   - one per other target: `packages`, `programs`, `outpaths`.
 #
 # The channel's GitHub release also holds releases.txt: the releases processed
 # so far (oldest first). Each new release is indexed with the previous
@@ -31,12 +31,12 @@
 #                     dir:<path> (local directory, for testing)
 #   NFI_INDEXER       nfi-indexer binary (default: nfi-indexer on PATH)
 #   NFI_CONFIG        policy (default: config.json next to this script)
-#   NFI_DATASETS      default: `datasets` from the policy
+#   NFI_TARGETS       default: `targets` from the policy
 #   NFI_MAX_RELEASES  index at most this many new releases per run (default: all)
-#   NFI_BACKFILL_DATASETS
-#                     instead of indexing new releases, add these datasets (e.g.
-#                     helpers-direct,helpers-full) to releases already recorded
-#                     that lack them
+#   NFI_BACKFILL_TARGETS
+#                     instead of indexing new releases, index these targets
+#                     (e.g. helpers) for releases already recorded that lack
+#                     any of their outputs
 #   NFI_INDEX_ARGS    extra arguments for `nfi-indexer index` (e.g. --sample 50)
 #   NFI_WORK          work directory (default: a temporary directory)
 set -euo pipefail
@@ -47,66 +47,53 @@ channel=${1:?usage: index-channel.sh [--check] <channel>}
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 NFI=${NFI_INDEXER:-nfi-indexer}
 export NFI_CONFIG=${NFI_CONFIG:-$here/config.json}
-DATASETS=${NFI_DATASETS:-$(jq -r '.datasets // "store-paths,packages,programs"' "$NFI_CONFIG")}
-BACKFILL=${NFI_BACKFILL_DATASETS:-}
-[[ -n $BACKFILL ]] && DATASETS=$BACKFILL
+TARGETS=${NFI_TARGETS:-$(jq -r '.targets // "store-paths,packages,programs"' "$NFI_CONFIG")}
+BACKFILL=${NFI_BACKFILL_TARGETS:-}
+[[ -n $BACKFILL ]] && TARGETS=$BACKFILL
 MAX=${NFI_MAX_RELEASES:-0}
 STORE=${NFI_STORE:?set NFI_STORE to gh:<owner>/<repo> or dir:<path>}
 read -r -a INDEX_ARGS <<<"${NFI_INDEX_ARGS:-}"
-IFS=, read -r -a datasets <<<"$DATASETS"
+IFS=, read -r -a targets <<<"$TARGETS"
 
 log() { echo "[$channel] $*" >&2; }
 
-# Published dataset -> evaluator whose eval errors it holds (empty for other
-# datasets).
-ds_errors_of() { case $1 in *-eval-errors) echo "${1%-eval-errors}" ;; *) echo "" ;; esac; }
-# Published dataset -> closure type (empty for datasets that aren't closures).
-ds_closure_type() {
-  case $1 in
-    *-eval-errors) echo "" ;;
-    store-paths) echo store-paths ;;
-    helpers-*) echo "helpers:${1#helpers-}" ;;
-    *) echo "" ;;
-  esac
-}
-# Evaluators that record eval errors.
+# Evaluators and their closure types (empty: unnamed), and the evaluators
+# that record eval errors.
+declare -A closure_types=([store-paths]="" [helpers]="direct full")
 records_errors() { [[ $1 == helpers ]]; }
-# Add the eval errors dataset of every evaluator with a closure dataset.
-for ds in "${datasets[@]}"; do
-  ct=$(ds_closure_type "$ds")
-  ev=${ct%%:*}
-  if [[ -n $ct ]] && records_errors "$ev" && [[ " ${datasets[*]} " != *" $ev-eval-errors "* ]]; then
-    datasets+=("$ev-eval-errors")
+
+# Outputs of the targets: name -> kind (closure, eval-errors or section) and
+# what to filter for (closure type, evaluator or section).
+outputs=() closure_outputs=()
+declare -A out_kind out_sel
+add_output() { # <name> <kind> <selector>
+  if [[ -z ${out_kind[$1]:-} ]]; then
+    outputs+=("$1") out_kind[$1]=$2 out_sel[$1]=$3
+    if [[ $2 == closure ]]; then closure_outputs+=("$1"); fi
   fi
-done
-# Indexer targets: each closure dataset's closure type, the other datasets'
-# own names, and an eval errors dataset's evaluator only when none of its
-# closure types is indexed anyway (the evaluator records its errors).
-targets=() closure_datasets=()
-for ds in "${datasets[@]}"; do
-  ct=$(ds_closure_type "$ds") ev=$(ds_errors_of "$ds")
-  if [[ -n $ct ]]; then
-    targets+=("$ct") closure_datasets+=("$ds")
-  elif [[ -z $ev ]]; then
-    targets+=("$ds")
-  fi
-done
-for ds in "${datasets[@]}"; do
-  ev=$(ds_errors_of "$ds")
-  [[ -n $ev && " ${targets[*]} " != *" $ev:"* ]] && targets+=("$ev")
-done
-TARGETS=$(IFS=,; echo "${targets[*]}")
-# filter_ds <bundle> <dataset> <out>: the dataset's part of a bundle.
-filter_ds() {
-  local ct ev
-  ct=$(ds_closure_type "$2") ev=$(ds_errors_of "$2")
-  if [[ -n $ct ]]; then
-    "$NFI" filter "$1" --section closure --closure-type "$ct" -o "$3"
-  elif [[ -n $ev ]]; then
-    "$NFI" filter "$1" --section eval-errors --closure-type "$ev" -o "$3"
+}
+for t in "${targets[@]}"; do
+  ev=${t%%:*}
+  if [[ -v closure_types[$ev] ]]; then
+    read -r -a names <<<"${closure_types[$ev]}"
+    ((${#names[@]})) || names=("")
+    for n in "${names[@]}"; do
+      if [[ $t != *:* || ${t#*:} == "$n" ]]; then
+        add_output "$ev${n:+-$n}" closure "$ev${n:+:$n}"
+      fi
+    done
+    if records_errors "$ev"; then add_output "$ev-eval-errors" eval-errors "$ev"; fi
   else
-    "$NFI" filter "$1" --section "$2" -o "$3"
+    add_output "$t" section "$t"
   fi
+done
+# filter_out <bundle> <output> <file>: the output's part of a bundle.
+filter_out() {
+  case ${out_kind[$2]} in
+    closure) "$NFI" filter "$1" --section closure --closure-type "${out_sel[$2]}" -o "$3" ;;
+    eval-errors) "$NFI" filter "$1" --section eval-errors --closure-type "${out_sel[$2]}" -o "$3" ;;
+    section) "$NFI" filter "$1" --section "${out_sel[$2]}" -o "$3" ;;
+  esac
 }
 # index <out> <url>...: index releases into one bundle (seeded from $seed).
 index() {
@@ -163,14 +150,14 @@ manifest=$work/releases.txt
 store_get "$channel" releases.txt "$manifest" || : >"$manifest"
 last=$(tail -n1 "$manifest")
 if [[ -n $BACKFILL ]]; then
-  # Recorded releases lacking a dataset: per-release assets, or (channels
+  # Recorded releases lacking an output: per-release assets, or (channels
   # without them) closures/sections of the cumulative bundles.
   "$NFI" list-releases "$prefix" >"$work/listing.tsv"
   grep -Ff <(sed 's/$/\t/' "$manifest") "$work/listing.tsv" >"$work/recorded.tsv" || true
   : >"$work/new.tsv"
   if [[ $per_release == true ]]; then
     while IFS=$'\t' read -r name url; do
-      for ds in "${datasets[@]}"; do
+      for ds in "${outputs[@]}"; do
         if ! store_get "$name" "$name-$ds.nfib" /dev/null; then
           printf '%s\t%s\n' "$name" "$url" >>"$work/new.tsv"
           break
@@ -180,18 +167,18 @@ if [[ -n $BACKFILL ]]; then
   else
     : >"$work/have.txt"
     first=true
-    for ds in "${datasets[@]}"; do
+    for ds in "${outputs[@]}"; do
       if store_get "$channel" "$series-$ds-cumulative.nfib" "$work/cum-$ds.nfib"; then
-        ct=$(ds_closure_type "$ds") ev=$(ds_errors_of "$ds")
-        "$NFI" inspect --json "$work/cum-$ds.nfib" | jq -r --arg ct "$ct" --arg ev "$ev" '
-          if $ct != "" then .closures[] | select(.closure_type == $ct) | .release
-          elif $ev != "" then .evals[] | select(.eval_type == $ev and .errors != null) | .release
-          else .releases[].name end' \
+        "$NFI" inspect --json "$work/cum-$ds.nfib" |
+          jq -r --arg kind "${out_kind[$ds]}" --arg sel "${out_sel[$ds]}" '
+            if $kind == "closure" then .closures[] | select(.closure_type == $sel) | .release
+            elif $kind == "eval-errors" then .evals[] | select(.eval_type == $sel and .errors != null) | .release
+            else .releases[].name end' \
           | sort -u >"$work/have-$ds.txt"
       else
         : >"$work/have-$ds.txt"
       fi
-      # Releases having every dataset already.
+      # Releases having every output already.
       if [[ $first == true ]]; then cp "$work/have-$ds.txt" "$work/have.txt"; first=false; else
         comm -12 "$work/have.txt" "$work/have-$ds.txt" >"$work/have.tmp" && mv "$work/have.tmp" "$work/have.txt"
       fi
@@ -250,9 +237,9 @@ if [[ -n $BACKFILL ]]; then
   seed_from=$(grep -B1 -xF "$first_new" "$manifest" | head -n1)
   [[ $seed_from == "$first_new" ]] && seed_from=""
 fi
-if [[ -n $seed_from && ${#closure_datasets[@]} -gt 0 ]]; then
+if [[ -n $seed_from && ${#closure_outputs[@]} -gt 0 ]]; then
   parts=()
-  for ds in "${closure_datasets[@]}"; do
+  for ds in "${closure_outputs[@]}"; do
     f=$work/seed-$ds.nfib
     if [[ $per_release == true ]] && store_get "$seed_from" "$seed_from-$ds.nfib" "$f"; then
       parts+=("$f")
@@ -272,12 +259,12 @@ if [[ -n $seed_from && ${#closure_datasets[@]} -gt 0 ]]; then
 fi
 
 # ---------- index ----------
-declare -A new_parts # dataset -> space-separated bundle files to fold into the cumulative
+declare -A new_parts # output -> space-separated bundle files to fold into the cumulative
 if [[ $per_release == true ]]; then
   while IFS=$'\t' read -r name url; do
     files=()
     have_all=true
-    for ds in "${datasets[@]}"; do
+    for ds in "${outputs[@]}"; do
       f=$work/$name-$ds.nfib
       files+=("$f")
       store_get "$name" "$name-$ds.nfib" "$f" || have_all=false
@@ -285,17 +272,17 @@ if [[ $per_release == true ]]; then
     if [[ $have_all == true ]]; then
       log "$name already published; reusing its bundles"
       next_seed=()
-      for ds in "${closure_datasets[@]}"; do next_seed+=("$work/$name-$ds.nfib"); done
+      for ds in "${closure_outputs[@]}"; do next_seed+=("$work/$name-$ds.nfib"); done
       if ((${#next_seed[@]})); then
         "$NFI" merge "${next_seed[@]}" -o "$work/$name.nfib"
       fi
     else
       log "indexing $name"
       index "$work/$name.nfib" "$url"
-      for ds in "${datasets[@]}"; do filter_ds "$work/$name.nfib" "$ds" "$work/$name-$ds.nfib"; done
+      for ds in "${outputs[@]}"; do filter_out "$work/$name.nfib" "$ds" "$work/$name-$ds.nfib"; done
       store_put "$name" "$name" "$(notes_for "$work/$name.nfib")" "${files[@]}"
     fi
-    for ds in "${datasets[@]}"; do new_parts[$ds]+=" $work/$name-$ds.nfib"; done
+    for ds in "${outputs[@]}"; do new_parts[$ds]+=" $work/$name-$ds.nfib"; done
     # The next release is seeded from this one (all of its closures).
     [[ -n $seed && $seed == "$work/"*"-full.nfib" ]] && rm -f "$seed"
     if [[ -f $work/$name.nfib ]]; then
@@ -308,8 +295,8 @@ else
   while IFS=$'\t' read -r name url; do urls+=("$url"); done <"$work/new.tsv"
   log "indexing $count release(s)"
   index "$work/new.nfib" "${urls[@]}"
-  for ds in "${datasets[@]}"; do
-    filter_ds "$work/new.nfib" "$ds" "$work/new-$ds.nfib"
+  for ds in "${outputs[@]}"; do
+    filter_out "$work/new.nfib" "$ds" "$work/new-$ds.nfib"
     new_parts[$ds]=" $work/new-$ds.nfib"
   done
   rm -f "$work/new.nfib"
@@ -318,7 +305,7 @@ fi
 # ---------- cumulative ----------
 if [[ $cumulative == true ]]; then
   cum_files=()
-  for ds in "${datasets[@]}"; do
+  for ds in "${outputs[@]}"; do
     cum=$work/$series-$ds-cumulative.nfib
     inputs=()
     if [[ -f $work/cum-$ds.nfib ]] || store_get "$channel" "$series-$ds-cumulative.nfib" "$work/cum-$ds.nfib"; then
