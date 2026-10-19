@@ -165,6 +165,27 @@ fn supervise(cmd: &mut Command, signal: libc::c_int) {
     let _ = signal;
 }
 
+/// Recursively set mode 0700 on `path` and everything below it (symlinks are
+/// left alone). PostgreSQL refuses to start unless the data directory is
+/// owner-only, and volumes or restored backups often arrive with wider modes.
+fn restrict_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::symlink_metadata(path).with_context(|| format!("reading {}", path.display()))?;
+    if meta.file_type().is_symlink() {
+        return Ok(());
+    }
+    if meta.permissions().mode() & 0o7777 != 0o700 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("setting the mode of {}", path.display()))?;
+    }
+    if meta.is_dir() {
+        for entry in std::fs::read_dir(path).with_context(|| format!("reading {}", path.display()))? {
+            restrict_permissions(&entry?.path())?;
+        }
+    }
+    Ok(())
+}
+
 fn run(cmd: &mut Command, what: &str) -> Result<()> {
     let out = cmd
         .stdin(Stdio::null())
@@ -242,6 +263,7 @@ impl EmbeddedPostgres {
                 pgdata.display()
             );
         }
+        restrict_permissions(&pgdata)?;
 
         let mut cmd = Command::new(bin.join("postgres"));
         cmd.arg("-D")
@@ -411,6 +433,25 @@ mod tests {
         assert_eq!(parse_major("postgres (PostgreSQL) 16.10"), Some(16));
         assert_eq!(parse_major("postgres (PostgreSQL) 18beta1"), Some(18));
         assert_eq!(parse_major("postgres (PostgreSQL) 17rc1"), Some(17));
+    }
+
+    #[test]
+    fn restricts_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("pgdata");
+        std::fs::create_dir_all(root.join("base/1")).unwrap();
+        std::fs::write(root.join("base/1/file"), b"x").unwrap();
+        std::fs::write(root.join("PG_VERSION"), b"16").unwrap();
+        for p in [&root, &root.join("base"), &root.join("base/1")] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o777)).unwrap();
+        }
+        std::fs::set_permissions(root.join("PG_VERSION"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        restrict_permissions(&root).unwrap();
+        for p in ["", "base", "base/1", "base/1/file", "PG_VERSION"] {
+            let mode = std::fs::metadata(root.join(p)).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(mode, 0o700, "{p}");
+        }
     }
 
     #[test]
