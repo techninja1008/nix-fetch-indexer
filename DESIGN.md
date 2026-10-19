@@ -67,8 +67,9 @@ Bundle {
 Release { name, commit, channel, series, url, datasets: [closure|packages|outpaths|programs] }
 
 ClosureSection {
-  paths: [ClosurePath { hash, name, references: [path index], nar_size, file_size, deriver: Option<String>, releases: Bitset }],
-  missing: [MissingPath { hash, name, releases: Bitset }]   // in store-paths.xz but 404 on the cache
+  closures: [Closure { release: release index, closure_type, skipped: [String] }],
+  paths: [ClosurePath { hash, name, references: [path index], nar_size, file_size, deriver: Option<String>, closures: Bitset }],
+  missing: [MissingPath { hash, name, closures: Bitset }]   // roots that are 404 on the cache
 }
 PackagesSection { entries: [Package { attr, name, pname, version, system, description, homepage, license, main_program, broken, unfree, releases: Bitset }] }
 OutpathsSection { entries: [Outpaths { attr, system, drv_path, outputs: {name: store path}, releases: Bitset }] }
@@ -77,6 +78,10 @@ ProgramsSection { entries: [Program { name, system, attr, releases: Bitset }] }
 
 - `datasets` on a release records which sections contain data for it.
   - A release can be present in a section and still have zero entries.
+- **Closures (format version 3).** A release can have several closures, one per **closure type**: `store-paths` (runtime closures of `store-paths.xz`), `helpers-direct` and `helpers-full` (build inputs of nixpkgs helpers, found by probes), and later possibly `eval` or `fods`. Closure path and missing-path bitsets index the closure table; other sections' bitsets index releases.
+  - `skipped` records roots a closure could not collect, e.g. a probe that does not evaluate on that release.
+  - A closure's release must carry the closure dataset.
+  - Version 2 bundles have no closure table; their closure bits are release indices. Readers upgrade them, with one closure per release with the closure dataset, of a type the caller chooses (`--v2-closure-type`, default `store-paths`), so no bitset is rewritten.
 - **References** are indices into `paths`, which keeps the binary form compact. Paths outside the indexed set do not exist, because the closure is followed transitively.
 - **Bitsets** are encoded as little-endian byte strings.
 - **Binary form:**
@@ -88,12 +93,12 @@ ProgramsSection { entries: [Program { name, system, attr, releases: Bitset }] }
 - **JSON form:** the same data model.
   - Structurally identical, with bitsets as hex strings and references as index arrays.
   - It is detected by a leading `{`.
-- **Merge:** union the release tables by name, remap the bitsets, and union entries by key:
+- **Merge:** union the release tables by name, then the closure tables by (release, type), remap the bitsets, and union entries by key:
   - closure: hash
   - packages: (attr, version, system, metadata)
   - outpaths: (attr, system, drv_path)
   - programs: (name, system, attr)
-- **Split / filter:** select a subset of releases and/or sections, then drop the entries whose bitset becomes empty.
+- **Split / filter:** select a subset of releases, sections and/or closure types, then drop the entries whose bitset becomes empty. A release left without closures loses the closure dataset.
 
 ## Indexers (`nfi-indexer`)
 
@@ -105,6 +110,14 @@ ProgramsSection { entries: [Program { name, system, attr, releases: Bitset }] }
   - The indexer follows references transitively.
   - Paths that return 404 are recorded in `missing`.
   - `--seed <bundle>` reuses known hashes: store paths are immutable, so only new hashes are fetched. In channel-list mode, each release seeds the next.
+  - `--closure-types` picks the closure types to index (default `store-paths`). Every type goes through the same walk from its roots; only root collection differs.
+- **Helper probes** (`helpers-direct`, `helpers-full`)
+  - nixpkgs helpers build some tools inline, e.g. fetchurl's own bootstrap curl. Those tools, and the stdenv bootstrap, are in no runtime closure of `store-paths.xz`, even though Hydra built and cached them.
+  - `probes.nix` (embedded in the indexer) defines probes against the release's unpacked nixexprs, for each `--probe-systems` system (default `x86_64-linux,aarch64-linux`):
+    - **fetch probes** call a helper twice with every argument changed. Only derivations shared by both calls are kept, so anything built from the probe's own arguments drops out. Option variants (e.g. fetchgit with submodules or LFS) are separate probes, unioned.
+    - **target probes** are roots themselves (stdenv, stdenvNoCC).
+  - Probes guard on helper and argument availability per nixpkgs version. Each is instantiated separately, so a failing probe is skipped and recorded in the closure's `skipped`.
+  - `nix derivation show --recursive` gives the probes' graphs. `helpers-direct` roots are the consumed outputs of shared direct inputs (and target outputs); `helpers-full` roots are all outputs of every shared derivation in the build graphs, including bootstrap stages and fixed-output sources.
 - **`packages`**
   - Fetch `packages.json.br`, stream-decode brotli, and emit package metadata.
 - **`outpaths`**
@@ -148,10 +161,12 @@ ProgramsSection { entries: [Program { name, system, attr, releases: Bitset }] }
 ```
 releases(id, name unique, commit unique, channel, series, url, indexed_at)
 release_datasets(release_id, dataset)
+closure_types(id, name unique)          -- store-paths, helpers-direct, helpers-full, ...
+closures(id, release_id, type_id, skipped text[], unique (release_id, type_id))
 store_paths(id bigserial, hash char(32) unique, name, nar_size, file_size, deriver,
-            releases int[],   -- sorted ids of the releases whose closure contains the path
+            closures int[],   -- sorted ids of the closures containing the path
             refs bigint[])    -- ids of the path's runtime references
-missing_paths(hash, name, release_id)
+missing_paths(hash, name, closure_id)
 packages(id, attr, version, system, name, pname, description, homepage, license, main_program, broken, unfree)
 package_releases(package_id, release_id)
 package_outputs(attr, system, release_id, output, path_hash, drv_path)   -- joined from outpaths at ingest
@@ -159,27 +174,27 @@ programs(name, system, attr, release_id)
 jobs(id, kind, status, params jsonb, staged_blob oid/bytea, progress, error, created_at, started_at, finished_at)
 ```
 
-Membership and references are arrays on the path row, not one row per (path, release) or per edge. A channel's releases share most of their paths, so per-pair rows grow quickly: all 87 `nixos-26.05` releases are 2.7M paths, 22.5M memberships and 38M references.
+Membership and references are arrays on the path row, not one row per (path, closure) or per edge. Migration 0003 introduced closures by giving each existing release's store-paths closure the release's own id, so existing arrays stayed valid. A channel's releases share most of their paths, so per-pair rows grow quickly: all 87 `nixos-26.05` releases are 2.7M paths, 22.5M memberships and 38M references.
 
 **Ingest of a closure section**
 1. Load the bundle's paths into a temporary table.
 2. Resolve existing paths by hash. Allocate ids for new paths from the sequence; this is safe because writers hold the advisory lock.
 3. Insert the new paths with their references in one statement.
-4. Add the bundle's release ids to the arrays of existing paths.
+4. Add the bundle's closure ids to the arrays of existing paths. Closure types and closures are created as needed; skipped roots are unioned.
 
 A store path's references never change, so they are written only once, when the path is new.
 
-**Prune** removes the pruned release ids from the arrays, then deletes paths that are left with no releases.
+**Prune** removes the pruned closures' ids from the arrays, then deletes paths that are left with no closures. It removes whole releases, or with `closure_types` only those closures of the selected releases.
 
 **Invariants.** These replace the foreign keys:
 - every reference resolves to an existing path;
-- every release id exists;
-- every path belongs to at least one release;
-- a path's references belong to all of its releases (closures are closed).
+- every closure id exists;
+- every path belongs to at least one closure;
+- a path's references belong to all of its closures (closures are closed).
 
 **Enforcement:**
 - `Bundle::validate` rejects open closures.
-- Ingest skips paths outside the ingested releases.
+- Ingest skips paths in no closure.
 - `nfi-admin check` (`POST /admin/v1/check`) verifies the invariants.
 - Closure queries fail with an `index inconsistency` error instead of returning partial results.
 
@@ -230,12 +245,16 @@ A store path's references never change, so they are written only once, when the 
 3. DFS from the requested derivations.
    - A derivation is a **hit** when every output it needs is a known store path in the index.
      - "Needed" means the outputs its dependants consume, or all outputs for a requested derivation.
-     - Paths present in any indexed release count, and paths in `missing` do not.
+     - Paths present in any closure of any type count, and paths in `missing` do not.
    - On a hit, record those paths and stop descending.
-   - Otherwise the derivation must be built: add it to `to_build` and recurse into its `inputDrvs` with the outputs they consume.
-     - Content-addressed or floating outputs with no known path always count as must-build.
+   - Otherwise the derivation must be realised: add it to `to_build`, or to `to_fetch` for a fixed-output derivation, and recurse into its `inputDrvs` with the outputs they consume.
+     - Fixed-output paths are computed from their hash and name when `nix derivation show` omits them (Nix 2.34+).
+     - Floating content-addressed outputs with no known path always count as must-build.
    - `inputSrcs` of must-build derivations that are in the index are included.
 4. The result is the deduplicated runtime closure of all hits, plus `roots`: hits that are not inside another hit's closure.
+5. Warnings:
+   - `unindexed_nixpkgs`: a final stdenv in `to_build`.
+   - `close_miss`: a derivation in `to_build` whose name matches indexed paths (fewer than `close_miss_threshold`, default 100) with a different hash.
 
 ## Query CLI (`nfi`)
 

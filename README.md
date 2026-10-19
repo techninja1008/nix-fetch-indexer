@@ -50,7 +50,27 @@ nfi-indexer all --channel-list nixos/25.05 --limit 3 -o recent.nfib
 
 # Incremental: reuse a previous bundle's closure so known narinfos are not fetched again.
 nfi-indexer closure --release-url $R2 --seed closure.nfib -o closure-2.nfib
+
+# Build inputs of nixpkgs helpers (needs Nix), alongside the runtime closures:
+nfi-indexer closure --release-url $R --closure-types store-paths,helpers-direct,helpers-full -o closures.nfib
 ```
+
+**Closure types**
+
+A release's closure section can hold several closures, one per closure type. Each type differs only in where its roots come from; the narinfo walk, seeding and missing-path tracking are shared. A path's runtime closure is always included.
+
+| closure type | roots |
+|---|---|
+| `store-paths` (default) | the paths listed in the release's `store-paths.xz`: outputs of Hydra jobs |
+| `helpers-direct` | outputs of the direct build inputs of nixpkgs helpers, e.g. fetchurl's own bootstrap `curl`, plus `stdenv` and `stdenvNoCC` |
+| `helpers-full` | everything in those helpers' build graphs: bootstrap stages, compilers, and the cached sources they are built from |
+
+Build-only paths like these are in no runtime closure of `store-paths.xz`, so without them minimise reports them as needing a build. The helper types are collected by **probes** ([`probes.nix`](crates/nfi-indexer/src/probes.nix)):
+
+- **Calls:** each probe calls a helper twice with every argument changed (URL, revision, hash, name, source) and instantiates both calls against the release's nixexprs. Only derivations shared by both calls count, so anything built from the probe's own arguments drops out.
+- **Coverage:** fetchurl, fetchzip and fetchpatch; fetchgit (plain, with submodules, `leaveDotGit`, LFS and sparse checkout); fetchFromGitHub and fetchFromGitLab; fetchsvn, fetchhg, fetchbzr and fetchcvs; fetchCargoVendor (or fetchCargoTarball), buildGoModule's vendor derivation, fetchNpmDeps and fetchYarnDeps; and stdenv/stdenvNoCC as targets.
+- **Versions:** probes check which helpers and arguments a nixpkgs version has, so the same file works from 24.05 to unstable. A probe that still fails to evaluate is skipped, and the closure records it with the error.
+- **Systems:** `--probe-systems` (default `x86_64-linux,aarch64-linux`). Probes need `nix-instantiate` and `nix` (`--nix-instantiate`, `--nix`); a release takes about 15–30 s to probe.
 
 **Indexer options**
 
@@ -60,6 +80,7 @@ nfi-indexer closure --release-url $R2 --seed closure.nfib -o closure-2.nfib
 - `--sample N`: index only the first N roots, for testing.
 - `--format json`: write the JSON form.
 - `--compression {none,zstd,xz,brotli}[:level]`: compression for the binary form (default `zstd:9`).
+- `--v2-closure-type`: the closure type to read version 2 bundles (which predate closure types) as, for every command that reads bundles (default `store-paths`).
 
 **Bundle tools**
 
@@ -67,6 +88,7 @@ nfi-indexer closure --release-url $R2 --seed closure.nfib -o closure-2.nfib
 nfi-indexer merge a.nfib b.nfib -o ab.nfib
 nfi-indexer split ab.nfib -o per-release/
 nfi-indexer filter ab.nfib --channel nixos-25.05 --section closure,packages -o f.nfib
+nfi-indexer filter ab.nfib --section closure --closure-type helpers-direct -o helpers.nfib
 nfi-indexer convert ab.nfib --format json -o ab.json
 nfi-indexer inspect ab.nfib
 nfi-indexer list-channels nixos   # 24.05, 26.05, unstable, ...
@@ -79,7 +101,7 @@ nfi-indexer bench-compression ab.nfib
 The `Index releases` workflow (`.github/workflows/index-releases.yml`) runs every six hours, and can also be started by hand for one channel with a cap on how many new releases to index. It only uploads: bundles are published as GitHub release assets on [`techninja1008/nix-fetch-indexer-data`](https://github.com/techninja1008/nix-fetch-indexer-data), and nothing is ingested anywhere.
 
 1. A plan job builds `nfi-indexer` once. [`ci/channels.sh`](ci/channels.sh) discovers the channels on releases.nixos.org, and [`ci/plan.sh`](ci/plan.sh) keeps those with releases not yet published.
-2. One job per such channel runs [`ci/index-channel.sh`](ci/index-channel.sh), which indexes the new releases and uploads binary bundles (closure, packages and programs).
+2. One job per such channel runs [`ci/index-channel.sh`](ci/index-channel.sh), which indexes the new releases and uploads binary bundles, one per dataset: `closure` (the `store-paths` closures), `helpers-direct`, `helpers-full`, `packages` and `programs`. The helper datasets are separate assets because `helpers-full` is much larger: it reaches the whole stdenv bootstrap.
 
 **Channels.** Channels are discovered automatically according to the policy in [`ci/config.json`](ci/config.json); `-small` and `-aarch64` channels are skipped.
 
@@ -93,11 +115,13 @@ A stable channel only gets releases for about a month after the next one ships; 
 
 **Assets**
 
-- **Per-release bundles.** Release tag `<release>` (e.g. `nixos-26.05.590.ec942ba042da`). One asset per dataset: `<release>-closure.nfib`, `<release>-packages.nfib` and `<release>-programs.nfib`. The release notes summarise path, package and program counts.
+- **Per-release bundles.** Release tag `<release>` (e.g. `nixos-26.05.590.ec942ba042da`). One asset per dataset: `<release>-closure.nfib`, `<release>-helpers-direct.nfib`, `<release>-helpers-full.nfib`, `<release>-packages.nfib` and `<release>-programs.nfib`. The release notes summarise path, package and program counts, and each closure's paths, missing paths and skipped probes.
 - **Cumulative bundles.** Release tag `<channel>` (e.g. `nixos-26.05`). One asset per dataset covering every release processed so far: `<series>-<dataset>-cumulative.nfib`, e.g. `26.05-closure-cumulative.nfib`.
 - **Manifest.** Each channel's release (tag `<channel>`) also holds `releases.txt`, which lists the releases processed so far, oldest first. The next run starts after its last line.
 
-**Seeding.** A release usually shares nearly all of its closure with the previous release in the same channel, and very little with older ones. Each new release is therefore seeded with the previous release's closure only. For per-release channels, the seed comes from the previous release's `-closure.nfib`. For cumulative-only channels, it is filtered out of the cumulative bundle. With the seed, only narinfos that are new are fetched.
+**Seeding.** A release usually shares nearly all of its closures with the previous release in the same channel, and very little with older ones. Each new release is therefore seeded with the previous release's closures only, of every closure type. For per-release channels, the seed comes from the previous release's closure assets. For cumulative-only channels, it is filtered out of the cumulative bundles. With the seed, only narinfos that are new are fetched.
+
+**Backfill.** Datasets added later, such as the helper datasets, can be added to releases that are already recorded: set the workflow's `backfill_datasets` input (or `NFI_BACKFILL_DATASETS`) to e.g. `helpers-direct,helpers-full`. Instead of indexing new releases, the run indexes only those datasets for recorded releases that lack them, uploads their per-release assets, and folds them into the cumulative bundles.
 
 **Recovery.** If a run fails after publishing some per-release bundles but before updating `releases.txt`, the next run reuses those bundles instead of indexing them again. Merging a release that is already in a cumulative bundle is a no-op.
 
@@ -106,18 +130,22 @@ A stable channel only gets releases for about a month after the next one ships; 
 ```sh
 D=https://github.com/techninja1008/nix-fetch-indexer-data/releases/download
 # Catch up on a whole channel:
-nfi-admin ingest $D/nixos-26.05/26.05-closure-cumulative.nfib $D/nixos-26.05/26.05-packages-cumulative.nfib --wait
+nfi-admin ingest $D/nixos-26.05/26.05-closure-cumulative.nfib $D/nixos-26.05/26.05-helpers-direct-cumulative.nfib \
+  $D/nixos-26.05/26.05-packages-cumulative.nfib --wait
 # Then add releases one at a time:
 nfi-admin ingest $D/nixos-26.05.889.b51242d7d436/nixos-26.05.889.b51242d7d436-closure.nfib --wait
 ```
 
-The script can also run locally. Set `NFI_STORE=dir:<path>` to write to a directory instead of GitHub, and `NFI_INDEX_ARGS="--sample 30"` for a quick test.
+Bundles published before closure types (format version 2) are read as `store-paths` closures.
+
+The script can also run locally. Set `NFI_STORE=dir:<path>` to write to a directory instead of GitHub, and `NFI_INDEX_ARGS="--sample 30 --probe-systems x86_64-linux"` for a quick test.
 
 ## Interchange format
 
 A bundle holds a table of releases plus up to four sections: `closure`, `packages`, `outpaths` and `programs`.
 
 - **Release membership:** each entry has a bitset over the release table. One file can therefore hold many releases and still be split or filtered per release.
+- **Closures (format version 3):** the closure section has its own table of closures, each a release plus a closure type (and the roots it had to skip). Closure path and missing-path bitsets index that table. Version 2 bundles have no closure table and their bits are release indices; they are upgraded on read, with one closure per release of a type chosen by the reader (`--v2-closure-type`, default `store-paths`).
 - **Binary form:** `NFIB`, a container version byte (currently 2), a compression byte, then compressed CBOR. In this form entries are positional arrays, store hashes are 20 raw bytes and bitsets are byte strings.
 - **JSON form:** the same data model, with nix-base32 hashes and hex bitsets. The JSON form is detected by its leading `{`.
 
@@ -236,7 +264,7 @@ The figures below were measured with embedded PostgreSQL 16 on 4 cores.
 | GET | `/v1/search?q=&attr=&pname=&version=&program=&system=&release=&channel=&series=&commit=&limit=&offset=` | Search over packages and programs |
 | GET | `/v1/packages/{attr}?commit=&system=` | Metadata, output paths (with a `cached` flag) and programs for an attribute at a commit; unique commit prefixes are accepted |
 | POST | `/v1/lookup/bulk` | Body `{"items":[{"attr","commit","system"?,"outputs"?}]}`; returns per-item status and outputs, plus the deduplicated closure |
-| POST | `/v1/minimise` | Body: raw `nix derivation show --recursive` JSON (legacy or v4 format) or a reduced graph `{"derivations":{drv:{outputs,inputDrvs,inputSrcs}}}` |
+| POST | `/v1/minimise?close_miss_threshold=` | Body: raw `nix derivation show --recursive` JSON (legacy or v4 format) or a reduced graph `{"derivations":{drv:{outputs,inputDrvs,inputSrcs,fixed}}}` |
 
 **Bulk lookup details**
 
@@ -247,28 +275,30 @@ The figures below were measured with embedded PostgreSQL 16 on 4 cores.
 
 - The requested derivations are those that no other derivation in the graph references.
 - The graph is walked from the requested derivations, dependants first.
-- A derivation is a cache hit when every output its dependants need has a path in the index. The walk does not descend past a hit.
-- Any other derivation must be built, and the walk continues into its inputs.
+- A derivation is a cache hit when every output its dependants need has a path in the index, in a closure of any type. The walk does not descend past a hit.
+- Any other derivation must be built (or, for a fixed-output derivation, fetched), and the walk continues into its inputs.
+- Fixed-output paths are computed from their hash when `nix derivation show` leaves them out (Nix 2.34+).
 
 **Minimise response**
 
 - `to_build`: the derivations that must be built.
+- `to_fetch`: the fixed-output derivations (sources and other fetches) that aren't cached and will be downloaded from upstream.
 - `roots`: hits that are not inside another hit's closure.
 - `closure`: the full runtime closure of the hits.
 - `unresolved`: input derivations missing from the graph.
 - `warnings`: problems for the client to show. Each has a `code`, a `message` and the `paths` it concerns.
-  - `unindexed_nixpkgs` is raised for every final `stdenv-linux`/`stdenv-darwin` derivation in the graph whose output isn't indexed. Graphs can mix several nixpkgs instances, and each unindexed one is reported.
-  - Hydra builds stdenv for every release, so this almost always means the graph was evaluated from a nixpkgs revision that isn't indexed, or with overlays/config that change stdenv.
+  - `unindexed_nixpkgs` is raised for every final `stdenv-linux`/`stdenv-darwin` derivation that must be built. A stdenv beneath a cached path doesn't count. Graphs can mix several nixpkgs instances, and each unindexed one is reported. Hydra builds stdenv for every release, so this almost always means the graph was evaluated from a nixpkgs revision that isn't indexed, or with overlays/config that change stdenv.
+  - `close_miss` lists derivations to build whose name (name and version) matches indexed paths with a different hash: probably a slightly overridden package, or a build input that isn't indexed. Names matching `close_miss_threshold` indexed paths or more (default 100) are too generic to report; 0 turns the check off (`nfi minimise --close-miss-threshold`).
   - `nfi minimise` prints warnings to stderr.
 
 ### Admin API (admin listener only, optional `Authorization: Bearer <token>`)
 
 | method | path | description |
 |---|---|---|
-| POST | `/admin/v1/ingest` | Streamed bundle body (binary or JSON), or `{"url": ...}` with `Content-Type: application/json`; returns `{"id"}` |
+| POST | `/admin/v1/ingest?v2_closure_type=` | Streamed bundle body (binary or JSON), or `{"url": ..., "v2_closure_type": ...}` with `Content-Type: application/json`; returns `{"id"}`. `v2_closure_type` (default `store-paths`) is the closure type to read a version 2 bundle as (`nfi-admin ingest --v2-closure-type`) |
 | GET | `/admin/v1/jobs`, `/admin/v1/jobs/{id}` | Job status, progress and result |
-| GET | `/admin/v1/releases` | Releases (name, commit, channel, series) with their datasets |
-| POST | `/admin/v1/prune` | `{"releases":[], "commits":[], "channels":[]}`; garbage-collects orphaned paths and packages, then rebuilds search |
+| GET | `/admin/v1/releases` | Releases (name, commit, channel, series) with their datasets and closures (type and skipped roots) |
+| POST | `/admin/v1/prune` | `{"releases":[], "commits":[], "channels":[], "closure_types":[]}`; garbage-collects orphaned paths and packages, then rebuilds search. With `closure_types` (`nfi-admin prune --closure-type`), only those closures of the selected releases are removed and the releases are kept |
 | POST | `/admin/v1/reindex` | Rebuilds the Meilisearch index from Postgres and swaps it in |
 | POST | `/admin/v1/check` | Checks closure-index consistency (see below); the job result is a report with `ok`, counts and example rows per issue |
 
@@ -276,22 +306,22 @@ Ingest is purely additive: entries are immutable, so every insert is `ON CONFLIC
 
 ### Consistency
 
-Release membership and references are arrays on store path rows, so PostgreSQL can't enforce them with foreign keys. Ingest and prune maintain the invariants instead, and a few safeguards back them up.
+Closure membership and references are arrays on store path rows, so PostgreSQL can't enforce them with foreign keys. Ingest and prune maintain the invariants instead, and a few safeguards back them up.
 
 **`nfi-admin check`** runs these checks in one read-only snapshot:
 
 | issue | meaning |
 |---|---|
 | `dangling_refs` | a reference to a store path id that doesn't exist |
-| `unknown_releases` | membership in a release that doesn't exist |
-| `orphan_paths` | a store path that belongs to no release |
-| `open_closures` | a path is in a release that one of its references isn't in |
+| `unknown_closures` | membership in a closure that doesn't exist |
+| `orphan_paths` | a store path that belongs to no closure |
+| `open_closures` | a path is in a closure that one of its references isn't in |
 
 The check takes about 20 s on all of `nixos-26.05`: 2.7M paths and 38M references.
 
-**Queries fail instead of returning partial results.** If a closure query reaches a dangling reference or a path with no releases, the request fails with HTTP 500 and an `index inconsistency: …` message. It doesn't return a smaller closure.
+**Queries fail instead of returning partial results.** If a closure query reaches a dangling reference or a path in no closure, the request fails with HTTP 500 and an `index inconsistency: …` message. It doesn't return a smaller closure.
 
-**Bundles are validated.** `Bundle::validate`, which runs in the indexers and at ingest, rejects closures that aren't closed. Ingest doesn't store paths that belong to none of the ingested releases.
+**Bundles are validated.** `Bundle::validate`, which runs in the indexers and at ingest, rejects closures that aren't closed, and closures of releases without the closure dataset. Ingest doesn't store paths that belong to no closure.
 
 ## CLIs
 
@@ -346,7 +376,7 @@ NFI_LIVE_TESTS=1 NFI_LIVE_BUNDLE=full.nfib cargo test --release -p nfi --test li
 
 ## Known limitations
 
-- **Fixed-output sources are not in the index.** `store-paths.xz` lists only the outputs of Hydra jobs, and the closure indexer follows their *runtime* references. Source tarballs and other fixed-output derivation outputs are therefore not indexed, even though cache.nixos.org usually has them. `minimise` reports such derivations in `to_build`.
+- **Most fixed-output sources are not in the index.** `store-paths.xz` lists only the outputs of Hydra jobs, and the closure indexer follows their *runtime* references. Only the sources in helper probes' build graphs are indexed (`helpers-full`). Other source tarballs, such as crates from a project's `Cargo.lock`, are cached on cache.nixos.org when nixpkgs uses them but aren't indexed; `minimise` reports them in `to_fetch`. So are build-only derivations that nixpkgs happens to share with a project (e.g. its crate builds). Indexing these needs a future closure type built from full evaluation.
 - **Out paths need evaluation.** `packages.json` contains no store paths. Lookups only return outputs for releases whose `outpaths` dataset has been indexed (with nix-eval-jobs); other items get status `no_outpaths`.
 
 **Test services**

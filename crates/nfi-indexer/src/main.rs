@@ -553,8 +553,8 @@ async fn main() -> Result<()> {
                     println!("closures ({}):", s.closures.len());
                     for c in &s.closures {
                         println!(
-                            "  {} {}: paths={} missing={}",
-                            c.release, c.closure_type, c.paths, c.missing
+                            "  {} {}: paths={} missing={} skipped={}",
+                            c.release, c.closure_type, c.paths, c.missing, c.skipped
                         );
                     }
                 }

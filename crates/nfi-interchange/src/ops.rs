@@ -591,6 +591,8 @@ pub struct ClosureStats {
     pub closure_type: String,
     pub paths: usize,
     pub missing: usize,
+    /// Roots that could not be collected (e.g. skipped helper probes).
+    pub skipped: usize,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -645,6 +647,7 @@ pub fn stats(b: &Bundle) -> Stats {
                     .map(|r| r.name.clone())
                     .unwrap_or_default(),
                 closure_type: cl.closure_type.clone(),
+                skipped: cl.skipped.len(),
                 ..Default::default()
             })
             .collect();

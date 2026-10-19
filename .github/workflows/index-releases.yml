@@ -22,6 +22,10 @@ on:
         description: "Index at most this many new releases per channel (0: all)"
         required: false
         default: "0"
+      backfill_datasets:
+        description: "Instead of new releases, add these datasets to recorded releases lacking them (e.g. helpers-direct,helpers-full)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -30,6 +34,7 @@ env:
   GH_TOKEN: ${{ secrets.NFI_DATA_REPO_TOKEN }}
   NFI_STORE: gh:${{ vars.NFI_DATA_REPO || 'techninja1008/nix-fetch-indexer-data' }}
   NFI_INDEXER: ${{ github.workspace }}/bin/nfi-indexer
+  NFI_BACKFILL_DATASETS: ${{ inputs.backfill_datasets }}
 
 jobs:
   plan:
@@ -73,7 +78,8 @@ jobs:
       fail-fast: false
       matrix:
         channel: ${{ fromJSON(needs.plan.outputs.channels) }}
-    # One run per channel at a time: each run appends to the channel's manifest.
+    # One run per channel at a time: each run updates the channel's manifest
+    # and cumulative bundles.
     concurrency:
       group: index-${{ matrix.channel }}
       cancel-in-progress: false
@@ -85,6 +91,8 @@ jobs:
         with:
           name: nfi-indexer
           path: bin
+      # The helpers datasets instantiate probes against each release.
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
       - name: Index and upload
         env:
           NFI_MAX_RELEASES: ${{ inputs.max_releases || '0' }}
