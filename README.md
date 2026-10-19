@@ -374,6 +374,21 @@ NFI_LIVE_TESTS=1 NFI_LIVE_BUNDLE=full.nfib cargo test --release -p nfi --test li
 | `minimise` on the release's own `hello` (all cached: 1 root, 5-path closure) | ~1 s, most of it spent in `nix derivation show` |
 | `minimise` on a modified `hello`: 2 derivations to build, 8 roots, 82-path closure | ~0.3–2.7 s |
 
+### Acceptance test: minimise this repository
+
+`nfi minimise .#nfi`, run against the exact nixpkgs release in `flake.lock` (`nixos-26.11pre1092090.55bfb4d7437b`), should only plan derivations that cache.nixos.org doesn't have. Indexed with `--closure-types store-paths,helpers-direct,helpers-full`:
+
+| | store-paths only | with helper closures |
+|---|---:|---:|
+| to build | 762 | 300 |
+| to fetch | (in to build) | 297 |
+| cached but still planned | 541 | 376 |
+| `unindexed_nixpkgs` warning | yes | no |
+
+- **Indexing:** 56 s for 264,841 paths. All 20 probes ran on both systems.
+- **No longer planned:** the bootstrap curl and the other helper tools, and every stdenv bootstrap stage.
+- **Still planned although cached:** all 376 are crate builds and crate tarballs from this repository's `Cargo.lock` that nixpkgs happens to share. Indexing those needs a closure type built from full evaluation (see Known limitations).
+
 ## Known limitations
 
 - **Most fixed-output sources are not in the index.** `store-paths.xz` lists only the outputs of Hydra jobs, and the closure indexer follows their *runtime* references. Only the sources in helper probes' build graphs are indexed (`helpers-full`). Other source tarballs, such as crates from a project's `Cargo.lock`, are cached on cache.nixos.org when nixpkgs uses them but aren't indexed; `minimise` reports them in `to_fetch`. So are build-only derivations that nixpkgs happens to share with a project (e.g. its crate builds). Indexing these needs a future closure type built from full evaluation.
