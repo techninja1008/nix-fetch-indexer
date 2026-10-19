@@ -39,43 +39,48 @@ cargo build --release
 ```sh
 R=https://releases.nixos.org/nixos/25.05/nixos-25.05.813814.ac62194c3917
 
-nfi-indexer closure  --release-url $R -o closure.nfib    # store-paths.xz + narinfos
-nfi-indexer packages --release-url $R -o packages.nfib   # packages.json.br
-nfi-indexer programs --release-url $R -o programs.nfib   # programs.sqlite (nixos channels only)
-nfi-indexer outpaths --release-url $R --systems x86_64-linux,aarch64-linux -o outpaths.nfib  # nix-eval-jobs
-nfi-indexer all      --release-url $R --datasets closure,packages,programs,outpaths -o release.nfib
+# Default targets: store-paths closures, packages and programs.
+nfi-indexer index --release-url $R -o release.nfib
+nfi-indexer index --release-url $R --targets store-paths -o closure.nfib   # store-paths.xz + narinfos
+nfi-indexer index --release-url $R --targets packages,programs -o meta.nfib  # packages.json.br, programs.sqlite
+nfi-indexer index --release-url $R --targets outpaths --systems x86_64-linux,aarch64-linux -o outpaths.nfib  # nix-eval-jobs
 
 # Index every release of a channel, or only the newest few:
-nfi-indexer all --channel-list nixos/25.05 --limit 3 -o recent.nfib
+nfi-indexer index --channel-list nixos/25.05 --limit 3 -o recent.nfib
 
-# Incremental: reuse a previous bundle's closure so known narinfos are not fetched again.
-nfi-indexer closure --release-url $R2 --seed closure.nfib -o closure-2.nfib
+# Incremental: reuse a previous bundle's closures so known narinfos are not fetched again.
+nfi-indexer index --release-url $R2 --targets store-paths --seed closure.nfib -o closure-2.nfib
 
 # Build inputs of nixpkgs helpers (needs Nix), alongside the runtime closures:
-nfi-indexer closure --release-url $R --closure-types store-paths,helpers-direct,helpers-full -o closures.nfib
+nfi-indexer index --release-url $R --targets store-paths,helpers -o closures.nfib
+nfi-indexer index --release-url $R --targets helpers:direct -o helpers-direct.nfib
 ```
 
-**Closure types**
+**Targets**
 
-A release's closure section can hold several closures, one per closure type. Each type differs only in where its roots come from; the narinfo walk, seeding and missing-path tracking are shared. A path's runtime closure is always included.
+`--targets` names what to index. Datasets read from the release are `packages`, `programs` and `outpaths`. Closures are named by the **evaluator** that produces their roots and, within it, the **closure type**, as `<evaluator>[:<closure type>]`: a bare evaluator selects all of its closure types.
 
-| closure type | roots |
-|---|---|
-| `store-paths` (default) | the paths listed in the release's `store-paths.xz`: outputs of Hydra jobs |
-| `helpers-direct` | outputs of the direct build inputs of nixpkgs helpers, e.g. fetchurl's own bootstrap `curl`, plus `stdenv` and `stdenvNoCC` |
-| `helpers-full` | everything in those helpers' build graphs: bootstrap stages, compilers, and the cached sources they are built from |
+**Evaluations and closures**
 
-Build-only paths like these are in no runtime closure of `store-paths.xz`, so without them minimise reports them as needing a build. The helper types are collected by **probes** ([`probes.nix`](crates/nfi-indexer/src/probes.nix)):
+An **evaluation** is a release evaluated in one way; its **eval type** names the evaluator. Each evaluation produces one or more **closures**, one per closure type of its eval type. Closure type names are namespaced by eval type and may be empty. A closure belongs to its evaluation, and through it to the release. Closure types differ only in where their roots come from; the narinfo walk, seeding and missing-path tracking are shared. A path's runtime closure is always included.
+
+| target | evaluator | roots |
+|---|---|---|
+| `store-paths` | `store-paths`: a pseudo-evaluation, since the paths come from Hydra's evaluation; one unnamed closure type | the paths listed in the release's `store-paths.xz`: outputs of Hydra jobs |
+| `helpers:direct` | `helpers`: helper probes | outputs of the direct build inputs of nixpkgs helpers, e.g. fetchurl's own bootstrap `curl`, plus `stdenv` and `stdenvNoCC` |
+| `helpers:full` | `helpers` | everything in those helpers' build graphs: bootstrap stages, compilers, and the cached sources they are built from |
+
+Build-only paths like these are in no runtime closure of `store-paths.xz`, so without them minimise reports them as needing a build. The `helpers` evaluator runs **probes** ([`probes.nix`](crates/nfi-indexer/src/probes.nix)) once per release, for whichever of its closure types are selected:
 
 - **Calls:** each probe calls a helper twice with every argument changed (URL, revision, hash, name, source) and instantiates both calls against the release's nixexprs. Only derivations shared by both calls count, so anything built from the probe's own arguments drops out.
 - **Coverage:** fetchurl, fetchzip and fetchpatch; fetchgit (plain, with submodules, `leaveDotGit`, LFS and sparse checkout); fetchFromGitHub and fetchFromGitLab; fetchsvn, fetchhg, fetchbzr and fetchcvs; fetchCargoVendor (or fetchCargoTarball), buildGoModule's vendor derivation, fetchNpmDeps and fetchYarnDeps; and stdenv/stdenvNoCC as targets.
 - **Versions:** probes check which helpers and arguments a nixpkgs version has, so the same file works from 24.05 to unstable. A probe for a helper or argument that a version lacks is left out: it doesn't apply, so nothing is missed.
-- **Eval errors:** a probe that applies but fails to evaluate is an **eval error** of the release's `helper-probes` evaluation. Indexing a helper closure type records the probes' eval errors in the bundle's `eval-errors` section (see below). It is identified by probe name and system only; evaluation is deterministic, so the message is not kept. On 24.05 and 26.05 every applicable probe evaluates.
+- **Eval errors:** a probe that applies but fails to evaluate is an **eval error** of the release's `helpers` evaluation, identified by probe name and system only. On 24.05 and 26.05 every applicable probe evaluates.
 - **Systems:** `--probe-systems` (default `x86_64-linux,aarch64-linux`). Probes need `nix-instantiate` and `nix` (`--nix-instantiate`, `--nix`); a release takes about 15–30 s to probe.
 
 **Eval errors**
 
-The `eval-errors` section records attributes that failed to evaluate, per **evaluation**: one way of evaluating a release, named by an **eval type**. Eval types, evaluations and eval errors are to evaluation what closure types, closures and missing paths are to closures. An evaluation with no errors is still recorded: it says the evaluation ran. Eval errors only come from indexing something by evaluating it, so they can't be indexed on their own: they are written by the indexer that ran the evaluation. The only eval type so far is `helper-probes`, written when indexing the `helpers-direct` or `helpers-full` closure types; evaluation-based indexers added later can record their failures the same way.
+The `eval-errors` section records attributes that failed to evaluate, keyed by attribute and system, per evaluation. Evaluation is deterministic, so no message is kept. For each evaluation the section either holds its errors, possibly none, or says nothing about them. Eval errors only come from actually evaluating something, so they aren't a target: running an evaluator records its errors with its closures. The `store-paths` pseudo-evaluation evaluates nothing itself, so it records no error information.
 
 **Indexer options**
 
@@ -85,7 +90,7 @@ The `eval-errors` section records attributes that failed to evaluate, per **eval
 - `--sample N`: index only the first N roots, for testing.
 - `--format json`: write the JSON form.
 - `--compression {none,zstd,xz,brotli}[:level]`: compression for the binary form (default `zstd:9`).
-- `--v2-closure-type`: the closure type to read version 2 bundles (which predate closure types) as, for every command that reads bundles (default `store-paths`).
+- `--v2-closure-type`: the closure type to read version 2 bundles (which predate closure types) as, e.g. `helpers:full`, for every command that reads bundles (default `store-paths`).
 
 **Bundle tools**
 
@@ -93,7 +98,7 @@ The `eval-errors` section records attributes that failed to evaluate, per **eval
 nfi-indexer merge a.nfib b.nfib -o ab.nfib
 nfi-indexer split ab.nfib -o per-release/
 nfi-indexer filter ab.nfib --channel nixos-25.05 --section closure,packages -o f.nfib
-nfi-indexer filter ab.nfib --section closure --closure-type helpers-direct -o helpers.nfib
+nfi-indexer filter ab.nfib --section closure,eval-errors --closure-type helpers:direct -o helpers.nfib
 nfi-indexer convert ab.nfib --format json -o ab.json
 nfi-indexer inspect ab.nfib
 nfi-indexer list-channels nixos   # 24.05, 26.05, unstable, ...
@@ -106,7 +111,7 @@ nfi-indexer bench-compression ab.nfib
 The `Index releases` workflow (`.github/workflows/index-releases.yml`) runs every six hours, and can also be started by hand for one channel with a cap on how many new releases to index. It only uploads: bundles are published as GitHub release assets on [`techninja1008/nix-fetch-indexer-data`](https://github.com/techninja1008/nix-fetch-indexer-data), and nothing is ingested anywhere.
 
 1. A plan job builds `nfi-indexer` once. [`ci/channels.sh`](ci/channels.sh) discovers the channels on releases.nixos.org, and [`ci/plan.sh`](ci/plan.sh) keeps those with releases not yet published.
-2. One job per such channel runs [`ci/index-channel.sh`](ci/index-channel.sh), which indexes the new releases and uploads binary bundles, one per dataset: `closure` (the `store-paths` closures), `helpers-direct`, `helpers-full`, `packages` and `programs`. The helper datasets are separate assets because `helpers-full` is much larger: it reaches the whole stdenv bootstrap. Both helper assets also carry the probes' eval errors.
+2. One job per such channel runs [`ci/index-channel.sh`](ci/index-channel.sh), which indexes the new releases and uploads binary bundles, one per dataset: `closure` (the `store-paths` closures), `helpers-direct` and `helpers-full` (the `helpers:direct` and `helpers:full` closures), `packages` and `programs`. The helper datasets are separate assets because `helpers-full` is much larger: it reaches the whole stdenv bootstrap. Each closure asset also carries its evaluator's eval errors, so both helper assets carry the `helpers` evaluation's.
 
 **Channels.** Channels are discovered automatically according to the policy in [`ci/config.json`](ci/config.json); `-small` and `-aarch64` channels are skipped.
 
@@ -147,10 +152,10 @@ The script can also run locally. Set `NFI_STORE=dir:<path>` to write to a direct
 
 ## Interchange format
 
-A bundle holds a table of releases plus up to four sections: `closure`, `packages`, `outpaths` and `programs`.
+A bundle holds a table of releases, a table of evaluations, and up to five sections: `closure`, `packages`, `outpaths`, `programs` and `eval-errors`.
 
 - **Release membership:** each entry has a bitset over the release table. One file can therefore hold many releases and still be split or filtered per release.
-- **Closures (format version 3):** the closure section has its own table of closures, each a release plus a closure type (and the roots it had to skip). Closure path and missing-path bitsets index that table. Version 2 bundles have no closure table and their bits are release indices; they are upgraded on read, with one closure per release of a type chosen by the reader (`--v2-closure-type`, default `store-paths`).
+- **Evaluations and closures (format version 3):** the evaluation table lists (release, eval type) pairs. The closure section has its own table of closures, each an evaluation plus a closure type name; closure path and missing-path bitsets index that table. The eval-errors section has a bitset of the evaluations whose errors it holds, and each error a bitset of the evaluations it occurred in. Version 2 bundles have no closure table and their bits are release indices; they are upgraded on read, with one evaluation and closure per release of a type chosen by the reader (`--v2-closure-type`, default `store-paths`).
 - **Binary form:** `NFIB`, a container version byte (currently 2), a compression byte, then compressed CBOR. In this form entries are positional arrays, store hashes are 20 raw bytes and bitsets are byte strings.
 - **JSON form:** the same data model, with nix-base32 hashes and hex bitsets. The JSON form is detected by its leading `{`.
 
@@ -302,8 +307,8 @@ The figures below were measured with embedded PostgreSQL 16 on 4 cores.
 |---|---|---|
 | POST | `/admin/v1/ingest?v2_closure_type=` | Streamed bundle body (binary or JSON), or `{"url": ..., "v2_closure_type": ...}` with `Content-Type: application/json`; returns `{"id"}`. `v2_closure_type` (default `store-paths`) is the closure type to read a version 2 bundle as (`nfi-admin ingest --v2-closure-type`) |
 | GET | `/admin/v1/jobs`, `/admin/v1/jobs/{id}` | Job status, progress and result |
-| GET | `/admin/v1/releases` | Releases (name, commit, channel, series) with their datasets, closure types, and evaluations with their errors (`<attr>@<system>`) |
-| POST | `/admin/v1/prune` | `{"releases":[], "commits":[], "channels":[], "closure_types":[]}`; garbage-collects orphaned paths and packages, then rebuilds search. With `closure_types` (`nfi-admin prune --closure-type`), only those closures of the selected releases are removed and the releases are kept |
+| GET | `/admin/v1/releases` | Releases (name, commit, channel, series) with their datasets and evaluations: eval type, closure type names, and errors (`<attr>@<system>`, or `null` when not indexed) |
+| POST | `/admin/v1/prune` | `{"releases":[], "commits":[], "channels":[], "closure_types":[]}`; garbage-collects orphaned paths and packages, then rebuilds search. With `closure_types` (`nfi-admin prune --closure-type`), only the matching closures of the selected releases are removed (`helpers` or `helpers:full`, say) and the releases are kept; evaluations left with neither closures nor indexed errors are removed too |
 | POST | `/admin/v1/reindex` | Rebuilds the Meilisearch index from Postgres and swaps it in |
 | POST | `/admin/v1/check` | Checks closure-index consistency (see below); the job result is a report with `ok`, counts and example rows per issue |
 
@@ -381,7 +386,7 @@ NFI_LIVE_TESTS=1 NFI_LIVE_BUNDLE=full.nfib cargo test --release -p nfi --test li
 
 ### Acceptance test: minimise this repository
 
-`nfi minimise .#nfi`, run against the exact nixpkgs release in `flake.lock` (`nixos-26.11pre1092090.55bfb4d7437b`), should only plan derivations that cache.nixos.org doesn't have. Indexed with `--closure-types store-paths,helpers-direct,helpers-full`:
+`nfi minimise .#nfi`, run against the exact nixpkgs release in `flake.lock` (`nixos-26.11pre1092090.55bfb4d7437b`), should only plan derivations that cache.nixos.org doesn't have. Indexed with `--targets store-paths,helpers`:
 
 | | store-paths only | with helper closures |
 |---|---:|---:|
@@ -396,7 +401,7 @@ NFI_LIVE_TESTS=1 NFI_LIVE_BUNDLE=full.nfib cargo test --release -p nfi --test li
 
 ## Known limitations
 
-- **Most fixed-output sources are not in the index.** `store-paths.xz` lists only the outputs of Hydra jobs, and the closure indexer follows their *runtime* references. Only the sources in helper probes' build graphs are indexed (`helpers-full`). Other source tarballs, such as crates from a project's `Cargo.lock`, are cached on cache.nixos.org when nixpkgs uses them but aren't indexed; `minimise` reports them in `to_fetch`. So are build-only derivations that nixpkgs happens to share with a project (e.g. its crate builds). Indexing these needs a future closure type built from full evaluation.
+- **Most fixed-output sources are not in the index.** `store-paths.xz` lists only the outputs of Hydra jobs, and the closure indexer follows their *runtime* references. Only the sources in helper probes' build graphs are indexed (`helpers:full`). Other source tarballs, such as crates from a project's `Cargo.lock`, are cached on cache.nixos.org when nixpkgs uses them but aren't indexed; `minimise` reports them in `to_fetch`. So are build-only derivations that nixpkgs happens to share with a project (e.g. its crate builds). Indexing these needs a future closure type built from full evaluation.
 - **Out paths need evaluation.** `packages.json` contains no store paths. Lookups only return outputs for releases whose `outpaths` dataset has been indexed (with nix-eval-jobs); other items get status `no_outpaths`.
 
 **Test services**

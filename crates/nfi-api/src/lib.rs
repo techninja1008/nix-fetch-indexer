@@ -215,26 +215,23 @@ pub struct ReleaseInfo {
     pub series: String,
     pub url: Option<String>,
     pub datasets: Vec<String>,
-    /// The release's closures, by type.
-    #[serde(default)]
-    pub closures: Vec<ClosureInfo>,
-    /// The release's evaluations, by type.
+    /// The release's evaluations, by eval type, with their closures.
     #[serde(default)]
     pub evals: Vec<EvalInfo>,
     pub indexed_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ClosureInfo {
-    pub closure_type: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EvalInfo {
     pub eval_type: String,
-    /// Attributes that failed to evaluate, as `<attr>@<system>`.
+    /// Closure type names (within the eval type; may be empty) of the
+    /// evaluation's closures.
     #[serde(default)]
-    pub errors: Vec<String>,
+    pub closures: Vec<String>,
+    /// Attributes that failed to evaluate, as `<attr>@<system>`; `None` when
+    /// the evaluation's errors are not indexed.
+    #[serde(default)]
+    pub errors: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -254,9 +251,12 @@ pub struct PruneRequest {
     pub commits: Vec<String>,
     #[serde(default)]
     pub channels: Vec<String>,
-    /// Only remove closures of these types from the selected releases
-    /// (the releases themselves and their other data are kept). Empty
-    /// removes the selected releases entirely.
+    /// Only remove closures matching these selectors from the selected
+    /// releases: `<eval type>` (all its closure types) or `<eval
+    /// type>:<closure type>` (e.g. `helpers:full`). The releases and their
+    /// other data are kept; evaluations left with neither closures nor
+    /// indexed errors are removed. Empty removes the selected releases
+    /// entirely.
     #[serde(default)]
     pub closure_types: Vec<String>,
 }

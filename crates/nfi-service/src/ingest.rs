@@ -137,6 +137,41 @@ pub async fn ingest(
             .collect()
     };
 
+    // Evaluations. Database eval id of each of the bundle's evaluations;
+    // those whose errors the bundle covers are marked as having their
+    // errors indexed.
+    let covered = bundle
+        .eval_errors
+        .as_ref()
+        .map(|e| e.evals.clone())
+        .unwrap_or_default();
+    let mut eval_ids: Vec<i32> = Vec::with_capacity(bundle.evals.len());
+    for (i, ev) in bundle.evals.iter().enumerate() {
+        sqlx::query("INSERT INTO eval_types (name) VALUES ($1) ON CONFLICT DO NOTHING")
+            .bind(&ev.eval_type)
+            .execute(&mut *tx)
+            .await?;
+        // The update also makes RETURNING yield existing rows.
+        let id: i32 = sqlx::query_scalar(
+            "INSERT INTO evals (release_id, type_id, errors_indexed)
+             SELECT $1, t.id, $3 FROM eval_types t WHERE t.name = $2
+             ON CONFLICT (release_id, type_id)
+                DO UPDATE SET errors_indexed = evals.errors_indexed OR EXCLUDED.errors_indexed
+             RETURNING id",
+        )
+        .bind(ids[ev.release as usize])
+        .bind(&ev.eval_type)
+        .bind(covered.get(i))
+        .fetch_one(&mut *tx)
+        .await
+        .with_context(|| format!("adding eval {}", ev.eval_type))?;
+        eval_ids.push(id);
+        report.evals.push(format!(
+            "{} {}",
+            bundle.releases[ev.release as usize].name, ev.eval_type
+        ));
+    }
+
     // Closure.
     //
     // A store path's references never change, so they are only written when
@@ -146,28 +181,33 @@ pub async fn ingest(
         // ensures their releases carry the closure dataset).
         let mut closure_ids: Vec<i32> = Vec::with_capacity(c.closures.len());
         for cl in &c.closures {
-            let release_id = ids[cl.release as usize];
-            sqlx::query("INSERT INTO closure_types (name) VALUES ($1) ON CONFLICT DO NOTHING")
-                .bind(&cl.closure_type)
-                .execute(&mut *tx)
-                .await?;
-            // The no-op update makes RETURNING yield existing rows too.
+            let ct = bundle.closure_type(cl);
+            sqlx::query(
+                "INSERT INTO closure_types (eval_type_id, name)
+                 SELECT t.id, $2 FROM eval_types t WHERE t.name = $1 ON CONFLICT DO NOTHING",
+            )
+            .bind(&ct.eval_type)
+            .bind(&ct.name)
+            .execute(&mut *tx)
+            .await?;
             let id: i32 = sqlx::query_scalar(
-                "INSERT INTO closures (release_id, type_id)
-                 SELECT $1, t.id FROM closure_types t WHERE t.name = $2
-                 ON CONFLICT (release_id, type_id) DO UPDATE SET type_id = EXCLUDED.type_id
+                "INSERT INTO closures (eval_id, type_id)
+                 SELECT $1, ct.id FROM closure_types ct JOIN eval_types t ON t.id = ct.eval_type_id
+                  WHERE t.name = $2 AND ct.name = $3
+                 ON CONFLICT (eval_id, type_id) DO UPDATE SET type_id = EXCLUDED.type_id
                  RETURNING id",
             )
-            .bind(release_id)
-            .bind(&cl.closure_type)
+            .bind(eval_ids[cl.eval as usize])
+            .bind(&ct.eval_type)
+            .bind(&ct.name)
             .fetch_one(&mut *tx)
             .await
-            .with_context(|| format!("adding closure {}", cl.closure_type))?;
+            .with_context(|| format!("adding closure {ct}"))?;
             closure_ids.push(id);
-            report.closures.push(format!(
-                "{} {}",
-                bundle.releases[cl.release as usize].name, cl.closure_type
-            ));
+            let release = bundle.closure_release(cl).expect("validated");
+            report
+                .closures
+                .push(format!("{} {ct}", bundle.releases[release].name));
         }
         let to_ids = |bits: &nfi_interchange::Bitset| -> Vec<i32> {
             bits.iter().filter_map(|i| closure_ids.get(i).copied()).collect()
@@ -424,35 +464,10 @@ pub async fn ingest(
 
     // Eval errors.
     if let Some(e) = &bundle.eval_errors {
-        // Database eval id of each of the bundle's evaluations (validate()
-        // ensures their releases carry the eval-errors dataset).
-        let mut eval_ids: Vec<i32> = Vec::with_capacity(e.evals.len());
-        for ev in &e.evals {
-            sqlx::query("INSERT INTO eval_types (name) VALUES ($1) ON CONFLICT DO NOTHING")
-                .bind(&ev.eval_type)
-                .execute(&mut *tx)
-                .await?;
-            let id: i32 = sqlx::query_scalar(
-                "INSERT INTO evals (release_id, type_id)
-                 SELECT $1, t.id FROM eval_types t WHERE t.name = $2
-                 ON CONFLICT (release_id, type_id) DO UPDATE SET type_id = EXCLUDED.type_id
-                 RETURNING id",
-            )
-            .bind(ids[ev.release as usize])
-            .bind(&ev.eval_type)
-            .fetch_one(&mut *tx)
-            .await
-            .with_context(|| format!("adding eval {}", ev.eval_type))?;
-            eval_ids.push(id);
-            report.evals.push(format!(
-                "{} {}",
-                bundle.releases[ev.release as usize].name, ev.eval_type
-            ));
-        }
         progress(format!(
             "eval errors: {} errors in {} evals",
             e.errors.len(),
-            e.evals.len()
+            e.evals.count()
         ));
         exec(
             &mut tx,

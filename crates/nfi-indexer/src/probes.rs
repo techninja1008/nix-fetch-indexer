@@ -1,21 +1,21 @@
-//! Helper probes: roots for the `helpers-direct` and `helpers-full` closure
-//! types.
+//! Helper probes: the `helpers` evaluator, whose closure types are
+//! `helpers:direct` and `helpers:full`.
 //!
 //! nixpkgs helpers such as fetchurl build their tools inline (fetchurl uses
 //! its own bootstrap curl), so those tools are in no runtime closure of
 //! store-paths.xz. Probes (`probes.nix`) instantiate dummy helper calls
 //! against a release's nixexprs; the build inputs they share become roots:
 //!
-//! - `helpers-direct`: outputs of the probes' direct input derivations, and
+//! - `direct`: outputs of the probes' direct input derivations, and
 //!   of target probes (e.g. stdenv) themselves;
-//! - `helpers-full`: outputs of every derivation in the probes' build graphs,
+//! - `full`: outputs of every derivation in the probes' build graphs,
 //!   including bootstrap stages and fixed-output sources.
 //!
 //! The roots go through the same closure walk as store-paths.xz roots.
 //!
 //! Probes that do not apply to a nixpkgs version (a helper or argument it
 //! does not have) are left out by `probes.nix` itself. A probe that applies
-//! but fails to evaluate is an eval error of the `helper-probes` evaluation.
+//! but fails to evaluate is an eval error of the `helpers` evaluation.
 
 use anyhow::{Context, Result, bail};
 use futures::stream::{self, StreamExt};
@@ -25,10 +25,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::Stdio;
 
-pub const HELPERS_DIRECT: &str = "helpers-direct";
-pub const HELPERS_FULL: &str = "helpers-full";
-/// The eval type of probe evaluation, for the eval-errors dataset.
-pub const HELPER_PROBES: &str = "helper-probes";
+/// The eval type of helper probe evaluation.
+pub const HELPERS: &str = "helpers";
+/// Closure type of the probes' direct inputs (`helpers:direct`).
+pub const DIRECT: &str = "direct";
+/// Closure type of the probes' whole build graphs (`helpers:full`).
+pub const FULL: &str = "full";
 
 const PROBES_NIX: &str = include_str!("probes.nix");
 /// Files the probes' dummy sources contain (for language vendoring helpers).

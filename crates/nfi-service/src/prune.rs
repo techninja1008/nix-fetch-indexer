@@ -3,6 +3,7 @@
 use crate::ingest::WRITE_LOCK;
 use anyhow::Result;
 use nfi_api::PruneRequest;
+use nfi_interchange::{ClosureSelector, ClosureType};
 use serde::Serialize;
 use sqlx::{PgPool, Postgres, Transaction};
 
@@ -35,6 +36,13 @@ pub async fn gc(tx: &mut Transaction<'_, Postgres>) -> Result<(u64, u64)> {
 }
 
 pub async fn prune(pool: &PgPool, req: &PruneRequest) -> Result<PruneReport> {
+    let selectors = req
+        .closure_types
+        .iter()
+        .map(|s| s.parse::<ClosureSelector>().map_err(anyhow::Error::msg))
+        .collect::<Result<Vec<_>>>()?;
+    let sel_evals: Vec<&str> = selectors.iter().map(|s| s.eval_type.as_str()).collect();
+    let sel_names: Vec<Option<&str>> = selectors.iter().map(|s| s.name.as_deref()).collect();
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(WRITE_LOCK)
@@ -47,20 +55,27 @@ pub async fn prune(pool: &PgPool, req: &PruneRequest) -> Result<PruneReport> {
         .collect();
     let selected = "SELECT id FROM releases WHERE name = ANY($1) OR channel = ANY($2) OR commit LIKE ANY($3)";
     // Closures being removed: all of the selected releases' closures (cascaded
-    // from the release rows), or only those of the requested types.
-    let removed: Vec<(i32, String, String)> = sqlx::query_as(&format!(
-        "SELECT c.id, r.name, t.name FROM closures c
-           JOIN releases r ON r.id = c.release_id
-           JOIN closure_types t ON t.id = c.type_id
-          WHERE c.release_id IN ({selected}) AND (cardinality($4::text[]) = 0 OR t.name = ANY($4))"
+    // from the release rows), or only those matching the closure selectors
+    // (`<eval type>` or `<eval type>:<closure type>`).
+    let removed: Vec<(i32, String, String, String)> = sqlx::query_as(&format!(
+        "SELECT c.id, r.name, et.name, ct.name FROM closures c
+           JOIN evals e ON e.id = c.eval_id
+           JOIN eval_types et ON et.id = e.type_id
+           JOIN closure_types ct ON ct.id = c.type_id
+           JOIN releases r ON r.id = e.release_id
+          WHERE e.release_id IN ({selected})
+            AND (cardinality($4::text[]) = 0
+                 OR EXISTS (SELECT 1 FROM unnest($4::text[], $5::text[]) s(eval_type, name)
+                             WHERE s.eval_type = et.name AND (s.name IS NULL OR s.name = ct.name)))"
     ))
     .bind(&req.releases)
     .bind(&req.channels)
     .bind(&commit_patterns)
-    .bind(&req.closure_types)
+    .bind(&sel_evals)
+    .bind(&sel_names)
     .fetch_all(&mut *tx)
     .await?;
-    let closure_ids: Vec<i32> = removed.iter().map(|(id, _, _)| *id).collect();
+    let closure_ids: Vec<i32> = removed.iter().map(|(id, ..)| *id).collect();
     let mut names = Vec::new();
     let mut closures = Vec::new();
     if req.closure_types.is_empty() {
@@ -77,14 +92,25 @@ pub async fn prune(pool: &PgPool, req: &PruneRequest) -> Result<PruneReport> {
             .bind(&closure_ids)
             .execute(&mut *tx)
             .await?;
-        // A release left without closures no longer has the closure dataset.
+        // Evaluations left with neither closures nor known errors go too,
+        // and a release left without closures loses the closure dataset.
         sqlx::query(
-            "DELETE FROM release_datasets d WHERE d.dataset = 'closure'
-                AND NOT EXISTS (SELECT 1 FROM closures c WHERE c.release_id = d.release_id)",
+            "DELETE FROM evals e WHERE NOT e.errors_indexed
+                AND NOT EXISTS (SELECT 1 FROM closures c WHERE c.eval_id = e.id)",
         )
         .execute(&mut *tx)
         .await?;
-        closures = removed.iter().map(|(_, r, t)| format!("{r} {t}")).collect();
+        sqlx::query(
+            "DELETE FROM release_datasets d WHERE d.dataset = 'closure'
+                AND NOT EXISTS (SELECT 1 FROM closures c JOIN evals e ON e.id = c.eval_id
+                                 WHERE e.release_id = d.release_id)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        closures = removed
+            .iter()
+            .map(|(_, r, e, n)| format!("{r} {}", ClosureType::new(e, n)))
+            .collect();
     }
     if !closure_ids.is_empty() {
         // Drop the removed closures from store path membership.

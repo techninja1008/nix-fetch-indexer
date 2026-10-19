@@ -6,7 +6,8 @@ use crate::store_path::StoreHash;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Builder for closure sections keyed by hash, with references as hashes.
-/// Path and missing bits index the builder's closure table.
+/// Path and missing bits index the builder's closure table, whose closures
+/// refer to the evaluations of the bundle being built.
 #[derive(Default)]
 pub struct ClosureBuilder {
     closures: Vec<Closure>,
@@ -31,19 +32,20 @@ impl ClosureBuilder {
         Self::default()
     }
 
-    /// Seed the builder from an existing closure section, remapping release
-    /// indices (closures of releases mapped to `None` are dropped).
+    /// Seed the builder from an existing closure section, remapping eval
+    /// indices (closures of evaluations mapped to `None` are dropped).
     pub fn from_section(section: &ClosureSection, remap: &dyn Fn(usize) -> Option<usize>) -> Self {
         let mut b = Self::new();
         b.extend_section(section, remap);
         b
     }
 
+    /// Add a section, remapping eval indices as for [`Self::from_section`].
     pub fn extend_section(&mut self, section: &ClosureSection, remap: &dyn Fn(usize) -> Option<usize>) {
         let map: Vec<Option<usize>> = section
             .closures
             .iter()
-            .map(|c| remap(c.release as usize).map(|r| self.ensure_closure(r, &c.closure_type)))
+            .map(|c| remap(c.eval as usize).map(|e| self.ensure_closure(e, &c.closure_type)))
             .collect();
         let cremap = |i: usize| map.get(i).copied().flatten();
         for p in &section.paths {
@@ -72,19 +74,19 @@ impl ClosureBuilder {
         }
     }
 
-    /// Index of the closure of `release` (a bundle release index) of the
-    /// given type, adding it if absent.
-    pub fn ensure_closure(&mut self, release: usize, closure_type: &str) -> usize {
-        let release = release as u32;
+    /// Index of the closure of `eval` (a bundle eval index) with the given
+    /// closure type name, adding it if absent.
+    pub fn ensure_closure(&mut self, eval: usize, closure_type: &str) -> usize {
+        let eval = eval as u32;
         match self
             .closures
             .iter()
-            .position(|c| c.release == release && c.closure_type == closure_type)
+            .position(|c| c.eval == eval && c.closure_type == closure_type)
         {
             Some(i) => i,
             None => {
                 self.closures.push(Closure {
-                    release,
+                    eval,
                     closure_type: closure_type.to_string(),
                 });
                 self.closures.len() - 1
@@ -229,17 +231,12 @@ pub struct EvalErrorsBuilder {
 }
 
 impl EvalErrorsBuilder {
-    /// Add a section, remapping release indices (evaluations of releases
-    /// mapped to `None` are dropped).
+    /// Add a section, remapping eval indices (evaluations mapped to `None`
+    /// are dropped).
     pub fn extend_section(&mut self, section: &EvalErrorsSection, remap: &dyn Fn(usize) -> Option<usize>) {
-        let map: Vec<Option<usize>> = section
-            .evals
-            .iter()
-            .map(|e| remap(e.release as usize).map(|r| self.section.ensure_eval(r as u32, &e.eval_type)))
-            .collect();
-        let eremap = |i: usize| map.get(i).copied().flatten();
+        self.section.evals.union_with(&section.evals.remap(remap));
         for e in &section.errors {
-            let bits = e.evals.remap(eremap);
+            let bits = e.evals.remap(remap);
             if bits.is_empty() {
                 continue;
             }
@@ -379,15 +376,21 @@ pub fn merge(inputs: impl IntoIterator<Item = Bundle>) -> Bundle {
             .map(|r| out.ensure_release(r.clone()))
             .collect();
         let remap = |i: usize| map.get(i).copied();
+        let emap: Vec<usize> = input
+            .evals
+            .iter()
+            .map(|e| out.ensure_eval(map[e.release as usize] as u32, &e.eval_type))
+            .collect();
+        let eremap = |i: usize| emap.get(i).copied();
         if let Some(c) = &input.closure {
             closure
                 .get_or_insert_with(ClosureBuilder::new)
-                .extend_section(c, &remap);
+                .extend_section(c, &eremap);
         }
         if let Some(e) = &input.eval_errors {
             eval_errors
                 .get_or_insert_with(EvalErrorsBuilder::default)
-                .extend_section(e, &remap);
+                .extend_section(e, &eremap);
         }
         if let Some(s) = input.packages {
             let (idx, v) = packages.get_or_insert_with(Default::default);
@@ -437,8 +440,36 @@ pub fn merge(inputs: impl IntoIterator<Item = Bundle>) -> Bundle {
     out.outpaths = outpaths.map(|(_, entries)| OutpathsSection { entries });
     out.programs = programs.map(|(_, entries)| ProgramsSection { entries });
     out.eval_errors = eval_errors.map(EvalErrorsBuilder::finish);
+    sort_evals(&mut out);
     normalize(&mut out);
     out
+}
+
+/// Sort the evaluation table by release and eval type, so that merging is
+/// independent of input order.
+fn sort_evals(b: &mut Bundle) {
+    let mut order: Vec<usize> = (0..b.evals.len()).collect();
+    order.sort_by(|&x, &y| {
+        let (a, c) = (&b.evals[x], &b.evals[y]);
+        (a.release, &a.eval_type).cmp(&(c.release, &c.eval_type))
+    });
+    let mut map = vec![0; order.len()];
+    for (new, &old) in order.iter().enumerate() {
+        map[old] = new;
+    }
+    b.evals = order.iter().map(|&i| b.evals[i].clone()).collect();
+    if let Some(c) = &mut b.closure {
+        for cl in &mut c.closures {
+            cl.eval = map[cl.eval as usize] as u32;
+        }
+    }
+    if let Some(e) = &mut b.eval_errors {
+        let remap = |i: usize| map.get(i).copied();
+        e.evals = e.evals.remap(remap);
+        for err in &mut e.errors {
+            err.evals = err.evals.remap(remap);
+        }
+    }
 }
 
 /// Sort entries into a canonical order.
@@ -459,14 +490,16 @@ pub fn normalize(b: &mut Bundle) {
 }
 
 /// Keep only the releases matching `keep`, the sections in `sections` and
-/// the closures whose type is in `closure_types` (all when `None`). Entries
-/// left without releases or closures are dropped; closure paths are kept
-/// when referenced by a kept path.
+/// the closures matching `closure_types` (all when `None`); with selectors,
+/// eval errors are kept for the selected eval types. Entries left without
+/// releases, closures or evaluations are dropped, and evaluations left with
+/// neither closures nor eval errors; closure paths are kept when referenced
+/// by a kept path.
 pub fn filter(
     b: &Bundle,
     keep: impl Fn(&Release) -> bool,
     sections: Option<&[Dataset]>,
-    closure_types: Option<&[String]>,
+    closure_types: Option<&[ClosureSelector]>,
 ) -> Bundle {
     let want = |d: Dataset| sections.is_none_or(|s| s.contains(&d));
     let mut map = vec![None; b.releases.len()];
@@ -485,15 +518,61 @@ pub fn filter(
         ..Bundle::default()
     };
 
-    if let Some(c) = b.closure.as_ref().filter(|_| want(Dataset::Closure)) {
+    // Evaluations of kept releases and selected eval types, and which of
+    // them end up referenced by a kept closure or kept eval errors.
+    let eval_ok: Vec<bool> = b
+        .evals
+        .iter()
+        .map(|e| {
+            remap(e.release as usize).is_some()
+                && closure_types.is_none_or(|t| t.iter().any(|s| s.eval_type == e.eval_type))
+        })
+        .collect();
+    let closure_ok = |cl: &Closure| -> bool {
+        eval_ok.get(cl.eval as usize).copied().unwrap_or(false)
+            && closure_types.is_none_or(|t| {
+                t.iter()
+                    .any(|s| s.matches(&b.evals[cl.eval as usize].eval_type, &cl.closure_type))
+            })
+    };
+    let closures_kept = b.closure.as_ref().filter(|_| want(Dataset::Closure));
+    let errors_kept = b.eval_errors.as_ref().filter(|_| want(Dataset::EvalErrors));
+    let mut used = vec![false; b.evals.len()];
+    for cl in closures_kept.iter().flat_map(|c| &c.closures) {
+        if closure_ok(cl) {
+            used[cl.eval as usize] = true;
+        }
+    }
+    for e in errors_kept.iter().flat_map(|e| e.evals.iter()) {
+        if eval_ok.get(e).copied().unwrap_or(false) {
+            used[e] = true;
+        }
+    }
+    let mut emap = vec![None; b.evals.len()];
+    for (i, e) in b.evals.iter().enumerate() {
+        if used[i] {
+            emap[i] = Some(out.evals.len());
+            out.evals.push(Eval {
+                release: remap(e.release as usize).expect("kept release") as u32,
+                ..e.clone()
+            });
+        }
+    }
+    let eremap = |i: usize| emap.get(i).copied().flatten();
+
+    if let Some(e) = errors_kept {
+        let mut builder = EvalErrorsBuilder::default();
+        builder.extend_section(e, &eremap);
+        out.eval_errors = Some(builder.finish());
+    }
+    if let Some(c) = closures_kept {
         let mut cmap = vec![None; c.closures.len()];
         let mut closures = Vec::new();
         for (j, cl) in c.closures.iter().enumerate() {
-            let type_ok = closure_types.is_none_or(|t| t.contains(&cl.closure_type));
-            if let Some(r) = remap(cl.release as usize).filter(|_| type_ok) {
+            if let Some(e) = eremap(cl.eval as usize).filter(|_| closure_ok(cl)) {
                 cmap[j] = Some(closures.len());
                 closures.push(Closure {
-                    release: r as u32,
+                    eval: e as u32,
                     ..cl.clone()
                 });
             }
@@ -545,7 +624,10 @@ pub fn filter(
             .collect();
         // A release keeps the closure dataset only while it has closures.
         for (i, r) in out.releases.iter_mut().enumerate() {
-            if !closures.iter().any(|c| c.release as usize == i) {
+            if !closures
+                .iter()
+                .any(|c| out.evals[c.eval as usize].release as usize == i)
+            {
                 r.datasets.retain(|d| *d != Dataset::Closure);
             }
         }
@@ -554,11 +636,6 @@ pub fn filter(
             paths,
             missing,
         });
-    }
-    if let Some(e) = b.eval_errors.as_ref().filter(|_| want(Dataset::EvalErrors)) {
-        let mut builder = EvalErrorsBuilder::default();
-        builder.extend_section(e, &remap);
-        out.eval_errors = Some(builder.finish());
     }
     if let Some(s) = b.packages.as_ref().filter(|_| want(Dataset::Packages)) {
         out.packages = Some(PackagesSection {
@@ -628,6 +705,7 @@ pub struct ReleaseStats {
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct ClosureStats {
     pub release: String,
+    /// Qualified closure type (`<eval type>[:<name>]`).
     pub closure_type: String,
     pub paths: usize,
     pub missing: usize,
@@ -637,7 +715,10 @@ pub struct ClosureStats {
 pub struct EvalStats {
     pub release: String,
     pub eval_type: String,
-    pub errors: usize,
+    pub closures: usize,
+    /// Failed attributes; `None` when the bundle holds no error information
+    /// for the evaluation.
+    pub errors: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -680,6 +761,17 @@ pub fn stats(b: &Bundle) -> Stats {
             *f(&mut releases[i]) += 1;
         }
     };
+    let release_name = |i: usize| b.releases.get(i).map(|r| r.name.clone()).unwrap_or_default();
+    let mut evals: Vec<EvalStats> = b
+        .evals
+        .iter()
+        .map(|ev| EvalStats {
+            release: release_name(ev.release as usize),
+            eval_type: ev.eval_type.clone(),
+            ..Default::default()
+        })
+        .collect();
+    let eval_release = |e: usize| b.evals.get(e).map(|ev| ev.release as usize);
     if let Some(c) = &b.closure {
         s.closure_paths = c.paths.len();
         s.closure_edges = c.paths.iter().map(|p| p.references.len()).sum();
@@ -688,18 +780,20 @@ pub fn stats(b: &Bundle) -> Stats {
             .closures
             .iter()
             .map(|cl| ClosureStats {
-                release: b
-                    .releases
-                    .get(cl.release as usize)
-                    .map(|r| r.name.clone())
-                    .unwrap_or_default(),
-                closure_type: cl.closure_type.clone(),
+                release: b.closure_release(cl).map(release_name).unwrap_or_default(),
+                closure_type: b.closure_type(cl).to_string(),
                 ..Default::default()
             })
             .collect();
+        for cl in &c.closures {
+            if let Some(e) = evals.get_mut(cl.eval as usize) {
+                e.closures += 1;
+            }
+        }
         // Per release, a path counts once however many of its closures hold it.
-        let releases_of =
-            |bits: &Bitset| -> Bitset { bits.remap(|j| c.closures.get(j).map(|cl| cl.release as usize)) };
+        let releases_of = |bits: &Bitset| -> Bitset {
+            bits.remap(|j| c.closures.get(j).and_then(|cl| eval_release(cl.eval as usize)))
+        };
         for p in &c.paths {
             count(&releases_of(&p.closures), |r| &mut r.closure_paths);
             let n = closures.len();
@@ -736,30 +830,22 @@ pub fn stats(b: &Bundle) -> Stats {
     }
     if let Some(e) = &b.eval_errors {
         s.eval_errors = e.errors.len();
-        let mut evals: Vec<EvalStats> = e
-            .evals
-            .iter()
-            .map(|ev| EvalStats {
-                release: b
-                    .releases
-                    .get(ev.release as usize)
-                    .map(|r| r.name.clone())
-                    .unwrap_or_default(),
-                eval_type: ev.eval_type.clone(),
-                errors: 0,
-            })
-            .collect();
-        let releases_of =
-            |bits: &Bitset| -> Bitset { bits.remap(|j| e.evals.get(j).map(|ev| ev.release as usize)) };
-        for err in &e.errors {
-            count(&releases_of(&err.evals), |r| &mut r.eval_errors);
-            let n = evals.len();
-            for j in err.evals.iter().filter(|&j| j < n) {
-                evals[j].errors += 1;
+        for j in e.evals.iter() {
+            if let Some(ev) = evals.get_mut(j) {
+                ev.errors = Some(0);
             }
         }
-        s.evals = evals;
+        let releases_of = |bits: &Bitset| -> Bitset { bits.remap(eval_release) };
+        for err in &e.errors {
+            count(&releases_of(&err.evals), |r| &mut r.eval_errors);
+            for j in err.evals.iter() {
+                if let Some(n) = evals.get_mut(j).and_then(|ev| ev.errors.as_mut()) {
+                    *n += 1;
+                }
+            }
+        }
     }
+    s.evals = evals;
     s.releases = releases;
     s
 }

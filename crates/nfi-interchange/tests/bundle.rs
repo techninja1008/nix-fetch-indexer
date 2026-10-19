@@ -26,11 +26,14 @@ fn sample(name: &str, commit: &str, extra: bool) -> Bundle {
     sample_typed(name, commit, extra, STORE_PATHS)
 }
 
+/// Like [`sample`], with the closure of the given (qualified) closure type.
 fn sample_typed(name: &str, commit: &str, extra: bool, closure_type: &str) -> Bundle {
+    let ct: ClosureType = closure_type.parse().unwrap();
     let mut b = Bundle::default();
     let r = b.ensure_release(release(name, commit, "nixos-25.05"));
+    let e = b.ensure_eval(r as u32, &ct.eval_type);
     let mut cb = ClosureBuilder::new();
-    let cbits = Bitset::single(cb.ensure_closure(r, closure_type));
+    let cbits = Bitset::single(cb.ensure_closure(e, &ct.name));
     let bits = Bitset::single(r);
     let edges: &[(u8, &[u8])] = if extra {
         &[(1, &[2]), (2, &[3]), (4, &[3, 4]), (5, &[1])]
@@ -97,12 +100,23 @@ fn sample_typed(name: &str, commit: &str, extra: bool, closure_type: &str) -> Bu
             releases: bits,
         }],
     });
-    let mut ev = EvalErrorsSection::default();
-    let e = ev.ensure_eval(r as u32, "helper-probes");
-    if extra {
-        ev.add_error("fetchhg", "x86_64-linux", e);
+    b
+}
+
+/// A `helpers` evaluation of one release with the given errors.
+fn eval_errors(name: &str, commit: &str, errors: &[(&str, &str)]) -> Bundle {
+    let mut b = Bundle::default();
+    let mut r = release(name, commit, "nixos-25.05");
+    r.datasets = vec![Dataset::EvalErrors];
+    let r = b.ensure_release(r);
+    let e = b.ensure_eval(r as u32, "helpers");
+    let mut s = EvalErrorsSection::default();
+    s.evals.set(e);
+    for (attr, system) in errors {
+        s.add_error(attr, system, e);
     }
-    b.eval_errors = Some(ev);
+    b.eval_errors = Some(s);
+    b.validate().unwrap();
     b
 }
 
@@ -261,8 +275,9 @@ fn validate_rejects_open_closures() {
     b.validate().unwrap();
     let r2 = b.ensure_release(release("r2", &"b".repeat(40), "nixos-25.05"));
     // p1 (which references p2) joins r2 without p2: the closure is not closed.
+    let e2 = b.ensure_eval(r2 as u32, STORE_PATHS);
     let c = b.closure.as_mut().unwrap();
-    let c2 = c.ensure_closure(r2 as u32, STORE_PATHS);
+    let c2 = c.ensure_closure(e2 as u32, "");
     let p1 = c.paths.iter_mut().find(|p| p.name == "p1").unwrap();
     p1.closures.set(c2);
     let err = b.validate().unwrap_err();
@@ -280,21 +295,29 @@ fn v2_bundles_upgrade_with_the_given_closure_type() {
     v2.releases[r2].datasets.retain(|d| *d != Dataset::Closure);
     v2.format_version = 2;
     v2.closure.as_mut().unwrap().closures.clear();
+    v2.evals.clear();
     let mut buf = Vec::new();
     codec::write(&v2, &mut buf, Format::Json).unwrap();
     let text = String::from_utf8(buf)
         .unwrap()
         .replace("\"closures\":", "\"releases\":");
-    let back = codec::read(text.as_bytes(), "helpers-direct").unwrap();
+    let back = codec::read(text.as_bytes(), "helpers:direct").unwrap();
     back.validate().unwrap();
     assert_eq!(back.format_version, FORMAT_VERSION);
     let c = back.closure.as_ref().unwrap();
-    // Only releases with the closure dataset get a closure.
+    // Only releases with the closure dataset get an evaluation and closure.
+    assert_eq!(
+        back.evals,
+        vec![Eval {
+            release: 0,
+            eval_type: "helpers".into(),
+        }]
+    );
     assert_eq!(
         c.closures,
         vec![Closure {
-            release: 0,
-            closure_type: "helpers-direct".into(),
+            eval: 0,
+            closure_type: "direct".into(),
         }]
     );
     assert!(
@@ -309,14 +332,15 @@ fn v2_bundles_upgrade_with_the_given_closure_type() {
 #[test]
 fn closure_types_merge_and_filter() {
     let rt = sample("r1", &"a".repeat(40), false);
-    let mut helpers = sample_typed("r1", &"a".repeat(40), true, "helpers-direct");
-    helpers.eval_errors = rt.eval_errors.clone();
-    let m = ops::merge([rt.clone(), helpers]);
+    let helpers = sample_typed("r1", &"a".repeat(40), true, "helpers:direct");
+    let m = ops::merge([rt.clone(), helpers, eval_errors("r1", &"a".repeat(40), &[])]);
     m.validate().unwrap();
     assert_eq!(m.releases.len(), 1);
+    // The helpers closure and eval errors share one evaluation.
+    assert_eq!(m.evals.len(), 2);
     let c = m.closure.as_ref().unwrap();
-    let types: Vec<_> = c.closures.iter().map(|c| c.closure_type.as_str()).collect();
-    assert_eq!(types, ["store-paths", "helpers-direct"]);
+    let types: Vec<_> = c.closures.iter().map(|c| m.closure_type(c).to_string()).collect();
+    assert_eq!(types, ["store-paths", "helpers:direct"]);
     let p1 = c.paths.iter().find(|p| p.name == "p1").unwrap();
     assert_eq!(p1.closures.iter().collect::<Vec<_>>(), vec![0, 1]);
     let p5 = c.paths.iter().find(|p| p.name == "p5").unwrap();
@@ -327,16 +351,47 @@ fn closure_types_merge_and_filter() {
         st.closures.iter().map(|c| c.paths).collect::<Vec<_>>(),
         vec![4, 5]
     );
+    let ev: Vec<_> = st
+        .evals
+        .iter()
+        .map(|e| (e.eval_type.as_str(), e.closures, e.errors))
+        .collect();
+    // Evaluations are sorted by release and eval type.
+    assert_eq!(ev, [("helpers", 1, Some(0)), ("store-paths", 1, None)]);
 
-    // Filtering by closure type keeps only that closure.
-    let only_rt = ops::filter(&m, |_| true, None, Some(&["store-paths".to_string()]));
+    let sel = |s: &str| -> Vec<ClosureSelector> { vec![s.parse().unwrap()] };
+    // Filtering by closure type keeps only that closure, and only eval
+    // errors of the selected eval types.
+    let only_rt = ops::filter(&m, |_| true, None, Some(&sel("store-paths")));
     only_rt.validate().unwrap();
-    assert_eq!(ops::merge([only_rt.clone()]), ops::merge([rt]));
+    assert_eq!(only_rt.evals.len(), 1);
+    assert!(only_rt.eval_errors.as_ref().unwrap().evals.is_empty());
+    assert_eq!(only_rt.closure, ops::merge([rt]).closure);
+    let direct = ops::filter(&m, |_| true, None, Some(&sel("helpers:direct")));
+    assert_eq!(direct.evals.len(), 1);
+    assert_eq!(direct.eval_errors.as_ref().unwrap().evals.count(), 1);
+    assert_eq!(ops::filter(&m, |_| true, None, Some(&sel("helpers"))), direct);
     // A release left without closures loses the closure dataset.
-    let none = ops::filter(&m, |_| true, None, Some(&["eval".to_string()]));
+    let none = ops::filter(&m, |_| true, None, Some(&sel("helpers:full")));
     none.validate().unwrap();
     assert!(!none.releases[0].datasets.contains(&Dataset::Closure));
     assert!(none.closure.as_ref().unwrap().paths.is_empty());
+}
+
+#[test]
+fn closure_type_syntax() {
+    let ct: ClosureType = "helpers:full".parse().unwrap();
+    assert_eq!(ct, ClosureType::new("helpers", "full"));
+    assert_eq!(ct.to_string(), "helpers:full");
+    let sp: ClosureType = "store-paths".parse().unwrap();
+    assert_eq!(sp, ClosureType::new(STORE_PATHS, ""));
+    assert_eq!(sp.to_string(), "store-paths");
+    let all: ClosureSelector = "helpers".parse().unwrap();
+    assert!(all.matches("helpers", "direct") && all.matches("helpers", ""));
+    assert!(!all.matches("store-paths", ""));
+    let unnamed: ClosureSelector = "helpers:".parse().unwrap();
+    assert!(unnamed.matches("helpers", "") && !unnamed.matches("helpers", "full"));
+    assert!(":full".parse::<ClosureSelector>().is_err());
 }
 
 #[test]
@@ -348,17 +403,22 @@ fn validate_rejects_closures_of_releases_without_the_dataset() {
 
 #[test]
 fn eval_errors_merge_filter_and_validate() {
-    let r1 = sample("r1", &"a".repeat(40), true);
-    let r2 = sample("r2", &"b".repeat(40), false);
-    let mut r3 = sample("r3", &"c".repeat(40), true);
+    let (a, b, c) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
+    let r1 = eval_errors("r1", &a, &[("fetchhg", "x86_64-linux")]);
+    let r2 = eval_errors("r2", &b, &[]);
     // Same attribute failing on another system is a distinct error.
-    let e = r3.eval_errors.as_mut().unwrap();
-    e.add_error("fetchhg", "aarch64-linux", 0);
-    let m = ops::merge([r1, r2, r3]);
+    let r3 = eval_errors(
+        "r3",
+        &c,
+        &[("fetchhg", "x86_64-linux"), ("fetchhg", "aarch64-linux")],
+    );
+    let m = ops::merge([r1, r2, r3, sample("r1", &a, false)]);
     m.validate().unwrap();
     let e = m.eval_errors.as_ref().unwrap();
-    // Evaluations without errors are kept: they say the evaluation ran.
-    assert_eq!(e.evals.len(), 3);
+    // Covered evaluations without errors stay covered: they had none. The
+    // store-paths evaluation has no error information.
+    assert_eq!(e.evals.iter().collect::<Vec<_>>(), [0, 2, 3]);
+    assert_eq!(m.evals[1].eval_type, STORE_PATHS);
     let keys: Vec<_> = e
         .errors
         .iter()
@@ -373,13 +433,16 @@ fn eval_errors_merge_filter_and_validate() {
     assert_eq!(
         keys,
         [
-            ("fetchhg", "aarch64-linux", vec![2]),
-            ("fetchhg", "x86_64-linux", vec![0, 2]),
+            ("fetchhg", "aarch64-linux", vec![3]),
+            ("fetchhg", "x86_64-linux", vec![0, 3]),
         ]
     );
     let st = ops::stats(&m);
     assert_eq!(st.eval_errors, 2);
-    assert_eq!(st.evals.iter().map(|e| e.errors).collect::<Vec<_>>(), [1, 0, 2]);
+    assert_eq!(
+        st.evals.iter().map(|e| e.errors).collect::<Vec<_>>(),
+        [Some(1), None, Some(0), Some(2)]
+    );
     assert_eq!(
         st.releases.iter().map(|r| r.eval_errors).collect::<Vec<_>>(),
         [1, 0, 2]
@@ -388,16 +451,17 @@ fn eval_errors_merge_filter_and_validate() {
     // Split and re-merge round trips.
     let parts = ops::split(&m);
     assert!(parts[1].eval_errors.as_ref().unwrap().errors.is_empty());
-    assert_eq!(parts[1].eval_errors.as_ref().unwrap().evals.len(), 1);
+    assert_eq!(parts[1].eval_errors.as_ref().unwrap().evals.count(), 1);
     assert_eq!(ops::merge(parts), m);
 
-    // Filtering the section out drops it.
+    // Filtering the section out drops it, and evaluations left with nothing.
     let no = ops::filter(&m, |_| true, Some(&[Dataset::Closure]), None);
     assert!(no.eval_errors.is_none());
+    assert_eq!(no.evals.len(), 1);
     assert!(!no.releases[0].datasets.contains(&Dataset::EvalErrors));
 
     let mut bad = m.clone();
-    bad.releases[0].datasets.retain(|d| *d != Dataset::EvalErrors);
+    bad.releases[1].datasets.retain(|d| *d != Dataset::EvalErrors);
     assert!(
         bad.validate()
             .unwrap_err()
@@ -407,7 +471,8 @@ fn eval_errors_merge_filter_and_validate() {
     let dup = bad.eval_errors.as_ref().unwrap().errors[0].clone();
     bad.eval_errors.as_mut().unwrap().errors.push(dup);
     assert!(bad.validate().unwrap_err().contains("duplicate eval error"));
+    // Errors only in covered evaluations.
     let mut bad = m;
-    bad.eval_errors.as_mut().unwrap().errors[0].evals.set(7);
-    assert!(bad.validate().unwrap_err().contains("out of range"));
+    bad.eval_errors.as_mut().unwrap().errors[0].evals.set(1);
+    assert!(bad.validate().unwrap_err().contains("does not cover"));
 }

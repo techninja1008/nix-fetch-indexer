@@ -58,7 +58,8 @@ A **bundle** holds multiple sections that share one release table:
 ```
 Bundle {
   format_version: u32,
-  releases: [Release],              // release table; bit i of every membership bitset refers to releases[i]
+  releases: [Release],              // release table; bit i of every release bitset refers to releases[i]
+  evals:    [Eval { release: release index, eval_type }],   // evaluations: closures and eval errors refer to these
   closure:  Option<ClosureSection>,
   packages: Option<PackagesSection>,
   outpaths: Option<OutpathsSection>,
@@ -68,7 +69,7 @@ Bundle {
 Release { name, commit, channel, series, url, datasets: [closure|packages|outpaths|programs|eval-errors] }
 
 ClosureSection {
-  closures: [Closure { release: release index, closure_type }],
+  closures: [Closure { eval: eval index, closure_type }],   // closure type name within the eval type; may be empty
   paths: [ClosurePath { hash, name, references: [path index], nar_size, file_size, deriver: Option<String>, closures: Bitset }],
   missing: [MissingPath { hash, name, closures: Bitset }]   // roots that are 404 on the cache
 }
@@ -76,20 +77,24 @@ PackagesSection { entries: [Package { attr, name, pname, version, system, descri
 OutpathsSection { entries: [Outpaths { attr, system, drv_path, outputs: {name: store path}, releases: Bitset }] }
 ProgramsSection { entries: [Program { name, system, attr, releases: Bitset }] }
 EvalErrorsSection {
-  evals: [Eval { release: release index, eval_type }],
+  evals: Bitset,                                           // evaluations whose errors the section holds
   errors: [EvalError { attr, system, evals: Bitset }]      // attributes that failed to evaluate
 }
 ```
 
 - `datasets` on a release records which sections contain data for it.
   - A release can be present in a section and still have zero entries.
-- **Closures (format version 3).** A release can have several closures, one per **closure type**: `store-paths` (runtime closures of `store-paths.xz`), `helpers-direct` and `helpers-full` (build inputs of nixpkgs helpers, found by probes), and later possibly `eval` or `fods`. Closure path and missing-path bitsets index the closure table; other sections' bitsets index releases.
+- **Evaluations and closures (format version 3).** An **evaluation** is a release evaluated in one way, named by its **eval type** (the evaluator): `store-paths` (a pseudo-evaluation: the roots come from Hydra's evaluation via `store-paths.xz`), `helpers` (helper probes), and later possibly a full nixpkgs evaluation or `fods`.
+  - Each evaluation produces closures, one per **closure type** of its eval type. Closure type names are namespaced by eval type, may be empty, and are unique within it: `store-paths` has one unnamed closure type, `helpers` has `direct` and `full`. They are written `<eval type>[:<name>]`, e.g. `store-paths`, `helpers:full`.
+  - A closure refers to its evaluation, not to a release: it inherits the evaluation's release. Every bundle with closures has the evaluations they refer to.
+  - Closure path and missing-path bitsets index the closure table; eval error bitsets index the evaluation table; other sections' bitsets index releases.
   - A closure's release must carry the closure dataset.
-- **Evaluations.** The eval-errors section mirrors the closure section: evaluations (release, **eval type**, e.g. `helper-probes`) play the role of closures, and eval errors that of missing paths. Error bitsets index the section's own evaluation table, so the section stands alone.
+- **Eval errors.** Eval errors are to evaluations what missing paths are to closures.
   - An error is keyed by (attr, system). Evaluation is deterministic, so no message is kept.
-  - An evaluation's release must carry the eval-errors dataset. An evaluation with no errors is kept: it records that the evaluation ran.
+  - For each evaluation the section is either present (its `evals` bit is set: these are all its errors, possibly none) or absent (nothing is known about its errors). Errors may only be in covered evaluations, whose releases must carry the eval-errors dataset.
+  - Eval errors only come from actually evaluating something: an evaluator writes them with its closures. The `store-paths` pseudo-evaluation records none.
   - Out paths are partly the evaluation counterpart of closure paths; folding them into evaluations later would only change the out paths' own details.
-- **Version 2 bundles** have no closure table; their closure bits are release indices. Readers upgrade them, with one closure per release with the closure dataset, of a type the caller chooses (`--v2-closure-type`, default `store-paths`), so no bitset is rewritten.
+- **Version 2 bundles** have no closure or evaluation table; their closure bits are release indices. Readers upgrade them, with one evaluation and closure per release with the closure dataset, of a closure type the caller chooses (`--v2-closure-type`, e.g. `helpers:full`; default `store-paths`), so no bitset is rewritten.
 - **References** are indices into `paths`, which keeps the binary form compact. Paths outside the indexed set do not exist, because the closure is followed transitively.
 - **Bitsets** are encoded as little-endian byte strings.
 - **Binary form:**
@@ -101,33 +106,34 @@ EvalErrorsSection {
 - **JSON form:** the same data model.
   - Structurally identical, with bitsets as hex strings and references as index arrays.
   - It is detected by a leading `{`.
-- **Merge:** union the release tables by name, then the closure tables by (release, type), remap the bitsets, and union entries by key:
+- **Merge:** union the release tables by name, the evaluation tables by (release, eval type) (sorted by release, then eval type), and the closure tables by (evaluation, closure type), remap the bitsets, and union entries by key:
   - closure: hash
   - packages: (attr, version, system, metadata)
   - outpaths: (attr, system, drv_path)
   - programs: (name, system, attr)
-  - eval errors: (attr, system), after unioning the evaluation tables by (release, type)
-- **Split / filter:** select a subset of releases, sections and/or closure types, then drop the entries whose bitset becomes empty. A release left without closures loses the closure dataset.
+  - eval errors: (attr, system); covered evaluations are unioned
+- **Split / filter:** select a subset of releases, sections and/or closure types (by selector: `helpers` selects all of an eval type's closure types, `helpers:full` one; eval errors are kept for the selected eval types), then drop the entries whose bitset becomes empty, and evaluations left with neither closures nor covered errors. A release left without closures loses the closure dataset.
 
 ## Indexers (`nfi-indexer`)
 
-- **Input:** each indexer takes either `--release-url <full URL>` or `--channel-list <prefix>`. The second option enumerates every release under a prefix via the S3 listing API, with optional `--limit` and `--since`.
+- **Command:** `nfi-indexer index` runs the indexers for `--targets` (default `store-paths,packages,programs`). Targets are `packages`, `programs`, `outpaths`, and evaluators or their closure types (`store-paths`, `helpers`, `helpers:direct`, `helpers:full`). Eval errors aren't a target: an evaluator records them with its closures.
+- **Input:** `--release-url <full URL>` or `--channel-list <prefix>`. The second option enumerates every release under a prefix via the S3 listing API, with optional `--limit` and `--since`.
 - **Output:** a bundle written with `-o <file>` and `--format binary|json`.
-- **`closure`**
+- **Closures** (`store-paths`)
   - Fetch `store-paths.xz`, then mass-query narinfos over HTTP/2 with bounded concurrency (default 512), spread over several independent connections (`--connections`, default 8), because the cache caps concurrent streams per connection.
   - Retries back off on 429/5xx.
   - The indexer follows references transitively.
   - Paths that return 404 are recorded in `missing`.
   - `--seed <bundle>` reuses known hashes: store paths are immutable, so only new hashes are fetched. In channel-list mode, each release seeds the next.
-  - `--closure-types` picks the closure types to index (default `store-paths`). Every type goes through the same walk from its roots; only root collection differs.
-- **Helper probes** (`helpers-direct`, `helpers-full`)
+  - Every closure type goes through the same walk from its roots; only root collection differs.
+- **Helper probes** (the `helpers` evaluator: `helpers:direct`, `helpers:full`)
   - nixpkgs helpers build some tools inline, e.g. fetchurl's own bootstrap curl. Those tools, and the stdenv bootstrap, are in no runtime closure of `store-paths.xz`, even though Hydra built and cached them.
   - `probes.nix` (embedded in the indexer) defines probes against the release's unpacked nixexprs, for each `--probe-systems` system (default `x86_64-linux,aarch64-linux`):
     - **fetch probes** call a helper twice with every argument changed. Only derivations shared by both calls are kept, so anything built from the probe's own arguments drops out. Option variants (e.g. fetchgit with submodules or LFS) are separate probes, unioned.
     - **target probes** are roots themselves (stdenv, stdenvNoCC).
-  - Probes guard on helper and argument availability per nixpkgs version; a probe that doesn't apply is left out of `probes'`. Each remaining probe is instantiated separately, so one that fails to evaluate (`nix-instantiate` exits non-zero) doesn't stop the others. It is recorded as an eval error of the release's `helper-probes` evaluation. Failures to run the tools at all, or unexpected output, fail the run.
-  - Probes run once per release for both helper closure types, and their eval errors go in the bundle's eval-errors section. Eval errors can't be requested on their own (`--datasets eval-errors` is refused): they only come from the evaluation that produced them.
-  - `nix derivation show --recursive` gives the probes' graphs. `helpers-direct` roots are the consumed outputs of shared direct inputs (and target outputs); `helpers-full` roots are all outputs of every shared derivation in the build graphs, including bootstrap stages and fixed-output sources.
+  - Probes guard on helper and argument availability per nixpkgs version; a probe that doesn't apply is left out of `probes'`. Each remaining probe is instantiated separately, so one that fails to evaluate (`nix-instantiate` exits non-zero) doesn't stop the others. It is recorded as an eval error of the release's `helpers` evaluation. Failures to run the tools at all, or unexpected output, fail the run.
+  - Probes run once per release for whichever `helpers` closure types are selected; both closures belong to the one evaluation, which also covers its eval errors.
+  - `nix derivation show --recursive` gives the probes' graphs. `direct` roots are the consumed outputs of shared direct inputs (and target outputs); `full` roots are all outputs of every shared derivation in the build graphs, including bootstrap stages and fixed-output sources.
 - **`packages`**
   - Fetch `packages.json.br`, stream-decode brotli, and emit package metadata.
 - **`outpaths`**
@@ -171,15 +177,15 @@ EvalErrorsSection {
 ```
 releases(id, name unique, commit unique, channel, series, url, indexed_at)
 release_datasets(release_id, dataset)
-closure_types(id, name unique)          -- store-paths, helpers-direct, helpers-full, ...
-closures(id, release_id, type_id, unique (release_id, type_id))
+eval_types(id, name unique)             -- store-paths, helpers, ...
+evals(id, release_id, type_id, errors_indexed, unique (release_id, type_id))
+closure_types(id, eval_type_id, name, unique (eval_type_id, name))   -- (store-paths, ''), (helpers, direct), (helpers, full)
+closures(id, eval_id, type_id, unique (eval_id, type_id))            -- type's eval type = evaluation's
 store_paths(id bigserial, hash char(32) unique, name, nar_size, file_size, deriver,
             closures int[],   -- sorted ids of the closures containing the path
             refs bigint[])    -- ids of the path's runtime references
 missing_paths(hash, name, closure_id)
-eval_types(id, name unique)             -- helper-probes, ...
-evals(id, release_id, type_id, unique (release_id, type_id))
-eval_errors(attr, system, eval_id)      -- one row per (error, evaluation), like missing_paths
+eval_errors(attr, system, eval_id)      -- one row per (error, evaluation), like missing_paths; only in evals with errors_indexed
 packages(id, attr, version, system, name, pname, description, homepage, license, main_program, broken, unfree)
 package_releases(package_id, release_id)
 package_outputs(attr, system, release_id, output, path_hash, drv_path)   -- joined from outpaths at ingest
@@ -187,23 +193,25 @@ programs(name, system, attr, release_id)
 jobs(id, kind, status, params jsonb, staged_blob oid/bytea, progress, error, created_at, started_at, finished_at)
 ```
 
-Membership and references are arrays on the path row, not one row per (path, closure) or per edge. Migration 0003 introduced closures by giving each existing release's store-paths closure the release's own id, so existing arrays stayed valid. A channel's releases share most of their paths, so per-pair rows grow quickly: all 87 `nixos-26.05` releases are 2.7M paths, 22.5M memberships and 38M references.
+Membership and references are arrays on the path row, not one row per (path, closure) or per edge. Migration 0003 introduced evaluations and closures by giving each existing release a store-paths evaluation and closure with the release's own id, so existing arrays stayed valid. A channel's releases share most of their paths, so per-pair rows grow quickly: all 87 `nixos-26.05` releases are 2.7M paths, 22.5M memberships and 38M references.
 
 **Ingest of a closure section**
 1. Load the bundle's paths into a temporary table.
 2. Resolve existing paths by hash. Allocate ids for new paths from the sequence; this is safe because writers hold the advisory lock.
 3. Insert the new paths with their references in one statement.
-4. Add the bundle's closure ids to the arrays of existing paths. Closure types and closures are created as needed.
+4. Add the bundle's closure ids to the arrays of existing paths. Eval types, evaluations, closure types and closures are created as needed; an evaluation whose errors the bundle covers gets `errors_indexed`.
 
 A store path's references never change, so they are written only once, when the path is new.
 
-**Prune** removes the pruned closures' ids from the arrays, then deletes paths that are left with no closures. It removes whole releases (their evaluations and eval errors cascade), or with `closure_types` only those closures of the selected releases.
+**Prune** removes the pruned closures' ids from the arrays, then deletes paths that are left with no closures. It removes whole releases (their evaluations, closures and eval errors cascade), or with `closure_types` (selectors) only the matching closures of the selected releases; evaluations left with neither closures nor indexed errors are removed too.
 
 **Invariants.** These replace the foreign keys:
 - every reference resolves to an existing path;
 - every closure id exists;
 - every path belongs to at least one closure;
-- a path's references belong to all of its closures (closures are closed).
+- a path's references belong to all of its closures (closures are closed);
+- a closure's type belongs to its evaluation's eval type;
+- eval errors are only in evaluations whose errors are indexed.
 
 **Enforcement:**
 - `Bundle::validate` rejects open closures.
@@ -246,7 +254,7 @@ A store path's references never change, so they are written only once, when the 
 
 - `POST /admin/v1/ingest` is either a streaming body (binary or JSON bundle) or `{url}`. It returns a job id.
 - `GET /admin/v1/jobs/{id}` and `GET /admin/v1/jobs` show job status.
-- `GET /admin/v1/releases` lists releases and their datasets.
+- `GET /admin/v1/releases` lists releases with their datasets and evaluations (closure types, and errors when indexed).
 - `POST /admin/v1/prune` takes `{releases?:[name], commits?:[hash], channels?:[name]}` and returns a job id.
 - `POST /admin/v1/reindex` returns a job id.
 - `POST /admin/v1/check` returns a job id. The job's result is a consistency report: `ok`, totals, and per issue kind a count and examples.

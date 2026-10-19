@@ -2,12 +2,12 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use nfi_indexer::closure::{ClosureOptions, DEFAULT_CACHE};
 use nfi_indexer::fetch::Fetcher;
-use nfi_indexer::index::{IndexOptions, index_releases_with_report};
+use nfi_indexer::index::{IndexOptions, Target, index_releases_with_report};
 use nfi_indexer::outpaths::OutpathsOptions;
 use nfi_indexer::probes::ProbeOptions;
 use nfi_indexer::release::{self, DEFAULT_RELEASES_BASE, DEFAULT_S3_LIST_BASE, ReleaseLocation};
 use nfi_interchange::codec::{self, Compression, Format};
-use nfi_interchange::{Dataset, STORE_PATHS, ops};
+use nfi_interchange::{ClosureSelector, Dataset, STORE_PATHS, ops};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -18,25 +18,20 @@ use std::path::PathBuf;
 )]
 struct Cli {
     /// Closure type to read version 2 bundles (which predate closure types)
-    /// as.
+    /// as, `<eval type>[:<closure type>]` (e.g. `store-paths`,
+    /// `helpers:full`).
     #[arg(long, global = true, default_value = STORE_PATHS, env = "NFI_V2_CLOSURE_TYPE")]
     v2_closure_type: String,
     #[command(subcommand)]
     cmd: Cmd,
 }
 
+// Parsed once per run, so the size of the index variant doesn't matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Cmd {
-    /// Index the binary cache closure of a release (store-paths.xz + narinfos).
-    Closure(IndexCmd),
-    /// Index packages.json metadata.
-    Packages(IndexCmd),
-    /// Index evaluated output store paths (runs nix-eval-jobs).
-    Outpaths(IndexCmd),
-    /// Index programs.sqlite (command-not-found) from the nixexprs tarball.
-    Programs(IndexCmd),
-    /// Index several datasets in one run (default: closure, packages, programs).
-    All(IndexCmd),
+    /// Index releases into a bundle, running the indexers for `--targets`.
+    Index(IndexCmd),
     /// List the releases under a channel prefix (e.g. nixos/26.05), oldest
     /// first, as `name<TAB>url` lines.
     ListReleases {
@@ -87,9 +82,11 @@ enum Cmd {
         /// Sections to keep (closure, packages, outpaths, programs, eval-errors).
         #[arg(long = "section", value_delimiter = ',')]
         sections: Vec<Dataset>,
-        /// Closure types to keep (e.g. store-paths, helpers-direct).
+        /// Closure types to keep, by evaluator or closure type (e.g.
+        /// `store-paths`, `helpers`, `helpers:direct`). Eval errors are kept
+        /// for the selected evaluators.
         #[arg(long = "closure-type", value_delimiter = ',')]
-        closure_types: Vec<String>,
+        closure_types: Vec<ClosureSelector>,
         #[command(flatten)]
         out: OutArgs,
     },
@@ -145,14 +142,16 @@ struct IndexCmd {
     /// With --channel-list: only releases newer than this release name.
     #[arg(long)]
     since: Option<String>,
-    /// Datasets (for `all`).
-    #[arg(long, value_delimiter = ',')]
-    datasets: Vec<Dataset>,
-    /// Closure types to index: store-paths (runtime closures of
-    /// store-paths.xz), helpers-direct and helpers-full (build inputs of
-    /// nixpkgs helpers, found by instantiating probes; needs Nix).
-    #[arg(long, value_delimiter = ',', default_value = STORE_PATHS)]
-    closure_types: Vec<String>,
+    /// What to index. Closures, by evaluator or closure type (`<eval
+    /// type>[:<closure type>]`): `store-paths` (runtime closures of
+    /// store-paths.xz), `helpers` (build inputs of nixpkgs helpers, found by
+    /// instantiating probes; needs Nix) or one of its closure types,
+    /// `helpers:direct` and `helpers:full`. Running an evaluator also
+    /// records its eval errors. And datasets read from the release:
+    /// `packages` (packages.json), `programs` (programs.sqlite) and
+    /// `outpaths` (runs nix-eval-jobs).
+    #[arg(long, value_delimiter = ',', default_value = "store-paths,packages,programs")]
+    targets: Vec<Target>,
     /// Systems to run helper probes for.
     #[arg(long, value_delimiter = ',', default_value = "x86_64-linux,aarch64-linux")]
     probe_systems: Vec<String>,
@@ -318,13 +317,8 @@ fn log_summary(
     );
 }
 
-async fn run_index(cmd: IndexCmd, default: &[Dataset], v2_closure_type: &str) -> Result<()> {
+async fn run_index(cmd: IndexCmd, v2_closure_type: &str) -> Result<()> {
     let started = std::time::Instant::now();
-    let datasets = if cmd.datasets.is_empty() {
-        default.to_vec()
-    } else {
-        cmd.datasets.clone()
-    };
     let fetcher = Fetcher::with_connections(cmd.retries, cmd.connections)?;
     let mut locations: Vec<ReleaseLocation> = cmd
         .release_urls
@@ -355,8 +349,7 @@ async fn run_index(cmd: IndexCmd, default: &[Dataset], v2_closure_type: &str) ->
         .transpose()
         .context("reading seed")?;
     let opts = IndexOptions {
-        datasets,
-        closure_types: cmd.closure_types.clone(),
+        targets: cmd.targets.clone(),
         probes: ProbeOptions {
             systems: cmd.probe_systems.clone(),
             nix_instantiate: shell_split(&cmd.nix_instantiate)?,
@@ -411,11 +404,7 @@ async fn main() -> Result<()> {
     let v2 = cli.v2_closure_type.as_str();
     let read = |p: &str| codec::read_path_or_stdin(p, v2);
     match cli.cmd {
-        Cmd::Closure(c) => run_index(c, &[Dataset::Closure], v2).await,
-        Cmd::Packages(c) => run_index(c, &[Dataset::Packages], v2).await,
-        Cmd::Outpaths(c) => run_index(c, &[Dataset::Outpaths], v2).await,
-        Cmd::Programs(c) => run_index(c, &[Dataset::Programs], v2).await,
-        Cmd::All(c) => run_index(c, &[Dataset::Closure, Dataset::Packages, Dataset::Programs], v2).await,
+        Cmd::Index(c) => run_index(c, v2).await,
         Cmd::ListReleases {
             prefix,
             since,
@@ -571,7 +560,11 @@ async fn main() -> Result<()> {
                 if !s.evals.is_empty() {
                     println!("evals ({}):", s.evals.len());
                     for e in &s.evals {
-                        println!("  {} {}: errors={}", e.release, e.eval_type, e.errors);
+                        let errors = e.errors.map_or("unknown".to_string(), |n| n.to_string());
+                        println!(
+                            "  {} {}: closures={} errors={errors}",
+                            e.release, e.eval_type, e.closures
+                        );
                     }
                 }
             }

@@ -517,7 +517,19 @@ async fn ingest_rejects_closures_of_releases_without_the_dataset() {
     assert_eq!(n, 0);
 }
 
-/// A helpers-direct closure for release A: a bootstrap tool (path 7) that
+/// The qualified closure types of a release's evaluations.
+fn closure_types(r: &ReleaseInfo) -> Vec<String> {
+    r.evals
+        .iter()
+        .flat_map(|e| {
+            e.closures
+                .iter()
+                .map(|c| ClosureType::new(&e.eval_type, c).to_string())
+        })
+        .collect()
+}
+
+/// A helpers:direct closure for release A: a bootstrap tool (path 7) that
 /// references glibc (path 1), plus an uncached source tarball.
 fn helpers_bundle() -> Bundle {
     let base = bundle();
@@ -525,8 +537,9 @@ fn helpers_bundle() -> Bundle {
     let mut r = base.releases[0].clone();
     r.datasets = vec![Dataset::Closure];
     let ra = b.ensure_release(r);
+    let e = b.ensure_eval(ra as u32, "helpers");
     let mut cb = ClosureBuilder::new();
-    let ci = cb.ensure_closure(ra, "helpers-direct");
+    let ci = cb.ensure_closure(e, "direct");
     let bits = Bitset::single(ci);
     for (n, name, refs) in [(7u8, "curl-bootstrap-8.0", vec![1u8]), (1, "glibc-2.40", vec![1])] {
         cb.insert(
@@ -556,7 +569,7 @@ async fn closure_types_ingest_minimise_and_prune() {
     assert_eq!(result["new_store_paths"], 1);
     assert_eq!(
         result["closures"],
-        json!(["nixos-25.05.100.aaaaaaaaaaaa helpers-direct"])
+        json!(["nixos-25.05.100.aaaaaaaaaaaa helpers:direct"])
     );
 
     let releases = || async {
@@ -571,8 +584,10 @@ async fn closure_types_ingest_minimise_and_prune() {
         rels.into_iter().find(|r| r.commit == A).unwrap()
     };
     let a = releases().await;
-    let types: Vec<_> = a.closures.iter().map(|c| c.closure_type.as_str()).collect();
-    assert_eq!(types, ["store-paths", "helpers-direct"]);
+    // Evaluations are listed in eval type creation order.
+    assert_eq!(closure_types(&a), ["store-paths", "helpers:direct"]);
+    // The helpers evaluation's errors were not part of the bundle.
+    assert_eq!(a.evals[1].errors, None);
 
     // A build-only tool from a helpers closure is a hit.
     let drv = |n: u8, name: &str| format!("{}-{name}.drv", h(100 + n));
@@ -590,7 +605,7 @@ async fn closure_types_ingest_minimise_and_prune() {
     // Pruning one closure type keeps the release and its other closures.
     let r = c
         .admin(reqwest::Method::POST, "/admin/v1/prune")
-        .json(&json!({"channels": ["nixos-25.05"], "closure_types": ["helpers-direct"]}))
+        .json(&json!({"channels": ["nixos-25.05"], "closure_types": ["helpers:direct"]}))
         .send()
         .await
         .unwrap();
@@ -600,12 +615,13 @@ async fn closure_types_ingest_minimise_and_prune() {
     assert_eq!(res["releases"], json!([]));
     assert_eq!(
         res["closures"],
-        json!(["nixos-25.05.100.aaaaaaaaaaaa helpers-direct"])
+        json!(["nixos-25.05.100.aaaaaaaaaaaa helpers:direct"])
     );
     assert_eq!(res["store_paths_removed"], 1);
     let a = releases().await;
-    assert_eq!(a.closures.len(), 1);
-    assert_eq!(a.closures[0].closure_type, "store-paths");
+    // The helpers evaluation had nothing else, so it went too.
+    assert_eq!(closure_types(&a), ["store-paths"]);
+    assert_eq!(a.evals.len(), 1);
     assert!(a.datasets.contains(&"closure".to_string()));
     let n: i64 = sqlx::query_scalar("SELECT count(*) FROM missing_paths")
         .fetch_one(&c.svc.state.pool)
@@ -644,10 +660,11 @@ async fn closure_types_ingest_minimise_and_prune() {
     let mut v2 = helpers_bundle();
     v2.format_version = 2;
     v2.closure.as_mut().unwrap().closures.clear();
+    v2.evals.clear();
     let r = c
         .admin(
             reqwest::Method::POST,
-            "/admin/v1/ingest?v2_closure_type=helpers-full",
+            "/admin/v1/ingest?v2_closure_type=helpers:full",
         )
         .body(encode(&v2, Format::Json))
         .send()
@@ -656,8 +673,7 @@ async fn closure_types_ingest_minimise_and_prune() {
     let j = c.wait_job(r.json::<JobCreated>().await.unwrap().id).await;
     assert_eq!(j.status, JobStatus::Succeeded, "{:?}", j.error);
     let a = releases().await;
-    let types: Vec<_> = a.closures.iter().map(|c| c.closure_type.as_str()).collect();
-    assert_eq!(types, ["store-paths", "helpers-full"]);
+    assert_eq!(closure_types(&a), ["store-paths", "helpers:full"]);
 
     let r = c
         .admin(reqwest::Method::POST, "/admin/v1/check")
@@ -680,7 +696,7 @@ fn eval_errors_bundle() -> Bundle {
         let mut r = r.clone();
         r.datasets = vec![Dataset::EvalErrors];
         let ri = b.ensure_release(r);
-        let ev = e.ensure_eval(ri as u32, "helper-probes");
+        let ev = b.ensure_eval(ri as u32, "helpers");
         e.add_error("fetchhg", "x86_64-linux", ev);
         if i == 0 {
             e.add_error("fetchsvn", "aarch64-linux", ev);
@@ -717,13 +733,31 @@ async fn eval_errors_ingest_and_prune() {
     let rels = releases().await;
     assert_eq!(rels[0].commit, A);
     assert!(rels[0].datasets.contains(&"eval-errors".to_string()));
-    assert_eq!(rels[0].evals.len(), 1);
-    assert_eq!(rels[0].evals[0].eval_type, "helper-probes");
+    // The store-paths pseudo-evaluation (from the first bundle) has no
+    // error information; the helpers evaluation has no closures.
+    let ev: Vec<_> = rels[0]
+        .evals
+        .iter()
+        .map(|e| (e.eval_type.as_str(), e.closures.len(), e.errors.clone()))
+        .collect();
     assert_eq!(
-        rels[0].evals[0].errors,
-        ["fetchhg@x86_64-linux", "fetchsvn@aarch64-linux"]
+        ev,
+        [
+            ("store-paths", 1, None),
+            (
+                "helpers",
+                0,
+                Some(vec![
+                    "fetchhg@x86_64-linux".to_string(),
+                    "fetchsvn@aarch64-linux".to_string()
+                ])
+            ),
+        ]
     );
-    assert_eq!(rels[1].evals[0].errors, ["fetchhg@x86_64-linux"]);
+    assert_eq!(
+        rels[1].evals[1].errors,
+        Some(vec!["fetchhg@x86_64-linux".to_string()])
+    );
 
     let check = || async {
         let r = c
@@ -736,7 +770,19 @@ async fn eval_errors_ingest_and_prune() {
     };
     let report = check().await;
     assert!(report.ok, "{report:?}");
-    assert_eq!((report.evals, report.eval_errors), (2, 3));
+    assert_eq!((report.evals, report.eval_errors), (4, 3));
+
+    // Pruning the helpers closures of a release keeps its helpers
+    // evaluation while its errors are known.
+    let r = c
+        .admin(reqwest::Method::POST, "/admin/v1/prune")
+        .json(&json!({"commits": [A], "closure_types": ["helpers"]}))
+        .send()
+        .await
+        .unwrap();
+    let j = c.wait_job(r.json::<JobCreated>().await.unwrap().id).await;
+    assert_eq!(j.status, JobStatus::Succeeded, "{:?}", j.error);
+    assert_eq!(check().await.evals, 4);
 
     // Pruning a release removes its evaluations and their errors.
     let r = c
@@ -748,7 +794,8 @@ async fn eval_errors_ingest_and_prune() {
     let j = c.wait_job(r.json::<JobCreated>().await.unwrap().id).await;
     assert_eq!(j.status, JobStatus::Succeeded, "{:?}", j.error);
     let report = check().await;
-    assert_eq!((report.evals, report.eval_errors), (1, 1));
+    assert!(report.ok, "{report:?}");
+    assert_eq!((report.evals, report.eval_errors), (2, 1));
 }
 
 /// Migration 0003 turns existing release membership into store-paths
@@ -780,15 +827,24 @@ async fn closure_types_migration_keeps_ids() {
     .await
     .unwrap();
     run("0003_closure_types.sql").await;
-    let closures: Vec<(i32, i32, String)> = sqlx::query_as(
-        "SELECT c.id, c.release_id, t.name FROM closures c JOIN closure_types t ON t.id = c.type_id ORDER BY c.id",
+    // Each release with the closure dataset gets a store-paths evaluation
+    // and its unnamed closure, both with the release's id.
+    let closures: Vec<(i32, i32, i32, String, String)> = sqlx::query_as(
+        "SELECT c.id, e.id, e.release_id, et.name, ct.name FROM closures c
+           JOIN evals e ON e.id = c.eval_id
+           JOIN eval_types et ON et.id = e.type_id
+           JOIN closure_types ct ON ct.id = c.type_id AND ct.eval_type_id = et.id
+          ORDER BY c.id",
     )
     .fetch_all(&pool)
     .await
     .unwrap();
     assert_eq!(
         closures,
-        vec![(3, 3, "store-paths".into()), (5, 5, "store-paths".into())]
+        vec![
+            (3, 3, 3, "store-paths".into(), "".into()),
+            (5, 5, 5, "store-paths".into(), "".into())
+        ]
     );
     let paths: Vec<(String, Vec<i32>)> =
         sqlx::query_as("SELECT hash, closures FROM store_paths ORDER BY hash")
@@ -801,11 +857,19 @@ async fn closure_types_migration_keeps_ids() {
         .await
         .unwrap();
     assert_eq!(missing, vec![("h9".into(), 3)]);
-    // New closures get ids past every release id, so they can't collide
-    // with ids still being assigned 1:1.
-    let id: i32 = sqlx::query_scalar(
-        "INSERT INTO closures (release_id, type_id) SELECT 7, id FROM closure_types RETURNING id",
+    // New evaluations and closures get ids past every release id, so they
+    // can't collide with ids still being assigned 1:1.
+    let eval: i32 = sqlx::query_scalar(
+        "INSERT INTO evals (release_id, type_id) SELECT 7, id FROM eval_types RETURNING id",
     )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(eval > 7, "{eval}");
+    let id: i32 = sqlx::query_scalar(
+        "INSERT INTO closures (eval_id, type_id) SELECT $1, id FROM closure_types RETURNING id",
+    )
+    .bind(eval)
     .fetch_one(&pool)
     .await
     .unwrap();

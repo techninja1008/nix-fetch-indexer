@@ -26,12 +26,9 @@ async fn live_end_to_end() {
             let fetcher = nfi_indexer::fetch::Fetcher::new(4).unwrap();
             let loc = nfi_indexer::release::ReleaseLocation::parse(&release_url).unwrap();
             let opts = nfi_indexer::index::IndexOptions {
-                datasets: vec![
-                    nfi_interchange::Dataset::Closure,
-                    nfi_interchange::Dataset::Packages,
-                    nfi_interchange::Dataset::Programs,
-                ],
-                closure_types: vec![nfi_interchange::STORE_PATHS.into()],
+                targets: ["store-paths", "packages", "programs"]
+                    .map(|t| t.parse().unwrap())
+                    .to_vec(),
                 closure: nfi_indexer::closure::ClosureOptions {
                     sample: Some(200),
                     ..Default::default()

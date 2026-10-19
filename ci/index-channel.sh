@@ -10,10 +10,11 @@
 #   per_release  publish each release as its own GitHub release (tag = release
 #                name) with one asset per dataset: <release>-<dataset>.nfib
 #
-# Datasets are the indexer's sections, except that closure sections are split
-# by closure type: `closure` holds the store-paths closures, `helpers-direct`
-# and `helpers-full` the helper probe closures (indexing them needs Nix).
-# Both helper datasets also carry the eval errors of the probes they come from.
+# Published datasets map to indexer targets. Closures are split by closure
+# type: `closure` holds the `store-paths` closures, `helpers-direct` and
+# `helpers-full` the `helpers:direct` and `helpers:full` closures (indexing
+# them needs Nix). Closure datasets also carry the eval errors of their
+# evaluator, if it records any.
 #   cumulative   maintain <series>-<dataset>-cumulative.nfib assets on the
 #                channel's GitHub release (tag = channel name)
 #   start        "all" to backfill every release on first run, "latest" to
@@ -34,7 +35,7 @@
 #                     instead of indexing new releases, add these datasets (e.g.
 #                     helpers-direct,helpers-full) to releases already recorded
 #                     that lack them
-#   NFI_INDEX_ARGS    extra arguments for `nfi-indexer all` (e.g. --sample 50)
+#   NFI_INDEX_ARGS    extra arguments for `nfi-indexer index` (e.g. --sample 50)
 #   NFI_WORK          work directory (default: a temporary directory)
 set -euo pipefail
 
@@ -54,34 +55,39 @@ IFS=, read -r -a datasets <<<"$DATASETS"
 
 log() { echo "[$channel] $*" >&2; }
 
-# Published dataset -> indexer section and closure type.
-ds_section() { case $1 in closure | helpers-*) echo closure ;; *) echo "$1" ;; esac; }
-ds_closure_type() { case $1 in closure) echo store-paths ;; helpers-*) echo "$1" ;; *) echo "" ;; esac; }
-sections=() closure_types=() closure_datasets=()
+# Published dataset -> closure type (empty for datasets that aren't closures).
+ds_closure_type() {
+  case $1 in
+    closure) echo store-paths ;;
+    helpers-*) echo "helpers:${1#helpers-}" ;;
+    *) echo "" ;;
+  esac
+}
+# Published dataset -> indexer target.
+ds_target() { local ct; ct=$(ds_closure_type "$1"); echo "${ct:-$1}"; }
+targets=() closure_datasets=()
 for ds in "${datasets[@]}"; do
-  sec=$(ds_section "$ds")
-  [[ " ${sections[*]} " == *" $sec "* ]] || sections+=("$sec")
-  ct=$(ds_closure_type "$ds")
-  [[ -n $ct ]] && closure_types+=("$ct") closure_datasets+=("$ds")
+  targets+=("$(ds_target "$ds")")
+  [[ -n $(ds_closure_type "$ds") ]] && closure_datasets+=("$ds")
 done
-INDEX_DATASETS=$(IFS=,; echo "${sections[*]}")
-CLOSURE_TYPES=$(IFS=,; echo "${closure_types[*]}")
-# filter_ds <bundle> <dataset> <out>: the dataset's part of a bundle. Helper
-# datasets keep the eval errors of the probes that produced them.
+TARGETS=$(IFS=,; echo "${targets[*]}")
+# filter_ds <bundle> <dataset> <out>: the dataset's part of a bundle. A
+# closure dataset keeps its evaluator's eval errors.
 filter_ds() {
-  local ct sec
+  local ct
   ct=$(ds_closure_type "$2")
-  sec=$(ds_section "$2")
-  [[ $2 == helpers-* ]] && sec+=,eval-errors
-  "$NFI" filter "$1" --section "$sec" ${ct:+--closure-type "$ct"} -o "$3"
+  if [[ -n $ct ]]; then
+    "$NFI" filter "$1" --section closure,eval-errors --closure-type "$ct" -o "$3"
+  else
+    "$NFI" filter "$1" --section "$2" -o "$3"
+  fi
 }
 # index <out> <url>...: index releases into one bundle (seeded from $seed).
 index() {
   local out=$1 url args=()
   shift
   for url in "$@"; do args+=(--release-url "$url"); done
-  "$NFI" all "${args[@]}" --datasets "$INDEX_DATASETS" ${CLOSURE_TYPES:+--closure-types "$CLOSURE_TYPES"} \
-    ${seed:+--seed "$seed"} "${INDEX_ARGS[@]}" -o "$out"
+  "$NFI" index "${args[@]}" --targets "$TARGETS" ${seed:+--seed "$seed"} "${INDEX_ARGS[@]}" -o "$out"
 }
 
 cfg=$(NFI_INDEXER=$NFI "$here/channels.sh" "$channel")
@@ -199,9 +205,9 @@ notes_for() { # <bundle> -> markdown summary of its releases, closures and evals
       "", "| closure | paths | missing |", "|---|---:|---:|",
       (.closures[] | "| \(.release) \(.closure_type) | \(.paths) | \(.missing) |")
     else empty end,
-    if ((.evals // []) | length) > 0 then
-      "", "| eval | errors |", "|---|---:|",
-      (.evals[] | "| \(.release) \(.eval_type) | \(.errors) |")
+    if ([(.evals // [])[] | select(.errors != null)] | length) > 0 then
+      "", "| evaluation | errors |", "|---|---:|",
+      (.evals[] | select(.errors != null) | "| \(.release) \(.eval_type) | \(.errors) |")
     else empty end'
 }
 

@@ -40,7 +40,8 @@ enum Cmd {
         #[arg(required = true)]
         sources: Vec<String>,
         /// Closure type to read version 2 bundles (which predate closure
-        /// types) as [service default: store-paths].
+        /// types) as, `<eval type>[:<closure type>]` (e.g. `helpers:full`)
+        /// [service default: store-paths].
         #[arg(long)]
         v2_closure_type: Option<String>,
         /// Wait for each job to finish.
@@ -55,7 +56,8 @@ enum Cmd {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
-    /// List releases with the datasets and closure types present for each.
+    /// List releases with their datasets, and their evaluations with their
+    /// closure types and error counts.
     Releases {
         /// Only releases in this channel.
         #[arg(long)]
@@ -70,8 +72,9 @@ enum Cmd {
         commits: Vec<String>,
         #[arg(long = "channel")]
         channels: Vec<String>,
-        /// Only remove closures of these types (e.g. helpers-full), keeping
-        /// the releases and their other data.
+        /// Only remove the closures matching these selectors, keeping the
+        /// releases and their other data: an evaluator (e.g. `helpers`) or
+        /// one of its closure types (e.g. `helpers:full`).
         #[arg(long = "closure-type", value_delimiter = ',')]
         closure_types: Vec<String>,
         #[arg(long)]
@@ -278,25 +281,33 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 println!("{}", serde_json::to_string_pretty(&rels)?);
             } else {
                 println!(
-                    "{:<40} {:<18} {:<12} {:<42} {:<28} {:<44} EVALS",
-                    "RELEASE", "CHANNEL", "SERIES", "COMMIT", "DATASETS", "CLOSURES"
+                    "{:<40} {:<18} {:<12} {:<42} {:<28} EVALS",
+                    "RELEASE", "CHANNEL", "SERIES", "COMMIT", "DATASETS"
                 );
                 for r in &rels {
-                    let closures: Vec<&str> = r.closures.iter().map(|c| c.closure_type.as_str()).collect();
+                    // e.g. `helpers[direct,full] (2 errors)`, `store-paths`.
                     let evals: Vec<String> = r
                         .evals
                         .iter()
-                        .map(|e| format!("{} ({} errors)", e.eval_type, e.errors.len()))
+                        .map(|e| {
+                            let mut s = e.eval_type.clone();
+                            if e.closures.iter().any(|c| !c.is_empty()) {
+                                s += &format!("[{}]", e.closures.join(","));
+                            }
+                            if let Some(errors) = &e.errors {
+                                s += &format!(" ({} errors)", errors.len());
+                            }
+                            s
+                        })
                         .collect();
                     println!(
-                        "{:<40} {:<18} {:<12} {:<42} {:<28} {:<44} {}",
+                        "{:<40} {:<18} {:<12} {:<42} {:<28} {}",
                         r.name,
                         r.channel,
                         r.series,
                         r.commit,
                         r.datasets.join(","),
-                        closures.join(","),
-                        evals.join(",")
+                        evals.join(", ")
                     );
                 }
             }

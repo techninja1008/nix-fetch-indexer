@@ -49,6 +49,20 @@ const CHECKS: &[Check] = &[
         example: "format('%s-%s (closures %s) references %s-%s (closures %s)',
                          s.hash, s.name, s.closures, t.hash, t.name, t.closures)",
     },
+    Check {
+        kind: "foreign_closure_types",
+        description: "closures whose closure type belongs to another eval type than their evaluation",
+        from: "FROM closures c JOIN evals e ON e.id = c.eval_id
+               JOIN closure_types ct ON ct.id = c.type_id
+               WHERE ct.eval_type_id <> e.type_id",
+        example: "format('closure %s (type %s) of eval %s', c.id, ct.id, e.id)",
+    },
+    Check {
+        kind: "unindexed_eval_errors",
+        description: "eval errors of evaluations whose errors are not marked as indexed",
+        from: "FROM eval_errors x JOIN evals e ON e.id = x.eval_id WHERE NOT e.errors_indexed",
+        example: "format('%s@%s in eval %s', x.attr, x.system, e.id)",
+    },
 ];
 
 /// Run all checks in one read-only snapshot.

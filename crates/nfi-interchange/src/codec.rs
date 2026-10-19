@@ -214,7 +214,8 @@ pub fn read<R: Read>(r: R, v2_closure_type: &str) -> Result<Bundle> {
 
 pub fn read_detect<R: Read>(r: R, v2_closure_type: &str) -> Result<(Bundle, Detected)> {
     let (mut bundle, detected) = decode(r)?;
-    bundle.upgrade(v2_closure_type);
+    let v2: crate::ClosureType = v2_closure_type.parse().map_err(anyhow::Error::msg)?;
+    bundle.upgrade(&v2);
     Ok((bundle, detected))
 }
 
