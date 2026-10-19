@@ -312,7 +312,11 @@ esac
         "fake-nix",
         &format!("cat {}\n", dir.path().join("graph.json").display()),
     );
-    let mut o = opts(&base, targets("store-paths,helpers"), Path::new("/bin/false"));
+    let mut o = opts(
+        &base,
+        targets("store-paths,helpers:direct,helpers:full"),
+        Path::new("/bin/false"),
+    );
     o.probes = ProbeOptions {
         systems: vec!["x86_64-linux".into()],
         nix_instantiate: vec![instantiate],
@@ -375,6 +379,9 @@ esac
     assert_eq!(b.eval_errors.as_ref().unwrap().errors.len(), 1);
     // Unknown targets are rejected.
     assert!("helpers:nope".parse::<Target>().is_err());
+    // An evaluator is not a target: it has no closure type of its own.
+    assert!("helpers".parse::<Target>().is_err());
+    assert!("store-paths".parse::<Target>().is_ok());
     assert!("eval-errors".parse::<Target>().is_err());
 }
 

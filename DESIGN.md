@@ -10,7 +10,7 @@ A single Cargo workspace:
 | crate | kind | purpose |
 |---|---|---|
 | `nfi-interchange` | lib | Interchange bundle data model, CBOR + compression codec, JSON codec, merge/split/filter |
-| `nfi-indexer` | bin | Indexers (`index --targets`: closures of the `store-paths` and `helpers` evaluators, `packages`, `outpaths`, `programs`), plus offline bundle tooling (`merge`, `split`, `filter`, `convert`, `inspect`) |
+| `nfi-indexer` | bin | Indexers (`index --targets`: closure types `store-paths`, `helpers:direct` and `helpers:full`, `packages`, `outpaths`, `programs`), plus offline bundle tooling (`merge`, `split`, `filter`, `convert`, `inspect`) |
 | `nfi-service` | bin | Query service (axum HTTP/JSON, Postgres, Meilisearch) |
 | `nfi` | bin | Query CLI (non-administrative endpoints, fetch hook, flake-ref resolution) |
 | `nfi-admin` | bin | Admin CLI (ingest, list releases, prune, reindex, job status) |
@@ -116,7 +116,7 @@ EvalErrorsSection {
 
 ## Indexers (`nfi-indexer`)
 
-- **Command:** `nfi-indexer index` runs the indexers for `--targets` (default `store-paths,packages,programs`). Targets are `packages`, `programs`, `outpaths`, and evaluators or their closure types (`store-paths`, `helpers`, `helpers:direct`, `helpers:full`). Eval errors aren't a target: an evaluator records them with its closures.
+- **Command:** `nfi-indexer index` runs the indexers for `--targets` (default `store-paths,packages,programs`). Targets are `packages`, `programs`, `outpaths`, and closure types (`store-paths`, `helpers:direct`, `helpers:full`); an evaluator alone isn't a target. Eval errors aren't a target: an evaluator records them with its closures.
 - **Input:** `--release-url <full URL>` or `--channel-list <prefix>`. The second option enumerates every release under a prefix via the S3 listing API, with optional `--limit` and `--since`.
 - **Output:** a bundle written with `-o <file>` and `--format binary|json`.
 - **Closures** (`store-paths`)

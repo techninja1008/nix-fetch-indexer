@@ -142,13 +142,12 @@ struct IndexCmd {
     /// With --channel-list: only releases newer than this release name.
     #[arg(long)]
     since: Option<String>,
-    /// What to index. Closures, by evaluator or closure type (`<eval
-    /// type>[:<closure type>]`): `store-paths` (runtime closures of
-    /// store-paths.xz), `helpers` (build inputs of nixpkgs helpers, found by
-    /// instantiating probes; needs Nix) or one of its closure types,
-    /// `helpers:direct` and `helpers:full`. Running an evaluator also
-    /// records its eval errors. And datasets read from the release:
-    /// `packages` (packages.json), `programs` (programs.sqlite) and
+    /// What to index. Closure types (`<eval type>[:<closure type>]`):
+    /// `store-paths` (runtime closures of store-paths.xz), `helpers:direct`
+    /// and `helpers:full` (build inputs of nixpkgs helpers, found by
+    /// instantiating probes, once for both; needs Nix). Running an
+    /// evaluator also records its eval errors. And datasets read from the
+    /// release: `packages` (packages.json), `programs` (programs.sqlite) and
     /// `outpaths` (runs nix-eval-jobs).
     #[arg(long, value_delimiter = ',', default_value = "store-paths,packages,programs")]
     targets: Vec<Target>,

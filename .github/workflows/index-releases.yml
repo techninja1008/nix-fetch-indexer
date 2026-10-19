@@ -23,7 +23,7 @@ on:
         required: false
         default: "0"
       backfill_targets:
-        description: "Instead of new releases, index these targets for recorded releases lacking any of their outputs (e.g. helpers)"
+        description: "Instead of new releases, index these targets for recorded releases lacking any of their outputs (e.g. helpers:direct,helpers:full)"
         required: false
         default: ""
 

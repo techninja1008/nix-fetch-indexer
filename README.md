@@ -52,13 +52,13 @@ nfi-indexer index --channel-list nixos/25.05 --limit 3 -o recent.nfib
 nfi-indexer index --release-url $R2 --targets store-paths --seed closure.nfib -o closure-2.nfib
 
 # Build inputs of nixpkgs helpers (needs Nix), alongside the runtime closures:
-nfi-indexer index --release-url $R --targets store-paths,helpers -o closures.nfib
+nfi-indexer index --release-url $R --targets store-paths,helpers:direct,helpers:full -o closures.nfib
 nfi-indexer index --release-url $R --targets helpers:direct -o helpers-direct.nfib
 ```
 
 **Targets**
 
-`--targets` names what to index. Datasets read from the release are `packages`, `programs` and `outpaths`. Closures are named by the **evaluator** that produces their roots and, within it, the **closure type**, as `<evaluator>[:<closure type>]`: a bare evaluator selects all of its closure types.
+`--targets` names what to index. Datasets read from the release are `packages`, `programs` and `outpaths`. Closures are named by their closure type, `<evaluator>[:<closure type>]`: the **evaluator** that produces their roots and, within it, the closure type's name, which only `store-paths` leaves empty. An evaluator alone (`helpers`) isn't a target, since it has no closure type of its own. Closure types of one evaluator selected together share one evaluation.
 
 **Evaluations and closures**
 
@@ -111,7 +111,7 @@ nfi-indexer bench-compression ab.nfib
 The `Index releases` workflow (`.github/workflows/index-releases.yml`) runs every six hours, and can also be started by hand for one channel with a cap on how many new releases to index. It only uploads: bundles are published as GitHub release assets on [`techninja1008/nix-fetch-indexer-data`](https://github.com/techninja1008/nix-fetch-indexer-data), and nothing is ingested anywhere.
 
 1. A plan job builds `nfi-indexer` once. [`ci/channels.sh`](ci/channels.sh) discovers the channels on releases.nixos.org, and [`ci/plan.sh`](ci/plan.sh) keeps those with releases not yet published.
-2. One job per such channel runs [`ci/index-channel.sh`](ci/index-channel.sh), which indexes the new releases and uploads binary bundles. What is indexed is set as indexer targets (`targets` in [`ci/config.json`](ci/config.json): `store-paths,helpers,packages,programs`). Each release is indexed in one run for all targets (both helper closure types share one probe run), and the result is split into one output per closure type (`store-paths`, `helpers-direct`, `helpers-full`), one per evaluator that records eval errors (`helpers-eval-errors`), and one per other target (`packages`, `programs`). The helper closures are separate outputs because `helpers-full` is much larger: it reaches the whole stdenv bootstrap.
+2. One job per such channel runs [`ci/index-channel.sh`](ci/index-channel.sh), which indexes the new releases and uploads binary bundles. What is indexed is set as indexer targets (`targets` in [`ci/config.json`](ci/config.json): `store-paths,helpers:direct,helpers:full,packages,programs`). Each release is indexed in one run for all targets (both helper closure types share one probe run), and the result is split into one output per closure type (`store-paths`, `helpers-direct`, `helpers-full`), one per evaluator that records eval errors (`helpers-eval-errors`), and one per other target (`packages`, `programs`). The helper closures are separate outputs because `helpers-full` is much larger: it reaches the whole stdenv bootstrap.
 
 **Channels.** Channels are discovered automatically according to the policy in [`ci/config.json`](ci/config.json); `-small` and `-aarch64` channels are skipped.
 
@@ -131,7 +131,7 @@ A stable channel only gets releases for about a month after the next one ships; 
 
 **Seeding.** A release usually shares nearly all of its closures with the previous release in the same channel, and very little with older ones. Each new release is therefore seeded with the previous release's closures only, of every closure type. For per-release channels, the seed comes from the previous release's closure assets. For cumulative-only channels, it is filtered out of the cumulative bundles. With the seed, only narinfos that are new are fetched.
 
-**Backfill.** Targets added later, such as `helpers`, can be indexed for releases that are already recorded: set the workflow's `backfill_targets` input (or `NFI_BACKFILL_TARGETS`) to e.g. `helpers`. Instead of indexing new releases, the run indexes those targets for recorded releases that lack any of their outputs, uploads their per-release assets, and folds them into the cumulative bundles.
+**Backfill.** Targets added later, such as the helper closure types, can be indexed for releases that are already recorded: set the workflow's `backfill_targets` input (or `NFI_BACKFILL_TARGETS`) to e.g. `helpers:direct,helpers:full`. Instead of indexing new releases, the run indexes those targets for recorded releases that lack any of their outputs, uploads their per-release assets, and folds them into the cumulative bundles. A release's notes are rewritten to cover all of its outputs, including those published before.
 
 **Recovery.** If a run fails after publishing some per-release bundles but before updating `releases.txt`, the next run reuses those bundles instead of indexing them again. Merging a release that is already in a cumulative bundle is a no-op.
 
@@ -386,7 +386,7 @@ NFI_LIVE_TESTS=1 NFI_LIVE_BUNDLE=full.nfib cargo test --release -p nfi --test li
 
 ### Acceptance test: minimise this repository
 
-`nfi minimise .#nfi`, run against the exact nixpkgs release in `flake.lock` (`nixos-26.11pre1092090.55bfb4d7437b`), should only plan derivations that cache.nixos.org doesn't have. Indexed with `--targets store-paths,helpers`:
+`nfi minimise .#nfi`, run against the exact nixpkgs release in `flake.lock` (`nixos-26.11pre1092090.55bfb4d7437b`), should only plan derivations that cache.nixos.org doesn't have. Indexed with `--targets store-paths,helpers:direct,helpers:full`:
 
 | | store-paths only | with helper closures |
 |---|---:|---:|

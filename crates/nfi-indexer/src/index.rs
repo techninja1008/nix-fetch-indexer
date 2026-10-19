@@ -12,12 +12,12 @@ use nfi_interchange::*;
 /// The evaluators and the closure types each produces.
 pub const EVALUATORS: &[(&str, &[&str])] = &[(STORE_PATHS, &[""]), (HELPERS, &[DIRECT, FULL])];
 
-/// Something an indexing run produces: closures of an evaluator (all of
-/// its closure types, or one: `helpers`, `helpers:full`), or one of the
-/// datasets that are read rather than evaluated.
+/// Something an indexing run produces: the closures of one closure type
+/// (`store-paths`, `helpers:direct`, `helpers:full`), or one of the datasets
+/// that are read rather than evaluated.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
-    Closures(ClosureSelector),
+    Closures(ClosureType),
     Packages,
     Programs,
     Outpaths,
@@ -31,22 +31,22 @@ impl std::str::FromStr for Target {
             "programs" => Target::Programs,
             "outpaths" => Target::Outpaths,
             _ => {
-                let sel: ClosureSelector = s.parse()?;
+                let ct: ClosureType = s.parse()?;
                 if !EVALUATORS
                     .iter()
-                    .any(|(e, names)| *e == sel.eval_type && names.iter().any(|n| sel.matches(e, n)))
+                    .any(|(e, names)| *e == ct.eval_type && names.contains(&ct.name.as_str()))
                 {
                     let known: Vec<String> = EVALUATORS
                         .iter()
                         .flat_map(|(e, names)| names.iter().map(|n| ClosureType::new(e, n).to_string()))
                         .collect();
                     return Err(format!(
-                        "unknown target {s:?} (expected packages, programs, outpaths, an evaluator \
-                         or a closure type: {})",
+                        "unknown target {s:?} (expected packages, programs, outpaths or a closure \
+                         type: {})",
                         known.join(", ")
                     ));
                 }
-                Target::Closures(sel)
+                Target::Closures(ct)
             }
         })
     }
@@ -55,7 +55,7 @@ impl std::str::FromStr for Target {
 impl std::fmt::Display for Target {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Target::Closures(s) => s.fmt(f),
+            Target::Closures(ct) => ct.fmt(f),
             Target::Packages => f.write_str("packages"),
             Target::Programs => f.write_str("programs"),
             Target::Outpaths => f.write_str("outpaths"),
@@ -69,10 +69,9 @@ pub fn closure_types(targets: &[Target]) -> Vec<ClosureType> {
         .iter()
         .flat_map(|(e, names)| names.iter().map(|n| ClosureType::new(e, n)))
         .filter(|ct| {
-            targets.iter().any(|t| match t {
-                Target::Closures(s) => s.matches(&ct.eval_type, &ct.name),
-                _ => false,
-            })
+            targets
+                .iter()
+                .any(|t| matches!(t, Target::Closures(c) if c == ct))
         })
         .collect()
 }

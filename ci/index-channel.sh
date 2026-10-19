@@ -15,8 +15,9 @@
 #                start from the newest release
 #
 # What is indexed is given as indexer targets (`nfi-indexer index --targets`),
-# e.g. store-paths,helpers,packages,programs. Each release is indexed in one
-# run for all targets, then split into outputs, one file each:
+# e.g. store-paths,helpers:direct,helpers:full,packages,programs. Each release
+# is indexed in one run for all targets, then split into outputs, one file
+# each:
 #   - one per closure type: `store-paths`, `helpers-direct`, `helpers-full`
 #     (`<eval type>[-<closure type>]`; the helpers ones need Nix);
 #   - one per evaluator that records eval errors: `helpers-eval-errors`;
@@ -35,8 +36,8 @@
 #   NFI_MAX_RELEASES  index at most this many new releases per run (default: all)
 #   NFI_BACKFILL_TARGETS
 #                     instead of indexing new releases, index these targets
-#                     (e.g. helpers) for releases already recorded that lack
-#                     any of their outputs
+#                     (e.g. helpers:direct,helpers:full) for releases already
+#                     recorded that lack any of their outputs
 #   NFI_INDEX_ARGS    extra arguments for `nfi-indexer index` (e.g. --sample 50)
 #   NFI_WORK          work directory (default: a temporary directory)
 set -euo pipefail
@@ -47,9 +48,9 @@ channel=${1:?usage: index-channel.sh [--check] <channel>}
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 NFI=${NFI_INDEXER:-nfi-indexer}
 export NFI_CONFIG=${NFI_CONFIG:-$here/config.json}
-TARGETS=${NFI_TARGETS:-$(jq -r '.targets // "store-paths,packages,programs"' "$NFI_CONFIG")}
+POLICY_TARGETS=${NFI_TARGETS:-$(jq -r '.targets // "store-paths,packages,programs"' "$NFI_CONFIG")}
 BACKFILL=${NFI_BACKFILL_TARGETS:-}
-[[ -n $BACKFILL ]] && TARGETS=$BACKFILL
+TARGETS=${BACKFILL:-$POLICY_TARGETS}
 MAX=${NFI_MAX_RELEASES:-0}
 STORE=${NFI_STORE:?set NFI_STORE to gh:<owner>/<repo> or dir:<path>}
 read -r -a INDEX_ARGS <<<"${NFI_INDEX_ARGS:-}"
@@ -57,36 +58,46 @@ IFS=, read -r -a targets <<<"$TARGETS"
 
 log() { echo "[$channel] $*" >&2; }
 
-# Evaluators and their closure types (empty: unnamed), and the evaluators
-# that record eval errors.
-declare -A closure_types=([store-paths]="" [helpers]="direct full")
+# Closure type targets, and the evaluators that record eval errors.
+closure_targets=" store-paths helpers:direct helpers:full "
 records_errors() { [[ $1 == helpers ]]; }
 
-# Outputs of the targets: name -> kind (closure, eval-errors or section) and
-# what to filter for (closure type, evaluator or section).
-outputs=() closure_outputs=()
-declare -A out_kind out_sel
-add_output() { # <name> <kind> <selector>
-  if [[ -z ${out_kind[$1]:-} ]]; then
-    outputs+=("$1") out_kind[$1]=$2 out_sel[$1]=$3
-    if [[ $2 == closure ]]; then closure_outputs+=("$1"); fi
-  fi
+# output_lines <target>...: "<name> <kind> <selector>" for each output of the
+# targets: one per closure type (kind closure, selected by closure type), one
+# per evaluator that records eval errors (eval-errors, by evaluator) and one
+# per other target (section).
+output_lines() {
+  local t
+  for t; do
+    case $t in
+      packages | programs | outpaths) echo "$t section $t" ;;
+      *)
+        if [[ $closure_targets != *" $t "* ]]; then
+          echo "unknown target $t (expected:$closure_targets""packages programs outpaths)" >&2
+          return 1
+        fi
+        echo "${t/:/-} closure $t"
+        if records_errors "${t%%:*}"; then echo "${t%%:*}-eval-errors eval-errors ${t%%:*}"; fi
+        ;;
+    esac
+  done
 }
-for t in "${targets[@]}"; do
-  ev=${t%%:*}
-  if [[ -v closure_types[$ev] ]]; then
-    read -r -a names <<<"${closure_types[$ev]}"
-    ((${#names[@]})) || names=("")
-    for n in "${names[@]}"; do
-      if [[ $t != *:* || ${t#*:} == "$n" ]]; then
-        add_output "$ev${n:+-$n}" closure "$ev${n:+:$n}"
-      fi
-    done
-    if records_errors "$ev"; then add_output "$ev-eval-errors" eval-errors "$ev"; fi
-  else
-    add_output "$t" section "$t"
-  fi
-done
+# outputs (and closure_outputs, out_kind, out_sel): this run's outputs.
+# policy_outputs: the outputs of the policy's targets, which a release's
+# notes cover.
+outputs=() closure_outputs=() policy_outputs=()
+declare -A out_kind out_sel
+lines=$(output_lines "${targets[@]}") || exit 2
+while read -r name kind sel; do
+  [[ -n ${out_kind[$name]:-} ]] && continue
+  outputs+=("$name") out_kind[$name]=$kind out_sel[$name]=$sel
+  if [[ $kind == closure ]]; then closure_outputs+=("$name"); fi
+done <<<"$lines"
+IFS=, read -r -a policy_targets <<<"$POLICY_TARGETS"
+lines=$(output_lines "${policy_targets[@]}") || exit 2
+while read -r name _; do
+  if [[ " ${policy_outputs[*]} " != *" $name "* ]]; then policy_outputs+=("$name"); fi
+done <<<"$lines"
 # filter_out <bundle> <output> <file>: the output's part of a bundle.
 filter_out() {
   case ${out_kind[$2]} in
@@ -280,7 +291,21 @@ if [[ $per_release == true ]]; then
       log "indexing $name"
       index "$work/$name.nfib" "$url"
       for ds in "${outputs[@]}"; do filter_out "$work/$name.nfib" "$ds" "$work/$name-$ds.nfib"; done
-      store_put "$name" "$name" "$(notes_for "$work/$name.nfib")" "${files[@]}"
+      # The notes cover all of the release's outputs: when backfilling, the
+      # ones already published too.
+      others=()
+      for ds in "${policy_outputs[@]}"; do
+        if [[ -z ${out_kind[$ds]:-} ]] && store_get "$name" "$name-$ds.nfib" "$work/$name-$ds.nfib"; then
+          others+=("$work/$name-$ds.nfib")
+        fi
+      done
+      notes_src=$work/$name.nfib
+      if ((${#others[@]})); then
+        "$NFI" merge "$work/$name.nfib" "${others[@]}" -o "$work/$name-notes.nfib"
+        notes_src=$work/$name-notes.nfib
+      fi
+      store_put "$name" "$name" "$(notes_for "$notes_src")" "${files[@]}"
+      rm -f "$work/$name-notes.nfib"
     fi
     for ds in "${outputs[@]}"; do new_parts[$ds]+=" $work/$name-$ds.nfib"; done
     # The next release is seeded from this one (all of its closures).
