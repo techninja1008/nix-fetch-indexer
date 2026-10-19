@@ -107,6 +107,11 @@ enum Cmd {
         /// Pass only the root paths (not their whole closure) to the fetch hook.
         #[arg(long)]
         roots_only: bool,
+        /// Warn about derivations to build whose name matches fewer than this
+        /// many indexed paths (likely overrides or unindexed build inputs);
+        /// 0 disables [server default: 100].
+        #[arg(long)]
+        close_miss_threshold: Option<u64>,
         #[command(flatten)]
         hook: HookArgs,
     },
@@ -292,6 +297,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             files,
             nix,
             roots_only,
+            close_miss_threshold,
             hook,
         } => {
             if installables.is_empty() && files.is_empty() {
@@ -305,7 +311,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             for f in &files {
                 graph.merge(read_graph(f)?);
             }
-            let r = client.minimise(&graph).await?;
+            let r = client.minimise(&graph, close_miss_threshold).await?;
             let paths = if roots_only { &r.roots } else { &r.closure };
             if cli.json {
                 print_json(&r)?;
@@ -321,9 +327,10 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 eprintln!("warning: {}", w.message);
             }
             eprintln!(
-                "{} requested, {} to build; {} root paths, {} in closure ({} download, {} unpacked)",
+                "{} requested, {} to build, {} to fetch; {} root paths, {} in closure ({} download, {} unpacked)",
                 r.requested.len(),
                 r.to_build.len(),
+                r.to_fetch.len(),
                 r.roots.len(),
                 r.closure.len(),
                 human_size(r.file_size),

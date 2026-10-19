@@ -339,6 +339,7 @@ mod tests {
                 .map(|(d, o)| (p(d), o.iter().map(|x| x.to_string()).collect()))
                 .collect(),
             input_srcs: Default::default(),
+            fixed: false,
         }
     }
 

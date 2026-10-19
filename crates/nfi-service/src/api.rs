@@ -120,12 +120,25 @@ async fn bulk(State(s): State<AppState>, Json(req): Json<BulkRequest>) -> R<Bulk
     Ok(Json(query::bulk(&s.pool, &req).await?))
 }
 
-async fn minimise(State(s): State<AppState>, Json(v): Json<serde_json::Value>) -> R<MinimiseResponse> {
+#[derive(Deserialize)]
+struct MinimiseParams {
+    /// See `nfi_api::minimise::close_miss_warnings`; 0 disables the check.
+    close_miss_threshold: Option<u64>,
+}
+
+async fn minimise(
+    State(s): State<AppState>,
+    Query(p): Query<MinimiseParams>,
+    Json(v): Json<serde_json::Value>,
+) -> R<MinimiseResponse> {
     let graph = ReducedGraph::from_json(&v).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     if graph.derivations.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "no derivations in request"));
     }
-    Ok(Json(query::minimise(&s.pool, &graph).await?))
+    let threshold = p
+        .close_miss_threshold
+        .unwrap_or(nfi_api::minimise::DEFAULT_CLOSE_MISS_THRESHOLD);
+    Ok(Json(query::minimise(&s.pool, &graph, threshold).await?))
 }
 
 #[derive(Deserialize)]

@@ -72,9 +72,18 @@ impl Client {
             .await
     }
 
-    pub async fn minimise(&self, graph: &drv::ReducedGraph) -> Result<MinimiseResponse> {
-        self.send(self.req(reqwest::Method::POST, "/v1/minimise").json(graph))
-            .await
+    /// `close_miss_threshold`: see `minimise::close_miss_warnings` (server
+    /// default when `None`, 0 disables).
+    pub async fn minimise(
+        &self,
+        graph: &drv::ReducedGraph,
+        close_miss_threshold: Option<u64>,
+    ) -> Result<MinimiseResponse> {
+        let mut rb = self.req(reqwest::Method::POST, "/v1/minimise");
+        if let Some(t) = close_miss_threshold {
+            rb = rb.query(&[("close_miss_threshold", t)]);
+        }
+        self.send(rb.json(graph)).await
     }
 
     // ----- admin -----

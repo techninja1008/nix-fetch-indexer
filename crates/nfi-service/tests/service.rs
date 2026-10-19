@@ -617,6 +617,31 @@ async fn closure_types_ingest_minimise_and_prune() {
     let (_, m): (u16, MinimiseResponse) = c.post("/v1/minimise", &graph).await;
     assert_eq!(m.to_build.len(), 2);
 
+    // A differently built curl-8.0 (path 3 is indexed as curl-8.0) is a close
+    // miss; an uncached fixed-output source is a fetch, not a build.
+    let graph = json!({"version": 4, "derivations": {
+        drv(1, "app"): {"outputs": {"out": {"path": format!("{}-app", h(50))}},
+            "inputs": {"drvs": {drv(3, "curl-8.0"): {"outputs": ["out"], "dynamicOutputs": {}}}, "srcs": []}},
+        drv(3, "curl-8.0"): {"outputs": {"out": {"path": format!("{}-curl-8.0", h(53))}},
+            "inputs": {"drvs": {drv(8, "curl-8.0.tar.xz"): {"outputs": ["out"], "dynamicOutputs": {}}}, "srcs": []}},
+        drv(8, "curl-8.0.tar.xz"): {"outputs": {"out": {"path": format!("{}-curl-8.0.tar.xz", h(54)),
+            "hashAlgo": "sha256", "hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}},
+            "inputs": {"drvs": {}, "srcs": []}},
+    }});
+    let (s, m): (u16, MinimiseResponse) = c.post("/v1/minimise", &graph).await;
+    assert_eq!(s, 200);
+    assert_eq!(m.to_build.len(), 2);
+    assert_eq!(
+        m.to_fetch,
+        vec![format!("/nix/store/{}", drv(8, "curl-8.0.tar.xz"))]
+    );
+    let w: Vec<_> = m.warnings.iter().filter(|w| w.code == "close_miss").collect();
+    assert_eq!(w.len(), 1, "{:?}", m.warnings);
+    assert_eq!(w[0].paths, vec![format!("/nix/store/{}", drv(3, "curl-8.0"))]);
+    assert!(w[0].message.contains("curl-8.0 (1 indexed)"), "{}", w[0].message);
+    let (_, m): (u16, MinimiseResponse) = c.post("/v1/minimise?close_miss_threshold=0", &graph).await;
+    assert!(m.warnings.iter().all(|w| w.code != "close_miss"));
+
     // A version 2 bundle is read with the closure type given at ingest.
     let mut v2 = helpers_bundle();
     v2.format_version = 2;

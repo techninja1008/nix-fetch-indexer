@@ -36,3 +36,6 @@ DELETE FROM missing_paths m WHERE NOT EXISTS (SELECT 1 FROM closures c WHERE c.i
 ALTER TABLE missing_paths
     ADD PRIMARY KEY (hash, closure_id),
     ADD FOREIGN KEY (closure_id) REFERENCES closures ON DELETE CASCADE;
+
+-- Minimise's close-miss check looks paths up by name.
+CREATE INDEX store_paths_name ON store_paths (name);

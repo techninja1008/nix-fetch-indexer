@@ -176,6 +176,10 @@ pub struct MinimiseResponse {
     pub requested: Vec<String>,
     /// Derivations that are not cached and must be built locally.
     pub to_build: Vec<String>,
+    /// Fixed-output derivations (fetches) that are not cached and must be
+    /// downloaded from upstream.
+    #[serde(default)]
+    pub to_fetch: Vec<String>,
     /// Cached paths directly needed (not inside another root's closure).
     pub roots: Vec<String>,
     /// Deduplicated runtime closure of all directly needed cached paths.
