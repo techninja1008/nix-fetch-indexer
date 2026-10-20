@@ -272,7 +272,7 @@ A store path's references never change, so they are written only once, when the 
      - Fixed-output paths are computed from their hash and name when `nix derivation show` omits them (Nix 2.34+).
      - Floating content-addressed outputs with no known path always count as must-build.
    - `inputSrcs` of must-build derivations that are in the index are included.
-   - Paths are looked up in rounds, only as the DFS reaches them: each round plans with what is known, taking unknown outputs as hits, and looks up the unknown paths that plan consulted. Nothing beneath a hit is looked up. After a round that mostly misses (beyond the first), or after 8 rounds, every remaining path of the graph is looked up at once.
+   - Paths are looked up in rounds, only as the DFS reaches them: each round plans with what is known, taking unknown outputs as hits, and looks up the unknown paths that plan consulted. Nothing beneath a hit is looked up. After a round that mostly misses (beyond the first) when the next round would look up more paths than it did, or after 8 rounds, every remaining path of the graph is looked up at once.
 4. The result is the deduplicated runtime closure of all hits, plus `roots`: hits that are not inside another hit's closure.
 5. Warnings:
    - `unindexed_nixpkgs`: a final stdenv in `to_build`.
