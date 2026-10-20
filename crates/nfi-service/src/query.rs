@@ -196,22 +196,26 @@ pub async fn minimise(
     let mut cached: BTreeMap<String, i64> = BTreeMap::new();
     let mut round = 0;
     let mut mostly_missing = false;
+    let mut last_asked = 0;
     let plan = loop {
         let (plan, unknown) = planner.step();
         if unknown.is_empty() {
             break plan;
         }
         round += 1;
-        // A round that mostly misses (after the first, whose requested
-        // outputs are rarely cached) suggests an unindexed nixpkgs, where
-        // the plan descends through most of the graph a level per round.
-        let ask = if round < MINIMISE_ROUNDS && !mostly_missing {
+        // A round that mostly missed (after the first, whose requested
+        // outputs are rarely cached), followed by a larger one, suggests an
+        // unindexed nixpkgs: the plan would descend through most of the graph
+        // a level per round. Misses that lead to fewer paths, such as
+        // vendored crates above their fetches, are followed round by round.
+        let ask = if round < MINIMISE_ROUNDS && !(mostly_missing && unknown.len() > last_asked) {
             unknown
         } else {
             planner.remaining()
         };
         let found = cached_paths(pool, &ask).await?;
         mostly_missing = round > 1 && found.len() * 2 < ask.len();
+        last_asked = ask.len();
         planner.learn(&ask, &|p| found.contains_key(p));
         cached.extend(found);
     };
