@@ -1,7 +1,7 @@
 //! Minimise planning: which cached paths are useful for building a graph.
 
-use crate::drv::ReducedGraph;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use crate::drv::{ReducedDrv, ReducedGraph};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Plan {
@@ -26,53 +26,168 @@ pub struct Plan {
 /// (input derivations with the outputs it consumes, and input sources)
 /// become needed.
 pub fn plan(graph: &ReducedGraph, is_cached: impl Fn(&str) -> bool) -> Plan {
-    let requested = graph.requested();
-    let order = topo_order(graph, &requested);
-    let mut needed: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
-    for r in &requested {
-        if let Some(d) = graph.derivations.get(r) {
-            needed.insert(r.as_str(), d.outputs.keys().cloned().collect());
+    Planner::new(graph).run(|p| Some(is_cached(p))).0
+}
+
+/// [`plan`] with the cache looked up in rounds, so that only the paths the
+/// plan consults are looked up: nothing beneath a hit is.
+///
+/// Each round, [`Planner::step`] plans with what is known so far, treating a
+/// derivation whose needed outputs are not known yet as a hit, and returns
+/// the paths it consulted that are not known. Once none are, the plan only
+/// depends on known paths, so it is the plan [`plan`] gives.
+pub struct Planner<'g> {
+    graph: &'g ReducedGraph,
+    requested: Vec<String>,
+    /// Positions of the requested derivations in `nodes`.
+    roots: Vec<usize>,
+    /// Every derivation reachable from the requested ones, dependants first.
+    nodes: Vec<Node<'g>>,
+    known: HashMap<String, bool>,
+}
+
+struct Node<'g> {
+    path: &'g str,
+    /// `None` for an input derivation missing from the graph.
+    drv: Option<&'g ReducedDrv>,
+    /// Input derivations by position in `nodes`, with the outputs consumed.
+    inputs: Vec<(usize, &'g BTreeSet<String>)>,
+}
+
+impl<'g> Planner<'g> {
+    pub fn new(graph: &'g ReducedGraph) -> Self {
+        // Number the derivations, and missing input derivations after them.
+        let mut paths: Vec<&str> = graph.derivations.keys().map(String::as_str).collect();
+        let mut index: HashMap<&str, usize> = paths.iter().enumerate().map(|(i, &p)| (p, i)).collect();
+        let mut referenced = vec![false; paths.len()];
+        let mut inputs: Vec<Vec<(usize, &BTreeSet<String>)>> = Vec::with_capacity(paths.len());
+        for d in graph.derivations.values() {
+            let mut ins = Vec::with_capacity(d.input_drvs.len());
+            for (input, outs) in &d.input_drvs {
+                let i = *index.entry(input.as_str()).or_insert_with(|| {
+                    paths.push(input.as_str());
+                    paths.len() - 1
+                });
+                if let Some(r) = referenced.get_mut(i) {
+                    *r = true;
+                }
+                ins.push((i, outs));
+            }
+            inputs.push(ins);
         }
-    }
-    let mut plan = Plan {
-        requested: requested.clone(),
-        ..Default::default()
-    };
-    let mut unresolved = BTreeSet::new();
-    for drv in order {
-        let Some(outs) = needed.remove(drv) else { continue };
-        let Some(d) = graph.derivations.get(drv) else {
-            unresolved.insert(drv.to_string());
-            continue;
-        };
-        let paths: Option<Vec<&String>> = outs
+        inputs.resize_with(paths.len(), Vec::new);
+        let roots: Vec<usize> = (0..graph.derivations.len()).filter(|&i| !referenced[i]).collect();
+        let order = topo_order(&inputs, &roots);
+        let mut position = vec![usize::MAX; paths.len()];
+        for (pos, &i) in order.iter().enumerate() {
+            position[i] = pos;
+        }
+        let nodes = order
             .iter()
-            .map(|o| d.outputs.get(o).and_then(|p| p.as_ref()))
+            .map(|&i| Node {
+                path: paths[i],
+                drv: graph.derivations.get(paths[i]),
+                inputs: inputs[i].iter().map(|&(j, outs)| (position[j], outs)).collect(),
+            })
             .collect();
-        if let Some(paths) = paths.filter(|ps| !ps.is_empty() && ps.iter().all(|p| is_cached(p))) {
-            plan.hits.extend(paths.into_iter().cloned());
-            continue;
-        }
-        if d.fixed {
-            plan.to_fetch.push(drv.to_string());
-        } else {
-            plan.to_build.push(drv.to_string());
-        }
-        for (input, input_outs) in &d.input_drvs {
-            let e = needed.entry(input.as_str()).or_default();
-            e.extend(input_outs.iter().cloned());
-            if !graph.derivations.contains_key(input) {
-                unresolved.insert(input.clone());
-            }
-        }
-        for src in &d.input_srcs {
-            if is_cached(src) {
-                plan.hits.insert(src.clone());
-            }
+        Planner {
+            graph,
+            requested: roots.iter().map(|&i| paths[i].to_string()).collect(),
+            roots: roots.iter().map(|&i| position[i]).collect(),
+            nodes,
+            known: HashMap::new(),
         }
     }
-    plan.unresolved = unresolved.into_iter().collect();
-    plan
+
+    /// Record a lookup: each of `queried` is cached if it is in `cached`.
+    pub fn learn<'a>(
+        &mut self,
+        queried: impl IntoIterator<Item = &'a String>,
+        cached: &impl Fn(&str) -> bool,
+    ) {
+        for p in queried {
+            self.known.insert(p.clone(), cached(p));
+        }
+    }
+
+    /// The paths of the graph that are not known yet.
+    pub fn remaining(&self) -> BTreeSet<String> {
+        let mut s = self.graph.all_paths();
+        s.retain(|p| !self.known.contains_key(p));
+        s
+    }
+
+    /// The plan so far, and the paths it consulted that are not known. The
+    /// plan is final when there are none.
+    pub fn step(&self) -> (Plan, BTreeSet<String>) {
+        self.run(|p| self.known.get(p).copied())
+    }
+
+    fn run(&self, is_cached: impl Fn(&str) -> Option<bool>) -> (Plan, BTreeSet<String>) {
+        let mut needed: Vec<Option<BTreeSet<&str>>> = vec![None; self.nodes.len()];
+        for &r in &self.roots {
+            needed[r] = self.nodes[r]
+                .drv
+                .map(|d| d.outputs.keys().map(String::as_str).collect());
+        }
+        let mut plan = Plan {
+            requested: self.requested.clone(),
+            ..Default::default()
+        };
+        let mut unknown = BTreeSet::new();
+        let mut unresolved = BTreeSet::new();
+        for (i, node) in self.nodes.iter().enumerate() {
+            let Some(outs) = needed[i].take() else { continue };
+            let Some(d) = node.drv else {
+                unresolved.insert(node.path.to_string());
+                continue;
+            };
+            let paths: Option<Vec<&String>> = outs
+                .iter()
+                .map(|&o| d.outputs.get(o).and_then(|p| p.as_ref()))
+                .collect();
+            if let Some(paths) = paths.filter(|ps| !ps.is_empty()) {
+                let cached: Vec<Option<bool>> = paths.iter().map(|p| is_cached(p)).collect();
+                // One output known to be uncached decides it, whatever the
+                // others are; otherwise unknown outputs are taken as cached.
+                if !cached.contains(&Some(false)) {
+                    for (p, c) in paths.into_iter().zip(cached) {
+                        if c.is_none() {
+                            unknown.insert(p.clone());
+                        }
+                        plan.hits.insert(p.clone());
+                    }
+                    continue;
+                }
+            }
+            if d.fixed {
+                plan.to_fetch.push(node.path.to_string());
+            } else {
+                plan.to_build.push(node.path.to_string());
+            }
+            for &(j, input_outs) in &node.inputs {
+                needed[j]
+                    .get_or_insert_default()
+                    .extend(input_outs.iter().map(String::as_str));
+                if self.nodes[j].drv.is_none() {
+                    unresolved.insert(self.nodes[j].path.to_string());
+                }
+            }
+            for src in &d.input_srcs {
+                match is_cached(src) {
+                    Some(true) => {
+                        plan.hits.insert(src.clone());
+                    }
+                    Some(false) => {}
+                    None => {
+                        unknown.insert(src.clone());
+                    }
+                }
+            }
+        }
+        plan.unresolved = unresolved.into_iter().collect();
+        (plan, unknown)
+    }
 }
 
 pub const UNINDEXED_NIXPKGS: &str = "unindexed_nixpkgs";
@@ -171,22 +286,21 @@ pub fn close_miss_warnings(
     }]
 }
 
-/// Dependants-first order of every derivation reachable from `roots`
-/// (reverse DFS post-order). Missing derivations are included as leaves.
-fn topo_order<'a>(graph: &'a ReducedGraph, roots: &'a [String]) -> Vec<&'a str> {
+/// Dependants-first order of every node reachable from `roots` (reverse DFS
+/// post-order).
+fn topo_order(inputs: &[Vec<(usize, &BTreeSet<String>)>], roots: &[usize]) -> Vec<usize> {
     let mut post = Vec::new();
-    let mut visited: HashSet<&str> = HashSet::new();
-    for root in roots {
-        if !visited.insert(root.as_str()) {
+    let mut visited = vec![false; inputs.len()];
+    for &root in roots {
+        if std::mem::replace(&mut visited[root], true) {
             continue;
         }
-        // Stack of (node, iterator position over its inputs).
-        let mut stack: Vec<(&str, Vec<&str>)> = vec![(root.as_str(), inputs(graph, root))];
+        // Stack of (node, inputs left to visit, last first).
+        let mut stack = vec![(root, inputs[root].iter().rev())];
         while let Some((node, children)) = stack.last_mut() {
-            if let Some(c) = children.pop() {
-                if visited.insert(c) {
-                    let ch = inputs(graph, c);
-                    stack.push((c, ch));
+            if let Some(&(c, _)) = children.next() {
+                if !std::mem::replace(&mut visited[c], true) {
+                    stack.push((c, inputs[c].iter().rev()));
                 }
             } else {
                 post.push(*node);
@@ -196,14 +310,6 @@ fn topo_order<'a>(graph: &'a ReducedGraph, roots: &'a [String]) -> Vec<&'a str> 
     }
     post.reverse();
     post
-}
-
-fn inputs<'a>(graph: &'a ReducedGraph, drv: &str) -> Vec<&'a str> {
-    graph
-        .derivations
-        .get(drv)
-        .map(|d| d.input_drvs.keys().map(String::as_str).collect())
-        .unwrap_or_default()
 }
 
 /// Given the closure edges of the hit set, the hits that are not contained in
@@ -348,6 +454,29 @@ mod tests {
     }
 
     #[test]
+    fn several_requested() {
+        // A second requested derivation that shares tool with app.
+        let mut g = graph();
+        g.derivations.insert(
+            "zapp.drv".into(),
+            drv(
+                &[("out", Some("zapp")), ("doc", Some("zapp-doc"))],
+                &[("tool.drv", &["out"])],
+                &[],
+            ),
+        );
+        let p = plan(&g, |p| p == "tool");
+        assert_eq!(p.requested, vec!["app.drv", "zapp.drv"]);
+        assert!(p.to_build.contains(&"zapp.drv".to_string()));
+        assert!(p.to_build.contains(&"app.drv".to_string()));
+        assert!(p.hits.contains("tool"));
+        // Every output of a requested derivation is needed.
+        let p = plan(&g, |p| p != "zapp-doc");
+        assert_eq!(p.to_build, vec!["zapp.drv"]);
+        assert_eq!(p.hits.into_iter().collect::<Vec<_>>(), vec!["app", "tool"]);
+    }
+
+    #[test]
     fn everything_cached() {
         let p = plan(&graph(), |_| true);
         assert!(p.to_build.is_empty());
@@ -377,6 +506,74 @@ mod tests {
         let p = plan(&g, |p| cached.contains(&p) || p == "src");
         assert!(p.to_fetch.is_empty());
         assert!(p.hits.contains("src"));
+    }
+
+    /// Plan with a [`Planner`], returning the plan and every path looked up.
+    fn plan_in_rounds(g: &ReducedGraph, is_cached: impl Fn(&str) -> bool) -> (Plan, BTreeSet<String>) {
+        let mut planner = Planner::new(g);
+        let mut looked_up = BTreeSet::new();
+        loop {
+            let (plan, unknown) = planner.step();
+            if unknown.is_empty() {
+                return (plan, looked_up);
+            }
+            assert!(unknown.is_disjoint(&looked_up), "looked up again: {unknown:?}");
+            planner.learn(&unknown, &is_cached);
+            looked_up.extend(unknown);
+        }
+    }
+
+    #[test]
+    fn rounds_match_plan() {
+        let mut fetching = graph();
+        fetching
+            .derivations
+            .get_mut("lib.drv")
+            .unwrap()
+            .input_drvs
+            .insert("src.drv".into(), ["out".to_string()].into());
+        let mut src = drv(&[("out", Some("src"))], &[("curl.drv", &["bin"])], &[]);
+        src.fixed = true;
+        fetching.derivations.insert("src.drv".into(), src);
+        fetching
+            .derivations
+            .insert("curl.drv".into(), drv(&[("bin", Some("curl-bin"))], &[], &[]));
+        let mut several = graph();
+        several.derivations.insert(
+            "zapp.drv".into(),
+            drv(
+                &[("out", Some("zapp"))],
+                &[("openssl.drv", &["out"])],
+                &["src.tar"],
+            ),
+        );
+        for g in [graph(), fetching, several] {
+            let paths: Vec<String> = g.all_paths().into_iter().collect();
+            for mask in 0..1u32 << paths.len() {
+                let cached = |p: &str| {
+                    paths
+                        .iter()
+                        .position(|q| q == p)
+                        .is_some_and(|i| mask & 1 << i != 0)
+                };
+                let (p, _) = plan_in_rounds(&g, cached);
+                assert_eq!(p, plan(&g, cached), "cached mask {mask:b} of {paths:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn rounds_skip_beneath_hits() {
+        let cached = ["glibc", "openssl-dev", "tool", "deep", "src.tar", "bootstrap"];
+        let (p, looked_up) = plan_in_rounds(&graph(), |p| cached.contains(&p));
+        assert_eq!(p, plan(&graph(), |p| cached.contains(&p)));
+        // Beneath the hits glibc, openssl-dev and tool: not looked up.
+        for p in ["bootstrap", "deep", "openssl"] {
+            assert!(!looked_up.contains(p), "{p} looked up");
+        }
+        // Everything cached: only the requested outputs.
+        let (_, looked_up) = plan_in_rounds(&graph(), |_| true);
+        assert_eq!(looked_up.into_iter().collect::<Vec<_>>(), vec!["app"]);
     }
 
     #[test]

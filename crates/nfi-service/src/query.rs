@@ -66,51 +66,58 @@ pub struct ClosureNode {
     pub file_size: Option<i64>,
 }
 
-/// Which of the given full store paths are in the closure index.
-pub async fn cached_paths(pool: &PgPool, paths: &BTreeSet<String>) -> Result<BTreeSet<String>> {
+/// Which of the given full store paths are in the closure index, with their ids.
+pub async fn cached_paths(pool: &PgPool, paths: &BTreeSet<String>) -> Result<BTreeMap<String, i64>> {
     let parsed: Vec<StorePath> = paths.iter().filter_map(|p| StorePath::parse(p).ok()).collect();
+    if parsed.is_empty() {
+        return Ok(BTreeMap::new());
+    }
     let hashes: Vec<String> = parsed.iter().map(|p| p.hash.to_string()).collect();
-    let found: Vec<(String, String, i32)> =
-        sqlx::query_as("SELECT hash, name, cardinality(closures) FROM store_paths WHERE hash = ANY($1)")
+    let found: Vec<(i64, String, String, i32)> =
+        sqlx::query_as("SELECT id, hash, name, cardinality(closures) FROM store_paths WHERE hash = ANY($1)")
             .bind(&hashes)
             .fetch_all(pool)
             .await?;
-    if let Some((hash, name, _)) = found.iter().find(|(_, _, n)| *n == 0) {
+    if let Some((_, hash, name, _)) = found.iter().find(|(.., n)| *n == 0) {
         return Err(Inconsistent(format!("store path {hash}-{name} belongs to no closure")).into());
     }
-    let found: HashMap<String, String> = found.into_iter().map(|(h, n, _)| (h, n)).collect();
+    let found: HashMap<String, (i64, String)> = found.into_iter().map(|(id, h, n, _)| (h, (id, n))).collect();
     Ok(parsed
         .into_iter()
-        .filter(|p| found.get(&p.hash.to_string()).is_some_and(|n| *n == p.name))
-        .map(|p| p.full())
+        .filter_map(|p| {
+            let (id, name) = found.get(&p.hash.to_string())?;
+            (*name == p.name).then(|| (p.full(), *id))
+        })
         .collect())
 }
 
-/// Runtime closure of the given (cached) store paths, plus the edges within it.
-pub async fn closure(
-    pool: &PgPool,
-    paths: &BTreeSet<String>,
-) -> Result<(Vec<ClosureNode>, Vec<(String, String)>)> {
-    let hashes: Vec<String> = paths
-        .iter()
-        .filter_map(|p| StorePath::parse(p).ok())
-        .map(|p| p.hash.to_string())
-        .collect();
-    if hashes.is_empty() {
+/// Runtime closure of the given cached store paths (by id, from
+/// [`cached_paths`]), plus the edges within it.
+pub async fn closure(pool: &PgPool, ids: &[i64]) -> Result<(Vec<ClosureNode>, Vec<(String, String)>)> {
+    if ids.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
+    // Postgres estimates a recursive query's size from a fixed multiple of
+    // its first step, so it overestimates closures and would join them with a
+    // sequential scan of store_paths; the lateral subquery (kept from being
+    // pulled up by OFFSET 0) looks each path up by id instead. JIT would
+    // compile for the inflated estimate, so it is off.
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL jit = off").execute(&mut *tx).await?;
     let rows: Vec<(i64, String, String, Option<i64>, Option<i64>, Vec<i64>, i32)> = sqlx::query_as(
         "WITH RECURSIVE c(id) AS (
-             SELECT id FROM store_paths WHERE hash = ANY($1)
+             SELECT unnest($1::bigint[])
              UNION
              SELECT unnest(s.refs) FROM store_paths s JOIN c ON s.id = c.id
          )
          SELECT s.id, s.hash, s.name, s.nar_size, s.file_size, s.refs, cardinality(s.closures)
-           FROM c JOIN store_paths s ON s.id = c.id ORDER BY s.hash",
+           FROM c, LATERAL (SELECT * FROM store_paths s WHERE s.id = c.id OFFSET 0) s
+          ORDER BY s.hash",
     )
-    .bind(&hashes)
-    .fetch_all(pool)
+    .bind(ids)
+    .fetch_all(&mut *tx)
     .await?;
+    tx.commit().await?;
     let by_id: HashMap<i64, String> = rows
         .iter()
         .map(|(id, hash, name, ..)| (*id, format!("/nix/store/{hash}-{name}")))
@@ -151,15 +158,29 @@ fn sizes(nodes: &[ClosureNode]) -> (u64, u64) {
     })
 }
 
-/// Number of indexed store paths with each of `names`.
-async fn indexed_names(pool: &PgPool, names: &[&str]) -> Result<HashMap<String, u64>> {
-    let rows: Vec<(String, i64)> =
-        sqlx::query_as("SELECT name, count(*) FROM store_paths WHERE name = ANY($1) GROUP BY name")
-            .bind(names)
-            .fetch_all(pool)
-            .await?;
+/// Number of indexed store paths with each of `names`, counting at most
+/// `limit` per name: generic names (`source`) are shared by a large part of
+/// the index.
+async fn indexed_names(pool: &PgPool, names: &BTreeSet<&str>, limit: u64) -> Result<HashMap<String, u64>> {
+    if names.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let names: Vec<&str> = names.iter().copied().collect();
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT n, (SELECT count(*) FROM (SELECT FROM store_paths WHERE name = n LIMIT $2) l)
+           FROM unnest($1::text[]) n",
+    )
+    .bind(&names)
+    .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+    .fetch_all(pool)
+    .await?;
     Ok(rows.into_iter().map(|(n, c)| (n, c as u64)).collect())
 }
+
+/// Lookup rounds before minimise looks up every remaining path of the graph
+/// at once. Graphs built on an indexed release need a few rounds: one per
+/// level of derivations to build above the hits.
+const MINIMISE_ROUNDS: usize = 8;
 
 pub async fn minimise(
     pool: &PgPool,
@@ -167,19 +188,48 @@ pub async fn minimise(
     close_miss_threshold: u64,
 ) -> Result<MinimiseResponse> {
     use nfi_api::minimise as m;
-    let cached = cached_paths(pool, &graph.all_paths()).await?;
-    let plan = m::plan(graph, |p| cached.contains(p));
+    // Look up only the paths the plan consults, in rounds: nothing beneath a
+    // hit needs looking up, and that is most of a graph built on an indexed
+    // release.
+    let mut planner = m::Planner::new(graph);
+    let mut cached: BTreeMap<String, i64> = BTreeMap::new();
+    let mut round = 0;
+    let mut mostly_missing = false;
+    let plan = loop {
+        let (plan, unknown) = planner.step();
+        if unknown.is_empty() {
+            break plan;
+        }
+        round += 1;
+        // A round that mostly misses (after the first, whose requested
+        // outputs are rarely cached) suggests an unindexed nixpkgs, where
+        // the plan descends through most of the graph a level per round.
+        let ask = if round < MINIMISE_ROUNDS && !mostly_missing {
+            unknown
+        } else {
+            planner.remaining()
+        };
+        let found = cached_paths(pool, &ask).await?;
+        mostly_missing = round > 1 && found.len() * 2 < ask.len();
+        planner.learn(&ask, &|p| found.contains_key(p));
+        cached.extend(found);
+    };
+    let hit_ids: Vec<i64> = plan.hits.iter().map(|p| cached[p]).collect();
     let mut warnings = m::anchor_warnings(&plan);
-    if close_miss_threshold > 0 {
-        let names: Vec<&str> = plan.to_build.iter().map(|d| m::drv_name(d)).collect();
-        let indexed = indexed_names(pool, &names).await?;
-        warnings.extend(m::close_miss_warnings(
-            &plan,
-            |n| indexed.get(n).copied().unwrap_or(0),
-            close_miss_threshold,
-        ));
-    }
-    let (nodes, edges) = closure(pool, &plan.hits).await?;
+    let names: BTreeSet<&str> = if close_miss_threshold > 0 {
+        plan.to_build.iter().map(|d| m::drv_name(d)).collect()
+    } else {
+        BTreeSet::new()
+    };
+    let (indexed, (nodes, edges)) = tokio::try_join!(
+        indexed_names(pool, &names, close_miss_threshold),
+        closure(pool, &hit_ids),
+    )?;
+    warnings.extend(m::close_miss_warnings(
+        &plan,
+        |n| indexed.get(n).copied().unwrap_or(0),
+        close_miss_threshold,
+    ));
     let roots = nfi_api::minimise::roots(&plan.hits, &edges);
     let (nar_size, file_size) = sizes(&nodes);
     Ok(MinimiseResponse {
@@ -239,10 +289,13 @@ async fn outputs(
     Ok((rows.into_iter().map(|(o, p, _)| (o, p)).collect(), drv))
 }
 
-fn with_cached(outs: BTreeMap<String, String>, cached: &BTreeSet<String>) -> BTreeMap<String, OutputInfo> {
+fn with_cached(
+    outs: BTreeMap<String, String>,
+    cached: &BTreeMap<String, i64>,
+) -> BTreeMap<String, OutputInfo> {
     outs.into_iter()
         .map(|(o, p)| {
-            let c = cached.contains(&p);
+            let c = cached.contains_key(&p);
             (o, OutputInfo { path: p, cached: c })
         })
         .collect()
@@ -381,13 +434,14 @@ pub async fn bulk(pool: &PgPool, req: &BulkRequest) -> Result<BulkResponse> {
     let cached = cached_paths(pool, &wanted_paths).await?;
     for it in &mut items {
         for o in it.outputs.values_mut() {
-            o.cached = cached.contains(&o.path);
+            o.cached = cached.contains_key(&o.path);
         }
         if it.status == ItemStatus::Ok && it.outputs.values().any(|o| !o.cached) {
             it.status = ItemStatus::NotCached;
         }
     }
-    let (nodes, _) = closure(pool, &cached).await?;
+    let ids: Vec<i64> = cached.values().copied().collect();
+    let (nodes, _) = closure(pool, &ids).await?;
     let (nar_size, file_size) = sizes(&nodes);
     Ok(BulkResponse {
         items,
