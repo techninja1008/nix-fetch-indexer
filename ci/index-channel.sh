@@ -57,6 +57,23 @@ read -r -a INDEX_ARGS <<<"${NFI_INDEX_ARGS:-}"
 IFS=, read -r -a targets <<<"$TARGETS"
 
 log() { echo "[$channel] $*" >&2; }
+# group <title>: start a collapsible log group (GitHub Actions), ending any
+# open one; elsewhere, just log the title. endgroup: end the open group.
+in_group=false
+group() {
+  endgroup
+  if [[ ${GITHUB_ACTIONS:-} == true ]]; then
+    echo "::group::[$channel] $*" >&2
+    in_group=true
+  else
+    log "$*"
+  fi
+}
+endgroup() {
+  if [[ $in_group == true ]]; then echo "::endgroup::" >&2; in_group=false; fi
+}
+# Close any open group on exit (including on failure).
+trap endgroup EXIT
 
 # Closure type targets, and the evaluators that record eval errors.
 closure_targets=" store-paths helpers:direct helpers:full "
@@ -217,10 +234,15 @@ if ((count == 0)); then
   exit 0
 fi
 if [[ -n $BACKFILL ]]; then
-  log "backfilling $BACKFILL for $count release(s): $(cut -f1 "$work/new.tsv" | tr '\n' ' ')"
+  group "backfilling $BACKFILL for $count release(s)"
 else
-  log "$count new release(s) after ${last:-<start>}: $(cut -f1 "$work/new.tsv" | tr '\n' ' ')"
+  group "$count new release(s) after ${last:-<start>}"
 fi
+i=0
+while IFS=$'\t' read -r name _; do
+  i=$((i + 1))
+  log "$i/$count $name"
+done <"$work/new.tsv"
 
 notes_for() { # <bundle> -> markdown summary of its releases, closures and evals
   "$NFI" inspect --json "$1" | jq -r '
@@ -272,7 +294,10 @@ fi
 # ---------- index ----------
 declare -A new_parts # output -> space-separated bundle files to fold into the cumulative
 if [[ $per_release == true ]]; then
+  i=0
   while IFS=$'\t' read -r name url; do
+    i=$((i + 1))
+    group "$i/$count $name"
     files=()
     have_all=true
     for ds in "${outputs[@]}"; do
@@ -318,7 +343,8 @@ if [[ $per_release == true ]]; then
 else
   urls=()
   while IFS=$'\t' read -r name url; do urls+=("$url"); done <"$work/new.tsv"
-  log "indexing $count release(s)"
+  # Indexed in one run, so one group for all of them.
+  group "indexing $count release(s)"
   index "$work/new.nfib" "${urls[@]}"
   for ds in "${outputs[@]}"; do
     filter_out "$work/new.nfib" "$ds" "$work/new-$ds.nfib"
@@ -328,6 +354,7 @@ else
 fi
 
 # ---------- cumulative ----------
+group "summary"
 if [[ $cumulative == true ]]; then
   cum_files=()
   for ds in "${outputs[@]}"; do
