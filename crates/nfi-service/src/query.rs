@@ -97,18 +97,19 @@ pub async fn closure(pool: &PgPool, ids: &[i64]) -> Result<(Vec<ClosureNode>, Ve
     if ids.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
-    // Postgres estimates a recursive query's size from a fixed multiple of
-    // its first step, so it overestimates closures and would join them with a
-    // sequential scan of store_paths; the lateral subquery (kept from being
-    // pulled up by OFFSET 0) looks each path up by id instead. JIT would
-    // compile for the inflated estimate, so it is off.
+    // Postgres estimates each step of a recursive query from a fixed
+    // multiple of the one before, so it overestimates closures and joins
+    // them, in the recursive step and the final select, with a sequential
+    // scan of store_paths. The lateral subqueries (kept from being pulled up
+    // by OFFSET 0) look each path up by id instead. JIT would compile for the
+    // inflated estimate, so it is off.
     let mut tx = pool.begin().await?;
     sqlx::query("SET LOCAL jit = off").execute(&mut *tx).await?;
     let rows: Vec<(i64, String, String, Option<i64>, Option<i64>, Vec<i64>, i32)> = sqlx::query_as(
         "WITH RECURSIVE c(id) AS (
              SELECT unnest($1::bigint[])
              UNION
-             SELECT unnest(s.refs) FROM store_paths s JOIN c ON s.id = c.id
+             SELECT unnest(s.refs) FROM c, LATERAL (SELECT refs FROM store_paths s WHERE s.id = c.id OFFSET 0) s
          )
          SELECT s.id, s.hash, s.name, s.nar_size, s.file_size, s.refs, cardinality(s.closures)
            FROM c, LATERAL (SELECT * FROM store_paths s WHERE s.id = c.id OFFSET 0) s

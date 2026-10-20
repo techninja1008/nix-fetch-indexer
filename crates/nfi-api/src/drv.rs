@@ -161,6 +161,31 @@ impl ReducedGraph {
         Ok(g)
     }
 
+    /// [`from_json`](Self::from_json) on a JSON document. A graph already
+    /// reduced with full paths, as the `nfi` CLI sends, is read directly
+    /// rather than through a `Value`, which takes several times as long.
+    pub fn from_slice(json: &[u8]) -> Result<Self> {
+        if let Ok(g) = serde_json::from_slice::<ReducedGraph>(json)
+            && g.is_normal()
+        {
+            return Ok(g);
+        }
+        Self::from_json(&serde_json::from_slice(json).context("invalid JSON")?)
+    }
+
+    /// Whether `from_json` reads this graph as it is: every path is full and
+    /// every derivation path names a `.drv`.
+    fn is_normal(&self) -> bool {
+        let full = |p: &String| p.starts_with('/');
+        self.derivations.iter().all(|(path, d)| {
+            full(path)
+                && path.ends_with(".drv")
+                && d.outputs.values().flatten().all(full)
+                && d.input_drvs.keys().all(full)
+                && d.input_srcs.iter().all(full)
+        })
+    }
+
     pub fn merge(&mut self, other: ReducedGraph) {
         self.derivations.extend(other.derivations);
     }
@@ -321,5 +346,24 @@ mod tests {
                 .all(|d| d.fixed)
         );
         assert_eq!(g.all_paths().len(), 2);
+    }
+
+    #[test]
+    fn from_slice_matches_from_json() {
+        let raw = r#"{"derivations":{
+          "0kchj5r1l1i7k32mlwybj099flmqnw4g-b.drv":{"inputs":{"drvs":{"mq9yfr049mwif1agr68la1sgsxw8kqpv-a.drv":{"dynamicOutputs":{},"outputs":["lib"]}},"srcs":["84m8sr66n6j8ygyxbky7js67k2zjqw03-srcf.txt"]},
+             "outputs":{"out":{"path":"pz71rggm46l6zw8m2y5d841k91zrhrlj-b"}}},
+          "mq9yfr049mwif1agr68la1sgsxw8kqpv-a.drv":{"inputs":{"drvs":{},"srcs":[]},
+             "outputs":{"lib":{"path":"ivdvygqpvh3137gmd9pgrfajc0m7swiv-a-lib"},"src":{"hash":"sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=","method":"flat"}}}},
+          "version":4}"#;
+        let g = ReducedGraph::from_json(&serde_json::from_str(raw).unwrap()).unwrap();
+        assert_eq!(ReducedGraph::from_slice(raw.as_bytes()).unwrap(), g);
+        // The reduced form, as the CLI sends it, reads back the same.
+        let reduced = serde_json::to_vec(&g).unwrap();
+        assert_eq!(ReducedGraph::from_slice(&reduced).unwrap(), g);
+        // Reduced, but with store-relative paths: normalised as before.
+        let short = String::from_utf8(reduced).unwrap().replace("/nix/store/", "");
+        assert_eq!(ReducedGraph::from_slice(short.as_bytes()).unwrap(), g);
+        assert!(ReducedGraph::from_slice(b"{").is_err());
     }
 }

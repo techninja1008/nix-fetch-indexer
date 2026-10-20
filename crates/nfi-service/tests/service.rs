@@ -229,6 +229,15 @@ async fn ingest_lookup_bulk_minimise_prune() {
 
     let (s, _): (u16, Value) = c.post("/v1/minimise", &json!({"nope": 1})).await;
     assert_eq!(s, 400);
+    let r = c
+        .http
+        .post(format!("{}/v1/minimise", c.svc.public_url))
+        .header("content-type", "text/plain")
+        .body(serde_json::to_vec(&reduced).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 415);
 
     // Re-ingesting (as JSON this time) is idempotent.
     c.ingest_bytes(encode(&bundle(), Format::Json)).await;
