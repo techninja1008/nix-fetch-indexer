@@ -78,6 +78,36 @@
                 ln -s ${workspace}/bin/.${name}-wrapped $out/bin/.${name}-wrapped
               fi
             '';
+          # Shared base for the OCI images: passwd/group entries, CA
+          # certificates, a shell (initdb needs /bin/sh) and enough tools to
+          # `docker exec -it <container> bash` for debugging.
+          image =
+            {
+              name,
+              config,
+            }:
+            pkgs.dockerTools.buildLayeredImage {
+              inherit name;
+              tag = "latest";
+              contents = [
+                pkgs.dockerTools.fakeNss
+                pkgs.cacert
+                pkgs.bashInteractive
+                pkgs.coreutils-full
+                pkgs.htop
+              ];
+              extraCommands = ''
+                mkdir -p -m 1777 tmp var/tmp
+                mkdir -p -m 0755 run
+              '';
+              config = config // {
+                Env = [
+                  "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+                  "TMPDIR=/tmp"
+                ]
+                ++ config.Env or [ ];
+              };
+            };
         in
         {
           default = workspace;
@@ -89,10 +119,8 @@
         }
         // linuxOnly pkgs {
           # OCI images (load with `docker load < result`).
-          nfi-service-image = pkgs.dockerTools.buildLayeredImage {
+          nfi-service-image = image {
             name = "nfi-service";
-            tag = "latest";
-            contents = [ pkgs.cacert ];
             config = {
               Entrypoint = [ "${workspace}/bin/nfi-service" ];
               Env = [
@@ -101,7 +129,6 @@
                 # To reach it from outside, override NFI_ADMIN_LISTEN, set
                 # NFI_ADMIN_TOKEN and publish the port on a private address.
                 "NFI_ADMIN_LISTEN=127.0.0.1:8081"
-                "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
               ];
               ExposedPorts = {
                 "8080/tcp" = { };
@@ -109,20 +136,10 @@
               User = "65534:65534";
             };
           };
-          nfi-indexer-image = pkgs.dockerTools.buildLayeredImage {
+          nfi-indexer-image = image {
             name = "nfi-indexer";
-            tag = "latest";
-            contents = [
-              pkgs.cacert
-              pkgs.dockerTools.fakeNss
-            ];
-            extraCommands = "mkdir -m 1777 tmp";
             config = {
               Entrypoint = [ "${workspace}/bin/nfi-indexer" ];
-              Env = [
-                "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-                "TMPDIR=/tmp"
-              ];
               WorkingDir = "/tmp";
             };
           };
