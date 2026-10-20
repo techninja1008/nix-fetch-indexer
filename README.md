@@ -276,6 +276,7 @@ The figures below were measured with embedded PostgreSQL 16 on 4 cores.
 | GET | `/v1/packages/{attr}?commit=&system=` | Metadata, output paths (with a `cached` flag) and programs for an attribute at a commit; unique commit prefixes are accepted |
 | POST | `/v1/lookup/bulk` | Body `{"items":[{"attr","commit","system"?,"outputs"?}]}`; returns per-item status and outputs, plus the deduplicated closure |
 | POST | `/v1/minimise?close_miss_threshold=` | Body: raw `nix derivation show --recursive` JSON (legacy or v4 format) or a reduced graph `{"derivations":{drv:{outputs,inputDrvs,inputSrcs,fixed}}}` |
+| GET | `/v1/releases?channel=&errors=` | What is in the index: releases (name, commit, channel, series) with their datasets and evaluations: eval type, closure type names, and `error_count` (`null` when errors are not indexed). With `errors=true`, each evaluation with indexed errors also lists them as `errors` (`<attr>@<system>`; `nfi releases --errors`). The same as `/admin/v1/releases` |
 
 **Bulk lookup details**
 
@@ -308,7 +309,7 @@ The figures below were measured with embedded PostgreSQL 16 on 4 cores.
 |---|---|---|
 | POST | `/admin/v1/ingest?v2_closure_type=` | Streamed bundle body (binary or JSON), or `{"url": ..., "v2_closure_type": ...}` with `Content-Type: application/json`; returns `{"id"}`. `v2_closure_type` (default `store-paths`) is the closure type to read a version 2 bundle as (`nfi-admin ingest --v2-closure-type`) |
 | GET | `/admin/v1/jobs`, `/admin/v1/jobs/{id}` | Job status, progress and result |
-| GET | `/admin/v1/releases` | Releases (name, commit, channel, series) with their datasets and evaluations: eval type, closure type names, and errors (`<attr>@<system>`, or `null` when not indexed) |
+| GET | `/admin/v1/releases?channel=&errors=` | The same as the public `/v1/releases` |
 | POST | `/admin/v1/prune` | `{"releases":[], "commits":[], "channels":[], "closure_types":[]}`; garbage-collects orphaned paths and packages, then rebuilds search. With `closure_types` (`nfi-admin prune --closure-type`), only the closures of those closure types (e.g. `helpers:full`) are removed from the selected releases, and the releases are kept; evaluations left with neither closures nor indexed errors are removed too |
 | POST | `/admin/v1/reindex` | Rebuilds the Meilisearch index from Postgres and swaps it in |
 | POST | `/admin/v1/check` | Checks closure-index consistency (see below); the job result is a report with `ok`, counts and example rows per issue |
@@ -338,6 +339,7 @@ The check takes about 20 s on all of `nixos-26.05`: 2.7M paths and 38M reference
 
 ```sh
 export NFI_URL=http://nfi.example:8080
+nfi releases --channel nixos-25.05
 nfi search ripgrep --series 25.05
 nfi search --program rg
 nfi show ripgrep --commit ac62194c3917

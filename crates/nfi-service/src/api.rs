@@ -43,6 +43,7 @@ pub fn public_router(state: AppState) -> Router {
         .route("/v1/packages/{*attr}", get(package))
         .route("/v1/lookup/bulk", post(bulk))
         .route("/v1/minimise", post(minimise))
+        .route("/v1/releases", get(releases))
         .layer(DefaultBodyLimit::max(512 << 20))
         .with_state(state)
 }
@@ -213,7 +214,16 @@ async fn get_job(State(s): State<AppState>, Path(id): Path<i64>) -> R<JobInfo> {
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("no job {id}")))
 }
 
-async fn releases(State(s): State<AppState>) -> R<Vec<ReleaseInfo>> {
+#[derive(Deserialize)]
+struct ReleasesParams {
+    channel: Option<String>,
+    /// List each evaluation's errors, not only their count.
+    #[serde(default)]
+    errors: bool,
+}
+
+/// Served on both listeners: what is in the index is public.
+async fn releases(State(s): State<AppState>, Query(p): Query<ReleasesParams>) -> R<Vec<ReleaseInfo>> {
     type Row = (
         i32,
         String,
@@ -229,28 +239,38 @@ async fn releases(State(s): State<AppState>) -> R<Vec<ReleaseInfo>> {
                 COALESCE(array_agg(d.dataset ORDER BY d.dataset) FILTER (WHERE d.dataset IS NOT NULL), '{}'),
                 r.indexed_at
          FROM releases r LEFT JOIN release_datasets d ON d.release_id = r.id
+         WHERE $1::text IS NULL OR r.channel = $1
          GROUP BY r.id ORDER BY r.channel, r.indexed_at, r.name",
     )
+    .bind(&p.channel)
     .fetch_all(&s.pool)
     .await?;
-    let evals: Vec<(i32, String, Vec<String>, Option<Vec<String>>)> = sqlx::query_as(
+    type EvalRow = (i32, String, Vec<String>, Option<i64>, Option<Vec<String>>);
+    let evals: Vec<EvalRow> = sqlx::query_as(
         "SELECT e.release_id, t.name,
                 ARRAY(SELECT ct.name FROM closures c JOIN closure_types ct ON ct.id = c.type_id
                        WHERE c.eval_id = e.id ORDER BY ct.id),
                 CASE WHEN e.errors_indexed THEN
+                  (SELECT count(*) FROM eval_errors x WHERE x.eval_id = e.id)
+                END,
+                CASE WHEN e.errors_indexed AND $2 THEN
                   ARRAY(SELECT x.attr || '@' || x.system FROM eval_errors x WHERE x.eval_id = e.id
                          ORDER BY x.attr, x.system)
                 END
            FROM evals e JOIN eval_types t ON t.id = e.type_id
+          WHERE $1::text IS NULL OR e.release_id IN (SELECT id FROM releases WHERE channel = $1)
           ORDER BY e.release_id, t.id",
     )
+    .bind(&p.channel)
+    .bind(p.errors)
     .fetch_all(&s.pool)
     .await?;
     let mut evals_by_release: std::collections::HashMap<i32, Vec<EvalInfo>> = Default::default();
-    for (release, eval_type, closures, errors) in evals {
+    for (release, eval_type, closures, error_count, errors) in evals {
         evals_by_release.entry(release).or_default().push(EvalInfo {
             eval_type,
             closures,
+            error_count: error_count.map(|n| n as u64),
             errors,
         });
     }

@@ -80,6 +80,17 @@ async fn query_cli() {
     let url = svc.public_url.clone();
     let run = |args: &[&str]| tokio::task::block_in_place(|| nfi(&url, d, args));
 
+    // releases
+    let o = run(&["releases"]);
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(o.stdout.starts_with("RELEASE"), "{}", o.stdout);
+    assert!(o.stdout.contains("nixos-25.05.100.aaaaaaaaaaaa"), "{}", o.stdout);
+    let o = run(&["--json", "releases", "--channel", "nixos-unstable"]);
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let v: serde_json::Value = serde_json::from_str(&o.stdout).unwrap();
+    assert_eq!(v.as_array().unwrap().len(), 1);
+    assert_eq!(v[0]["channel"], "nixos-unstable");
+
     // show
     let o = run(&["show", "curl", "--commit", "aaaaaaaa"]);
     assert_eq!(o.code, 0, "{}", o.stderr);

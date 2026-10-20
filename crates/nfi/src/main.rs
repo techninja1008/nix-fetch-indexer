@@ -66,6 +66,17 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         offset: usize,
     },
+    /// List the indexed releases with their datasets, and their evaluations
+    /// with their closure types and error counts.
+    Releases {
+        /// Only releases in this channel, e.g. nixos-25.05.
+        #[arg(long)]
+        channel: Option<String>,
+        /// Also list the attributes that failed to evaluate, not only their
+        /// count.
+        #[arg(long)]
+        errors: bool,
+    },
     /// Show a package's metadata and output paths at a nixpkgs commit.
     Show {
         attr: String,
@@ -201,6 +212,15 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     println!("    releases: {}", h.releases.join(" "));
                 }
                 eprintln!("{} of ~{} results", r.hits.len(), r.estimated_total);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Releases { channel, errors } => {
+            let rels = client.releases(channel.as_deref(), errors).await?;
+            if cli.json {
+                print_json(&rels)?;
+            } else {
+                print!("{}", nfi_api::releases_table(&rels));
             }
             Ok(ExitCode::SUCCESS)
         }
