@@ -205,7 +205,7 @@ pub struct Warning {
     pub paths: Vec<String>,
 }
 
-// ---------- admin ----------
+// ---------- releases ----------
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReleaseInfo {
@@ -233,6 +233,43 @@ pub struct EvalInfo {
     #[serde(default)]
     pub errors: Option<Vec<String>>,
 }
+
+/// A human-readable table of releases, one per line after a header.
+pub fn releases_table(rels: &[ReleaseInfo]) -> String {
+    let mut out = format!(
+        "{:<40} {:<18} {:<12} {:<42} {:<28} EVALS\n",
+        "RELEASE", "CHANNEL", "SERIES", "COMMIT", "DATASETS"
+    );
+    for r in rels {
+        // e.g. `helpers[direct,full] (2 errors)`, `store-paths`.
+        let evals: Vec<String> = r
+            .evals
+            .iter()
+            .map(|e| {
+                let mut s = e.eval_type.clone();
+                if e.closures.iter().any(|c| !c.is_empty()) {
+                    s += &format!("[{}]", e.closures.join(","));
+                }
+                if let Some(errors) = &e.errors {
+                    s += &format!(" ({} errors)", errors.len());
+                }
+                s
+            })
+            .collect();
+        out += &format!(
+            "{:<40} {:<18} {:<12} {:<42} {:<28} {}\n",
+            r.name,
+            r.channel,
+            r.series,
+            r.commit,
+            r.datasets.join(","),
+            evals.join(", ")
+        );
+    }
+    out
+}
+
+// ---------- admin ----------
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IngestUrlRequest {

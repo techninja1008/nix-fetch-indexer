@@ -272,43 +272,11 @@ async fn run(cli: Cli) -> Result<Outcome> {
             Ok(true)
         }
         Cmd::Releases { channel } => {
-            let mut rels = client.releases().await?;
-            if let Some(c) = &channel {
-                rels.retain(|r| &r.channel == c);
-            }
+            let rels = client.admin_releases(channel.as_deref()).await?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&rels)?);
             } else {
-                println!(
-                    "{:<40} {:<18} {:<12} {:<42} {:<28} EVALS",
-                    "RELEASE", "CHANNEL", "SERIES", "COMMIT", "DATASETS"
-                );
-                for r in &rels {
-                    // e.g. `helpers[direct,full] (2 errors)`, `store-paths`.
-                    let evals: Vec<String> = r
-                        .evals
-                        .iter()
-                        .map(|e| {
-                            let mut s = e.eval_type.clone();
-                            if e.closures.iter().any(|c| !c.is_empty()) {
-                                s += &format!("[{}]", e.closures.join(","));
-                            }
-                            if let Some(errors) = &e.errors {
-                                s += &format!(" ({} errors)", errors.len());
-                            }
-                            s
-                        })
-                        .collect();
-                    println!(
-                        "{:<40} {:<18} {:<12} {:<42} {:<28} {}",
-                        r.name,
-                        r.channel,
-                        r.series,
-                        r.commit,
-                        r.datasets.join(","),
-                        evals.join(", ")
-                    );
-                }
+                print!("{}", nfi_api::releases_table(&rels));
             }
             Ok(true)
         }

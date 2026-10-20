@@ -86,7 +86,25 @@ impl Client {
         self.send(rb.json(graph)).await
     }
 
+    /// Indexed releases, optionally only those in `channel`.
+    pub async fn releases(&self, channel: Option<&str>) -> Result<Vec<ReleaseInfo>> {
+        self.releases_at("/v1/releases", channel).await
+    }
+
+    async fn releases_at(&self, path: &str, channel: Option<&str>) -> Result<Vec<ReleaseInfo>> {
+        let mut rb = self.req(reqwest::Method::GET, path);
+        if let Some(c) = channel {
+            rb = rb.query(&[("channel", c)]);
+        }
+        self.send(rb).await
+    }
+
     // ----- admin -----
+
+    /// [`Client::releases`] through the admin listener.
+    pub async fn admin_releases(&self, channel: Option<&str>) -> Result<Vec<ReleaseInfo>> {
+        self.releases_at("/admin/v1/releases", channel).await
+    }
 
     /// Upload a bundle; `v2_closure_type` is the closure type to read a
     /// version 2 bundle as (server default `store-paths`).
@@ -131,11 +149,6 @@ impl Client {
                 .query(&[("limit", limit)]),
         )
         .await
-    }
-
-    pub async fn releases(&self) -> Result<Vec<ReleaseInfo>> {
-        self.send(self.req(reqwest::Method::GET, "/admin/v1/releases"))
-            .await
     }
 
     pub async fn prune(&self, req: &PruneRequest) -> Result<JobCreated> {

@@ -12,7 +12,7 @@ A single Cargo workspace:
 | `nfi-interchange` | lib | Interchange bundle data model, CBOR + compression codec, JSON codec, merge/split/filter |
 | `nfi-indexer` | bin | Indexers (`index --targets`: closure types `store-paths`, `helpers:direct` and `helpers:full`, `packages`, `outpaths`, `programs`), plus offline bundle tooling (`merge`, `split`, `filter`, `convert`, `inspect`) |
 | `nfi-service` | bin | Query service (axum HTTP/JSON, Postgres, Meilisearch) |
-| `nfi` | bin | Query CLI (non-administrative endpoints, fetch hook, flake-ref resolution) |
+| `nfi` | bin | Query CLI (non-administrative endpoints, release list, fetch hook, flake-ref resolution) |
 | `nfi-admin` | bin | Admin CLI (ingest, list releases, prune, reindex, job status) |
 | `nfi-embedded-postgres` | lib | Supervised child-process PostgreSQL for single-node mode (`--embedded-postgres`) |
 | `nfi-embedded-meilisearch` | lib | Supervised child-process Meilisearch for single-node mode (`--embedded-meilisearch`) |
