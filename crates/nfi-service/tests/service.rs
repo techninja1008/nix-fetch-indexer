@@ -232,7 +232,7 @@ async fn ingest_lookup_bulk_minimise_prune() {
 
     // Re-ingesting (as JSON this time) is idempotent.
     c.ingest_bytes(encode(&bundle(), Format::Json)).await;
-    let n: i64 = sqlx::query_scalar("SELECT sum(cardinality(releases))::bigint FROM store_paths")
+    let n: i64 = sqlx::query_scalar("SELECT sum(cardinality(closures))::bigint FROM store_paths")
         .fetch_one(&c.svc.state.pool)
         .await
         .unwrap();
@@ -460,10 +460,10 @@ async fn consistency_check_and_query_errors() {
     // Unaffected closures still work.
     let (s, _): (u16, BulkResponse) = c.post("/v1/lookup/bulk", &bulk("curl")).await;
     assert_eq!(s, 200);
-    // 2. Membership in an unknown release, 3. an orphan path, 4. an open closure.
-    exec("UPDATE store_paths SET releases = releases || 4242 WHERE name = 'curl-8.0'").await;
-    exec("INSERT INTO store_paths (hash, name, releases) VALUES ('orphanorphanorphanorphanorphan00', 'orphan', '{}')").await;
-    sqlx::query("UPDATE store_paths SET releases = releases[1:1] WHERE hash = $1")
+    // 2. Membership in an unknown closure, 3. an orphan path, 4. an open closure.
+    exec("UPDATE store_paths SET closures = closures || 4242 WHERE name = 'curl-8.0'").await;
+    exec("INSERT INTO store_paths (hash, name, closures) VALUES ('orphanorphanorphanorphanorphan00', 'orphan', '{}')").await;
+    sqlx::query("UPDATE store_paths SET closures = closures[1:1] WHERE hash = $1")
         .bind(&glibc)
         .execute(pool)
         .await
@@ -476,37 +476,205 @@ async fn consistency_check_and_query_errors() {
         kinds,
         vec![
             ("dangling_refs", 1),
-            ("unknown_releases", 1),
+            ("unknown_closures", 1),
             ("orphan_paths", 1),
             ("open_closures", 4)
         ]
     );
     assert!(report.issues[0].examples[0].contains("missing id 999999"));
-    assert!(report.issues[1].examples[0].contains("missing release id 4242"));
+    assert!(report.issues[1].examples[0].contains("missing closure id 4242"));
 
-    // A path with no releases is inconsistent too when a query reaches it.
-    exec("UPDATE store_paths SET releases = '{}' WHERE name = 'curl-8.0'").await;
+    // A path in no closure is inconsistent too when a query reaches it.
+    exec("UPDATE store_paths SET closures = '{}' WHERE name = 'curl-8.0'").await;
     let (s, e): (u16, Value) = c.get(&format!("/v1/packages/curl?commit={A}")).await;
     assert_eq!(s, 500);
     assert!(
-        e["error"].as_str().unwrap().contains("belongs to no release"),
+        e["error"].as_str().unwrap().contains("belongs to no closure"),
         "{e}"
     );
 }
 
 #[tokio::test]
-async fn ingest_skips_paths_outside_ingested_releases() {
+async fn ingest_rejects_closures_of_releases_without_the_dataset() {
     let Some(c) = setup(None).await else { return };
-    // Release B carries only packages: its closure bits must not be stored,
-    // and paths only in B must not become orphans.
+    // Release B carries only packages, but the bundle still has a closure
+    // for it: the bundle is invalid and nothing is stored.
     let mut b = bundle();
     b.releases[1].datasets = vec![Dataset::Packages];
-    c.ingest_bytes(encode(&b, Format::Json)).await;
-    let only_b: i64 = sqlx::query_scalar("SELECT count(*) FROM store_paths WHERE name = 'only-in-b'")
+    let r = c
+        .admin(reqwest::Method::POST, "/admin/v1/ingest")
+        .body(encode(&b, Format::Json))
+        .send()
+        .await
+        .unwrap();
+    let j = c.wait_job(r.json::<JobCreated>().await.unwrap().id).await;
+    assert_eq!(j.status, JobStatus::Failed);
+    assert!(j.error.unwrap().contains("lacks the closure dataset"));
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM store_paths")
         .fetch_one(&c.svc.state.pool)
         .await
         .unwrap();
-    assert_eq!(only_b, 0);
+    assert_eq!(n, 0);
+}
+
+/// The qualified closure types of a release's evaluations.
+fn closure_types(r: &ReleaseInfo) -> Vec<String> {
+    r.evals
+        .iter()
+        .flat_map(|e| {
+            e.closures
+                .iter()
+                .map(|c| ClosureType::new(&e.eval_type, c).to_string())
+        })
+        .collect()
+}
+
+/// A helpers:direct closure for release A: a bootstrap tool (path 7) that
+/// references glibc (path 1), plus an uncached source tarball.
+fn helpers_bundle() -> Bundle {
+    let base = bundle();
+    let mut b = Bundle::default();
+    let mut r = base.releases[0].clone();
+    r.datasets = vec![Dataset::Closure];
+    let ra = b.ensure_release(r);
+    let e = b.ensure_eval(ra as u32, "helpers");
+    let mut cb = ClosureBuilder::new();
+    let ci = cb.ensure_closure(e, "direct");
+    let bits = Bitset::single(ci);
+    for (n, name, refs) in [(7u8, "curl-bootstrap-8.0", vec![1u8]), (1, "glibc-2.40", vec![1])] {
+        cb.insert(
+            PathInfo {
+                hash: h(n),
+                name: name.into(),
+                references: refs.into_iter().map(h).collect(),
+                nar_size: Some(n as u64 * 1000),
+                file_size: Some(n as u64 * 100),
+                deriver: None,
+            },
+            &bits,
+        );
+    }
+    cb.add_missing(h(98), "curl-8.0.tar.xz", &bits);
+    b.closure = Some(cb.finish());
+    b.validate().unwrap();
+    b
+}
+
+#[tokio::test]
+async fn closure_types_ingest_minimise_and_prune() {
+    let Some(c) = setup(None).await else { return };
+    c.ingest_bytes(encode(&bundle(), Format::Json)).await;
+    let job = c.ingest_bytes(encode(&helpers_bundle(), Format::Json)).await;
+    let result = job.result.unwrap();
+    assert_eq!(result["new_store_paths"], 1);
+    assert_eq!(
+        result["closures"],
+        json!(["nixos-25.05.100.aaaaaaaaaaaa helpers:direct"])
+    );
+
+    let releases = || async {
+        let rels: Vec<ReleaseInfo> = c
+            .admin(reqwest::Method::GET, "/admin/v1/releases")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        rels.into_iter().find(|r| r.commit == A).unwrap()
+    };
+    let a = releases().await;
+    // Evaluations are listed in eval type creation order.
+    assert_eq!(closure_types(&a), ["store-paths", "helpers:direct"]);
+    // The helpers evaluation's errors were not part of the bundle.
+    assert_eq!(a.evals[1].errors, None);
+
+    // A build-only tool from a helpers closure is a hit.
+    let drv = |n: u8, name: &str| format!("{}-{name}.drv", h(100 + n));
+    let graph = json!({"version": 4, "derivations": {
+        drv(1, "app"): {"outputs": {"out": {"path": format!("{}-app", h(50))}},
+            "inputs": {"drvs": {drv(7, "curl-bootstrap-8.0"): {"outputs": ["out"], "dynamicOutputs": {}}}, "srcs": []}},
+        drv(7, "curl-bootstrap-8.0"): {"outputs": {"out": {"path": format!("{}-curl-bootstrap-8.0", h(7))}},
+            "inputs": {"drvs": {}, "srcs": []}},
+    }});
+    let (s, m): (u16, MinimiseResponse) = c.post("/v1/minimise", &graph).await;
+    assert_eq!(s, 200);
+    assert_eq!(m.to_build, vec![format!("/nix/store/{}", drv(1, "app"))]);
+    assert_eq!(m.roots, vec![path(7, "curl-bootstrap-8.0")]);
+
+    // Pruning one closure type keeps the release and its other closures.
+    let r = c
+        .admin(reqwest::Method::POST, "/admin/v1/prune")
+        .json(&json!({"channels": ["nixos-25.05"], "closure_types": ["helpers:direct"]}))
+        .send()
+        .await
+        .unwrap();
+    let j = c.wait_job(r.json::<JobCreated>().await.unwrap().id).await;
+    assert_eq!(j.status, JobStatus::Succeeded, "{:?}", j.error);
+    let res = j.result.unwrap();
+    assert_eq!(res["releases"], json!([]));
+    assert_eq!(
+        res["closures"],
+        json!(["nixos-25.05.100.aaaaaaaaaaaa helpers:direct"])
+    );
+    assert_eq!(res["store_paths_removed"], 1);
+    let a = releases().await;
+    // The helpers evaluation had nothing else, so it went too.
+    assert_eq!(closure_types(&a), ["store-paths"]);
+    assert_eq!(a.evals.len(), 1);
+    assert!(a.datasets.contains(&"closure".to_string()));
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM missing_paths")
+        .fetch_one(&c.svc.state.pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 1, "only the store-paths closure's missing path remains");
+    let (_, m): (u16, MinimiseResponse) = c.post("/v1/minimise", &graph).await;
+    assert_eq!(m.to_build.len(), 2);
+
+    // A differently built curl-8.0 (path 3 is indexed as curl-8.0) is a close
+    // miss; an uncached fixed-output source is a fetch, not a build.
+    let graph = json!({"version": 4, "derivations": {
+        drv(1, "app"): {"outputs": {"out": {"path": format!("{}-app", h(50))}},
+            "inputs": {"drvs": {drv(3, "curl-8.0"): {"outputs": ["out"], "dynamicOutputs": {}}}, "srcs": []}},
+        drv(3, "curl-8.0"): {"outputs": {"out": {"path": format!("{}-curl-8.0", h(53))}},
+            "inputs": {"drvs": {drv(8, "curl-8.0.tar.xz"): {"outputs": ["out"], "dynamicOutputs": {}}}, "srcs": []}},
+        drv(8, "curl-8.0.tar.xz"): {"outputs": {"out": {"path": format!("{}-curl-8.0.tar.xz", h(54)),
+            "hashAlgo": "sha256", "hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}},
+            "inputs": {"drvs": {}, "srcs": []}},
+    }});
+    let (s, m): (u16, MinimiseResponse) = c.post("/v1/minimise", &graph).await;
+    assert_eq!(s, 200);
+    assert_eq!(m.to_build.len(), 2);
+    assert_eq!(
+        m.to_fetch,
+        vec![format!("/nix/store/{}", drv(8, "curl-8.0.tar.xz"))]
+    );
+    let w: Vec<_> = m.warnings.iter().filter(|w| w.code == "close_miss").collect();
+    assert_eq!(w.len(), 1, "{:?}", m.warnings);
+    assert_eq!(w[0].paths, vec![format!("/nix/store/{}", drv(3, "curl-8.0"))]);
+    assert!(w[0].message.contains("curl-8.0 (1 indexed)"), "{}", w[0].message);
+    let (_, m): (u16, MinimiseResponse) = c.post("/v1/minimise?close_miss_threshold=0", &graph).await;
+    assert!(m.warnings.iter().all(|w| w.code != "close_miss"));
+
+    // A version 2 bundle is read with the closure type given at ingest.
+    let mut v2 = helpers_bundle();
+    v2.format_version = 2;
+    v2.closure.as_mut().unwrap().closures.clear();
+    v2.evals.clear();
+    let r = c
+        .admin(
+            reqwest::Method::POST,
+            "/admin/v1/ingest?v2_closure_type=helpers:full",
+        )
+        .body(encode(&v2, Format::Json))
+        .send()
+        .await
+        .unwrap();
+    let j = c.wait_job(r.json::<JobCreated>().await.unwrap().id).await;
+    assert_eq!(j.status, JobStatus::Succeeded, "{:?}", j.error);
+    let a = releases().await;
+    assert_eq!(closure_types(&a), ["store-paths", "helpers:full"]);
+
     let r = c
         .admin(reqwest::Method::POST, "/admin/v1/check")
         .send()
@@ -515,5 +683,195 @@ async fn ingest_skips_paths_outside_ingested_releases() {
     let j = c.wait_job(r.json::<JobCreated>().await.unwrap().id).await;
     let report: CheckReport = serde_json::from_value(j.result.unwrap()).unwrap();
     assert!(report.ok, "{report:?}");
-    assert_eq!(report.store_paths, 5);
+    assert_eq!(report.closures, 3);
+}
+
+/// Helper probe eval errors for both releases: fetchhg fails in A and B,
+/// fetchsvn only in A.
+fn eval_errors_bundle() -> Bundle {
+    let base = bundle();
+    let mut b = Bundle::default();
+    let mut e = EvalErrorsSection::default();
+    for (i, r) in base.releases.iter().enumerate() {
+        let mut r = r.clone();
+        r.datasets = vec![Dataset::EvalErrors];
+        let ri = b.ensure_release(r);
+        let ev = b.ensure_eval(ri as u32, "helpers");
+        e.add_error("fetchhg", "x86_64-linux", ev);
+        if i == 0 {
+            e.add_error("fetchsvn", "aarch64-linux", ev);
+        }
+    }
+    b.eval_errors = Some(e);
+    b.validate().unwrap();
+    b
+}
+
+#[tokio::test]
+async fn eval_errors_ingest_and_prune() {
+    let Some(c) = setup(None).await else { return };
+    c.ingest_bytes(encode(&bundle(), Format::Json)).await;
+    let job = c.ingest_bytes(encode(&eval_errors_bundle(), Format::Json)).await;
+    let result = job.result.unwrap();
+    assert_eq!(result["eval_errors"], 3);
+    assert_eq!(result["evals"].as_array().unwrap().len(), 2);
+    // Re-ingesting is a no-op.
+    c.ingest_bytes(encode(&eval_errors_bundle(), Format::Json)).await;
+
+    let releases = || async {
+        let mut rels: Vec<ReleaseInfo> = c
+            .admin(reqwest::Method::GET, "/admin/v1/releases")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        rels.sort_by(|a, b| a.commit.cmp(&b.commit));
+        rels
+    };
+    let rels = releases().await;
+    assert_eq!(rels[0].commit, A);
+    assert!(rels[0].datasets.contains(&"eval-errors".to_string()));
+    // The store-paths pseudo-evaluation (from the first bundle) has no
+    // error information; the helpers evaluation has no closures.
+    let ev: Vec<_> = rels[0]
+        .evals
+        .iter()
+        .map(|e| (e.eval_type.as_str(), e.closures.len(), e.errors.clone()))
+        .collect();
+    assert_eq!(
+        ev,
+        [
+            ("store-paths", 1, None),
+            (
+                "helpers",
+                0,
+                Some(vec![
+                    "fetchhg@x86_64-linux".to_string(),
+                    "fetchsvn@aarch64-linux".to_string()
+                ])
+            ),
+        ]
+    );
+    assert_eq!(
+        rels[1].evals[1].errors,
+        Some(vec!["fetchhg@x86_64-linux".to_string()])
+    );
+
+    let check = || async {
+        let r = c
+            .admin(reqwest::Method::POST, "/admin/v1/check")
+            .send()
+            .await
+            .unwrap();
+        let j = c.wait_job(r.json::<JobCreated>().await.unwrap().id).await;
+        serde_json::from_value::<CheckReport>(j.result.unwrap()).unwrap()
+    };
+    let report = check().await;
+    assert!(report.ok, "{report:?}");
+    assert_eq!((report.evals, report.eval_errors), (4, 3));
+
+    // Pruning the helpers closures of a release keeps its helpers
+    // evaluation while its errors are known.
+    let r = c
+        .admin(reqwest::Method::POST, "/admin/v1/prune")
+        .json(&json!({"commits": [A], "closure_types": ["helpers:direct", "helpers:full"]}))
+        .send()
+        .await
+        .unwrap();
+    let j = c.wait_job(r.json::<JobCreated>().await.unwrap().id).await;
+    assert_eq!(j.status, JobStatus::Succeeded, "{:?}", j.error);
+    assert_eq!(check().await.evals, 4);
+
+    // Pruning a release removes its evaluations and their errors.
+    let r = c
+        .admin(reqwest::Method::POST, "/admin/v1/prune")
+        .json(&json!({"commits": [A]}))
+        .send()
+        .await
+        .unwrap();
+    let j = c.wait_job(r.json::<JobCreated>().await.unwrap().id).await;
+    assert_eq!(j.status, JobStatus::Succeeded, "{:?}", j.error);
+    let report = check().await;
+    assert!(report.ok, "{report:?}");
+    assert_eq!((report.evals, report.eval_errors), (2, 1));
+}
+
+/// Migration 0003 turns existing release membership into store-paths
+/// closures with the same ids, without rewriting path rows.
+#[tokio::test]
+async fn closure_types_migration_keeps_ids() {
+    let Some(url) = nfi_testenv::fresh_database().await else {
+        return;
+    };
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
+    let run = |f: &str| {
+        let pool = pool.clone();
+        let sql = std::fs::read_to_string(format!("{dir}/{f}")).unwrap();
+        async move { sqlx::raw_sql(&sql).execute(&pool).await.unwrap() }
+    };
+    run("0001_init.sql").await;
+    run("0002_compact_closure.sql").await;
+    sqlx::raw_sql(
+        "INSERT INTO releases (id, name, commit, channel, series) VALUES
+           (3, 'r3', 'c3', 'nixos-25.05', '25.05'), (5, 'r5', 'c5', 'nixos-25.05', '25.05'),
+           (7, 'r7', 'c7', 'nixos-25.05', '25.05');
+         SELECT setval(pg_get_serial_sequence('releases', 'id'), 7);
+         INSERT INTO release_datasets VALUES (3, 'closure'), (5, 'closure'), (7, 'packages');
+         INSERT INTO store_paths (hash, name, releases) VALUES ('h1', 'a', '{3,5}'), ('h2', 'b', '{5}');
+         INSERT INTO missing_paths (hash, name, release_id) VALUES ('h9', 'gone', 3);",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    run("0003_closure_types.sql").await;
+    // Each release with the closure dataset gets a store-paths evaluation
+    // and its unnamed closure, both with the release's id.
+    let closures: Vec<(i32, i32, i32, String, String)> = sqlx::query_as(
+        "SELECT c.id, e.id, e.release_id, et.name, ct.name FROM closures c
+           JOIN evals e ON e.id = c.eval_id
+           JOIN eval_types et ON et.id = e.type_id
+           JOIN closure_types ct ON ct.id = c.type_id AND ct.eval_type_id = et.id
+          ORDER BY c.id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        closures,
+        vec![
+            (3, 3, 3, "store-paths".into(), "".into()),
+            (5, 5, 5, "store-paths".into(), "".into())
+        ]
+    );
+    let paths: Vec<(String, Vec<i32>)> =
+        sqlx::query_as("SELECT hash, closures FROM store_paths ORDER BY hash")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(paths, vec![("h1".into(), vec![3, 5]), ("h2".into(), vec![5])]);
+    let missing: Vec<(String, i32)> = sqlx::query_as("SELECT hash, closure_id FROM missing_paths")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(missing, vec![("h9".into(), 3)]);
+    // New evaluations and closures get ids past every release id, so they
+    // can't collide with ids still being assigned 1:1.
+    let eval: i32 = sqlx::query_scalar(
+        "INSERT INTO evals (release_id, type_id) SELECT 7, id FROM eval_types RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(eval > 7, "{eval}");
+    let id: i32 = sqlx::query_scalar(
+        "INSERT INTO closures (eval_id, type_id) SELECT $1, id FROM closure_types RETURNING id",
+    )
+    .bind(eval)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(id > 7, "{id}");
 }

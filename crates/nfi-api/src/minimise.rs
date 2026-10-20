@@ -8,6 +8,9 @@ pub struct Plan {
     pub requested: Vec<String>,
     /// Derivations that must be built, in dependants-first order.
     pub to_build: Vec<String>,
+    /// Fixed-output derivations (fetches) that must be realised, in
+    /// dependants-first order. Their inputs (the fetch tools) are needed.
+    pub to_fetch: Vec<String>,
     /// Cached paths that are directly needed (outputs of cache hits and
     /// cached input sources of derivations that must be built).
     pub hits: BTreeSet<String>,
@@ -50,7 +53,11 @@ pub fn plan(graph: &ReducedGraph, is_cached: impl Fn(&str) -> bool) -> Plan {
             plan.hits.extend(paths.into_iter().cloned());
             continue;
         }
-        plan.to_build.push(drv.to_string());
+        if d.fixed {
+            plan.to_fetch.push(drv.to_string());
+        } else {
+            plan.to_build.push(drv.to_string());
+        }
         for (input, input_outs) in &d.input_drvs {
             let e = needed.entry(input.as_str()).or_default();
             e.extend(input_outs.iter().cloned());
@@ -78,18 +85,19 @@ fn is_stdenv_drv(drv: &str) -> bool {
     matches!(name, "stdenv-linux.drv" | "stdenv-darwin.drv")
 }
 
-/// Anchor check: Hydra builds stdenv for every release, so an uncached
-/// stdenv almost always means the graph was evaluated from a nixpkgs
-/// revision that is not indexed (or with overlays/config that change stdenv).
-pub fn anchor_warnings(graph: &ReducedGraph, is_cached: impl Fn(&str) -> bool) -> Vec<crate::Warning> {
-    // Every uncached final stdenv is reported: graphs can legitimately mix
+/// Anchor check: Hydra builds stdenv for every release, so a stdenv that
+/// must be built almost always means the graph was evaluated from a nixpkgs
+/// revision that is not indexed (or with overlays/config that change
+/// stdenv). Only stdenvs the plan needs are considered: one beneath a cached
+/// path does not matter.
+pub fn anchor_warnings(plan: &Plan) -> Vec<crate::Warning> {
+    // Every needed final stdenv is reported: graphs can legitimately mix
     // several nixpkgs instances, and each unindexed one deserves a warning.
-    let uncached: Vec<String> = graph
-        .derivations
+    let uncached: Vec<String> = plan
+        .to_build
         .iter()
-        .filter(|(drv, _)| is_stdenv_drv(drv))
-        .filter(|(_, d)| !d.outputs.values().flatten().any(|p| is_cached(p)))
-        .map(|(drv, _)| drv.clone())
+        .filter(|drv| is_stdenv_drv(drv))
+        .cloned()
         .collect();
     if uncached.is_empty() {
         return Vec::new();
@@ -107,6 +115,59 @@ pub fn anchor_warnings(graph: &ReducedGraph, is_cached: impl Fn(&str) -> bool) -
                 .join(", ")
         ),
         paths: uncached,
+    }]
+}
+
+pub const CLOSE_MISS: &str = "close_miss";
+/// Default `close_miss_threshold`: names shared by this many indexed paths
+/// or more are too generic (e.g. `source`) to suggest anything.
+pub const DEFAULT_CLOSE_MISS_THRESHOLD: u64 = 100;
+
+/// The name of a derivation (`<hash>-<name>.drv`), which is also the name of
+/// its `out` output's path.
+pub fn drv_name(drv: &str) -> &str {
+    let base = drv.rsplit('/').next().unwrap_or(drv);
+    let base = base.strip_suffix(".drv").unwrap_or(base);
+    base.get(33..).unwrap_or(base)
+}
+
+/// Derivations to build whose name matches indexed paths: the same package
+/// (name and version) is indexed but with a different hash, e.g. a slightly
+/// overridden package or a build tool from a nixpkgs helper that is not
+/// indexed. `indexed` gives the number of indexed paths with a name; names
+/// matching `threshold` or more paths (and 0, which disables the check) are
+/// ignored.
+pub fn close_miss_warnings(
+    plan: &Plan,
+    indexed: impl Fn(&str) -> u64,
+    threshold: u64,
+) -> Vec<crate::Warning> {
+    if threshold == 0 {
+        return Vec::new();
+    }
+    let misses: Vec<(&String, u64)> = plan
+        .to_build
+        .iter()
+        .map(|d| (d, indexed(drv_name(d))))
+        .filter(|&(_, n)| n > 0 && n < threshold)
+        .collect();
+    if misses.is_empty() {
+        return Vec::new();
+    }
+    let examples: Vec<String> = misses
+        .iter()
+        .take(5)
+        .map(|(d, n)| format!("{} ({n} indexed)", drv_name(d)))
+        .collect();
+    vec![crate::Warning {
+        code: CLOSE_MISS.into(),
+        message: format!(
+            "{} derivation(s) to build look like indexed paths with a different hash, e.g. {}: they are probably \
+             overridden packages, or build inputs that are not indexed",
+            misses.len(),
+            examples.join(", ")
+        ),
+        paths: misses.into_iter().map(|(d, _)| d.clone()).collect(),
     }]
 }
 
@@ -188,6 +249,7 @@ mod tests {
                 .map(|(d, o)| (d.to_string(), o.iter().map(|s| s.to_string()).collect()))
                 .collect(),
             input_srcs: srcs.iter().map(|s| s.to_string()).collect(),
+            fixed: false,
         }
     }
 
@@ -293,34 +355,107 @@ mod tests {
     }
 
     #[test]
-    fn stdenv_anchor() {
+    fn fixed_outputs_are_fetches() {
         let mut g = graph();
+        // lib fetches its source; the fetch needs curl.
+        g.derivations
+            .get_mut("lib.drv")
+            .unwrap()
+            .input_drvs
+            .insert("src.drv".into(), ["out".to_string()].into());
+        let mut src = drv(&[("out", Some("src"))], &[("curl.drv", &["bin"])], &[]);
+        src.fixed = true;
+        g.derivations.insert("src.drv".into(), src);
+        g.derivations
+            .insert("curl.drv".into(), drv(&[("bin", Some("curl-bin"))], &[], &[]));
+        let cached = ["glibc", "openssl-dev", "tool", "deep", "src.tar", "curl-bin"];
+        let p = plan(&g, |p| cached.contains(&p));
+        assert_eq!(p.to_build, vec!["app.drv", "lib.drv"]);
+        assert_eq!(p.to_fetch, vec!["src.drv"]);
+        assert!(p.hits.contains("curl-bin"));
+        // A cached fetch is a hit like anything else.
+        let p = plan(&g, |p| cached.contains(&p) || p == "src");
+        assert!(p.to_fetch.is_empty());
+        assert!(p.hits.contains("src"));
+    }
+
+    #[test]
+    fn stdenv_anchor() {
         let stdenv = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-stdenv-linux.drv";
         let stage = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-bootstrap-stage1-stdenv-linux.drv";
+        let other = "/nix/store/cccccccccccccccccccccccccccccccc-stdenv-linux.drv";
+        // app uses stdenv; tool (cached below) uses the other stdenv.
+        let mut g = graph();
         g.derivations
-            .insert(stdenv.into(), drv(&[("out", Some("stdenv-out"))], &[], &[]));
+            .get_mut("app.drv")
+            .unwrap()
+            .input_drvs
+            .insert(stdenv.into(), ["out".to_string()].into());
+        g.derivations
+            .get_mut("tool.drv")
+            .unwrap()
+            .input_drvs
+            .insert(other.into(), ["out".to_string()].into());
+        g.derivations.insert(
+            stdenv.into(),
+            drv(&[("out", Some("stdenv-out"))], &[(stage, &["out"])], &[]),
+        );
         g.derivations
             .insert(stage.into(), drv(&[("out", Some("stage-out"))], &[], &[]));
-        // Cached stdenv (bootstrap stages are never cached and are ignored): no warning.
-        assert!(anchor_warnings(&g, |p| p == "stdenv-out").is_empty());
-        // Uncached stdenv: one warning naming it.
-        let w = anchor_warnings(&g, |_| false);
+        g.derivations
+            .insert(other.into(), drv(&[("out", Some("other-out"))], &[], &[]));
+        let base = ["glibc", "openssl-dev", "deep", "src.tar"];
+        // Cached stdenv: no warning (its bootstrap stages are never visited).
+        let p = plan(&g, |p| base.contains(&p) || p == "stdenv-out" || p == "tool");
+        assert!(anchor_warnings(&p).is_empty());
+        // Uncached stdenv that is needed: one warning naming it. The other
+        // stdenv is beneath a cached path (tool), so it is not needed.
+        let p = plan(&g, |p| base.contains(&p) || p == "tool");
+        let w = anchor_warnings(&p);
         assert_eq!(w.len(), 1);
         assert_eq!(w[0].code, UNINDEXED_NIXPKGS);
         assert_eq!(w[0].paths, vec![stdenv.to_string()]);
         assert!(w[0].message.contains("stdenv-linux.drv"));
-        // Several final stdenvs (e.g. two nixpkgs instances): any uncached one
-        // warns, and only the uncached ones are named.
-        let other = "/nix/store/cccccccccccccccccccccccccccccccc-stdenv-linux.drv";
-        g.derivations
-            .insert(other.into(), drv(&[("out", Some("other-out"))], &[], &[]));
-        let w = anchor_warnings(&g, |p| p == "other-out");
-        assert_eq!(w.len(), 1);
-        assert_eq!(w[0].paths, vec![stdenv.to_string()]);
-        assert_eq!(anchor_warnings(&g, |_| false)[0].paths.len(), 2);
-        assert!(anchor_warnings(&g, |p| p == "other-out" || p == "stdenv-out").is_empty());
+        // Both needed and uncached: both are named.
+        let p = plan(&g, |p| base.contains(&p));
+        assert_eq!(anchor_warnings(&p)[0].paths.len(), 2);
         // No stdenv in the graph: nothing to say.
-        assert!(anchor_warnings(&graph(), |_| false).is_empty());
+        let p = plan(&graph(), |_| false);
+        assert!(anchor_warnings(&p).is_empty());
+    }
+
+    #[test]
+    fn close_misses() {
+        let p = Plan {
+            to_build: vec![
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-curl-8.22.0.drv".into(),
+                "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-source.drv".into(),
+                "/nix/store/cccccccccccccccccccccccccccccccc-myapp-1.0.drv".into(),
+            ],
+            ..Default::default()
+        };
+        let indexed = |name: &str| match name {
+            "curl-8.22.0" => 11,
+            "source" => 5000,
+            _ => 0,
+        };
+        let w = close_miss_warnings(&p, indexed, DEFAULT_CLOSE_MISS_THRESHOLD);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].code, CLOSE_MISS);
+        assert_eq!(w[0].paths, vec![p.to_build[0].clone()]);
+        assert!(
+            w[0].message.contains("curl-8.22.0 (11 indexed)"),
+            "{}",
+            w[0].message
+        );
+        // A higher threshold includes generic names; 0 disables the check.
+        assert_eq!(close_miss_warnings(&p, indexed, 10_000)[0].paths.len(), 2);
+        assert!(close_miss_warnings(&p, indexed, 0).is_empty());
+        assert!(close_miss_warnings(&p, indexed, 11).is_empty());
+        assert_eq!(
+            drv_name("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-curl-8.22.0.drv"),
+            "curl-8.22.0"
+        );
     }
 
     #[test]

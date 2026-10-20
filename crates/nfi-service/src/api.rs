@@ -120,15 +120,38 @@ async fn bulk(State(s): State<AppState>, Json(req): Json<BulkRequest>) -> R<Bulk
     Ok(Json(query::bulk(&s.pool, &req).await?))
 }
 
-async fn minimise(State(s): State<AppState>, Json(v): Json<serde_json::Value>) -> R<MinimiseResponse> {
+#[derive(Deserialize)]
+struct MinimiseParams {
+    /// See `nfi_api::minimise::close_miss_warnings`; 0 disables the check.
+    close_miss_threshold: Option<u64>,
+}
+
+async fn minimise(
+    State(s): State<AppState>,
+    Query(p): Query<MinimiseParams>,
+    Json(v): Json<serde_json::Value>,
+) -> R<MinimiseResponse> {
     let graph = ReducedGraph::from_json(&v).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     if graph.derivations.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "no derivations in request"));
     }
-    Ok(Json(query::minimise(&s.pool, &graph).await?))
+    let threshold = p
+        .close_miss_threshold
+        .unwrap_or(nfi_api::minimise::DEFAULT_CLOSE_MISS_THRESHOLD);
+    Ok(Json(query::minimise(&s.pool, &graph, threshold).await?))
 }
 
-async fn ingest(State(s): State<AppState>, headers: HeaderMap, body: Body) -> Result<Response, AppError> {
+#[derive(Deserialize)]
+struct IngestParams {
+    v2_closure_type: Option<String>,
+}
+
+async fn ingest(
+    State(s): State<AppState>,
+    Query(p): Query<IngestParams>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, AppError> {
     let is_json = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -139,14 +162,16 @@ async fn ingest(State(s): State<AppState>, headers: HeaderMap, body: Body) -> Re
             .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
         let req: IngestUrlRequest = serde_json::from_slice(&bytes)
             .map_err(|e| err(StatusCode::BAD_REQUEST, format!("expected {{\"url\": ...}}: {e}")))?;
+        let v2 = req.v2_closure_type.or(p.v2_closure_type);
         jobs::enqueue(
             &s.pool,
             "ingest",
-            serde_json::json!({"source": "url", "url": req.url}),
+            serde_json::json!({"source": "url", "url": req.url, "v2_closure_type": v2}),
         )
         .await?
     } else {
-        jobs::enqueue_upload(&s.pool, body.into_data_stream()).await?
+        let params = serde_json::json!({"v2_closure_type": p.v2_closure_type});
+        jobs::enqueue_upload(&s.pool, body.into_data_stream(), params).await?
     };
     Ok((StatusCode::ACCEPTED, Json(JobCreated { id })).into_response())
 }
@@ -170,26 +195,57 @@ async fn get_job(State(s): State<AppState>, Path(id): Path<i64>) -> R<JobInfo> {
 }
 
 async fn releases(State(s): State<AppState>) -> R<Vec<ReleaseInfo>> {
-    let rows: Vec<(String, String, String, String, Option<String>, Vec<String>, chrono::DateTime<chrono::Utc>)> =
-        sqlx::query_as(
-            "SELECT r.name, r.commit, r.channel, r.series, r.url,
-                    COALESCE(array_agg(d.dataset ORDER BY d.dataset) FILTER (WHERE d.dataset IS NOT NULL), '{}'),
-                    r.indexed_at
-             FROM releases r LEFT JOIN release_datasets d ON d.release_id = r.id
-             GROUP BY r.id ORDER BY r.channel, r.indexed_at, r.name",
-        )
-        .fetch_all(&s.pool)
-        .await?;
+    type Row = (
+        i32,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Vec<String>,
+        chrono::DateTime<chrono::Utc>,
+    );
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT r.id, r.name, r.commit, r.channel, r.series, r.url,
+                COALESCE(array_agg(d.dataset ORDER BY d.dataset) FILTER (WHERE d.dataset IS NOT NULL), '{}'),
+                r.indexed_at
+         FROM releases r LEFT JOIN release_datasets d ON d.release_id = r.id
+         GROUP BY r.id ORDER BY r.channel, r.indexed_at, r.name",
+    )
+    .fetch_all(&s.pool)
+    .await?;
+    let evals: Vec<(i32, String, Vec<String>, Option<Vec<String>>)> = sqlx::query_as(
+        "SELECT e.release_id, t.name,
+                ARRAY(SELECT ct.name FROM closures c JOIN closure_types ct ON ct.id = c.type_id
+                       WHERE c.eval_id = e.id ORDER BY ct.id),
+                CASE WHEN e.errors_indexed THEN
+                  ARRAY(SELECT x.attr || '@' || x.system FROM eval_errors x WHERE x.eval_id = e.id
+                         ORDER BY x.attr, x.system)
+                END
+           FROM evals e JOIN eval_types t ON t.id = e.type_id
+          ORDER BY e.release_id, t.id",
+    )
+    .fetch_all(&s.pool)
+    .await?;
+    let mut evals_by_release: std::collections::HashMap<i32, Vec<EvalInfo>> = Default::default();
+    for (release, eval_type, closures, errors) in evals {
+        evals_by_release.entry(release).or_default().push(EvalInfo {
+            eval_type,
+            closures,
+            errors,
+        });
+    }
     Ok(Json(
         rows.into_iter()
             .map(
-                |(name, commit, channel, series, url, datasets, indexed_at)| ReleaseInfo {
+                |(id, name, commit, channel, series, url, datasets, indexed_at)| ReleaseInfo {
                     name,
                     commit,
                     channel,
                     series,
                     url,
                     datasets,
+                    evals: evals_by_release.remove(&id).unwrap_or_default(),
                     indexed_at,
                 },
             )

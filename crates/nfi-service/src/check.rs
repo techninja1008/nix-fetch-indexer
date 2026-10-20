@@ -28,26 +28,40 @@ const CHECKS: &[Check] = &[
         example: "format('%s-%s references missing id %s', s.hash, s.name, x)",
     },
     Check {
-        kind: "unknown_releases",
-        description: "membership in release ids that do not exist",
-        from: "FROM store_paths s, unnest(s.releases) x
-               WHERE NOT EXISTS (SELECT 1 FROM releases r WHERE r.id = x)",
-        example: "format('%s-%s is in missing release id %s', s.hash, s.name, x)",
+        kind: "unknown_closures",
+        description: "membership in closure ids that do not exist",
+        from: "FROM store_paths s, unnest(s.closures) x
+               WHERE NOT EXISTS (SELECT 1 FROM closures c WHERE c.id = x)",
+        example: "format('%s-%s is in missing closure id %s', s.hash, s.name, x)",
     },
     Check {
         kind: "orphan_paths",
-        description: "store paths that belong to no release",
-        from: "FROM store_paths s WHERE s.releases = '{}'",
+        description: "store paths that belong to no closure",
+        from: "FROM store_paths s WHERE s.closures = '{}'",
         example: "format('%s-%s', s.hash, s.name)",
     },
     Check {
         kind: "open_closures",
-        description: "references to paths missing from a release the referrer belongs to",
+        description: "references to paths missing from a closure the referrer belongs to",
         from: "FROM store_paths s, unnest(s.refs) x
                JOIN store_paths t ON t.id = x
-               WHERE NOT t.releases @> s.releases",
-        example: "format('%s-%s (releases %s) references %s-%s (releases %s)',
-                         s.hash, s.name, s.releases, t.hash, t.name, t.releases)",
+               WHERE NOT t.closures @> s.closures",
+        example: "format('%s-%s (closures %s) references %s-%s (closures %s)',
+                         s.hash, s.name, s.closures, t.hash, t.name, t.closures)",
+    },
+    Check {
+        kind: "foreign_closure_types",
+        description: "closures whose closure type belongs to another eval type than their evaluation",
+        from: "FROM closures c JOIN evals e ON e.id = c.eval_id
+               JOIN closure_types ct ON ct.id = c.type_id
+               WHERE ct.eval_type_id <> e.type_id",
+        example: "format('closure %s (type %s) of eval %s', c.id, ct.id, e.id)",
+    },
+    Check {
+        kind: "unindexed_eval_errors",
+        description: "eval errors of evaluations whose errors are not marked as indexed",
+        from: "FROM eval_errors x JOIN evals e ON e.id = x.eval_id WHERE NOT e.errors_indexed",
+        example: "format('%s@%s in eval %s', x.attr, x.system, e.id)",
     },
 ];
 
@@ -64,6 +78,13 @@ pub async fn check(pool: &PgPool) -> Result<CheckReport> {
     let releases: i64 = sqlx::query_scalar("SELECT count(*) FROM releases")
         .fetch_one(&mut *tx)
         .await?;
+    let closures: i64 = sqlx::query_scalar("SELECT count(*) FROM closures")
+        .fetch_one(&mut *tx)
+        .await?;
+    let (evals, eval_errors): (i64, i64) =
+        sqlx::query_as("SELECT (SELECT count(*) FROM evals), (SELECT count(*) FROM eval_errors)")
+            .fetch_one(&mut *tx)
+            .await?;
     let mut issues = Vec::new();
     for c in CHECKS {
         // A plain count can use parallel workers; examples are only fetched
@@ -92,6 +113,9 @@ pub async fn check(pool: &PgPool) -> Result<CheckReport> {
         store_paths: store_paths as u64,
         references: references.unwrap_or(0) as u64,
         releases: releases as u64,
+        closures: closures as u64,
+        evals: evals as u64,
+        eval_errors: eval_errors as u64,
         issues,
     })
 }

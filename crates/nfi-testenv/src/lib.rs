@@ -382,6 +382,12 @@ pub fn bundle() -> Bundle {
         datasets: Dataset::ALL.to_vec(),
     });
     let mut cb = ClosureBuilder::new();
+    // One store-paths evaluation and closure per release, created in release
+    // order so the closure indices equal the release indices used below.
+    for r in [ra, rb] {
+        let e = b.ensure_eval(r as u32, STORE_PATHS);
+        assert_eq!(cb.ensure_closure(e, ""), r);
+    }
     let def: &[(u8, &str, &[u8], &[usize])] = &[
         (1, "glibc-2.40", &[1], &[ra, rb]),
         (2, "hello-2.12", &[1, 2], &[ra, rb]),

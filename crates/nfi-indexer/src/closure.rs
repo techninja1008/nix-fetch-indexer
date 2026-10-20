@@ -50,19 +50,24 @@ pub fn parse_store_paths(xz: &[u8]) -> Result<Vec<StorePath>> {
 }
 
 /// Index the closure of `roots` into `builder`, marking it as part of
-/// `release`. Paths already present in the builder are not fetched again.
+/// `closure` (an index into the builder's closure table). Paths already
+/// present in the builder are not fetched again; roots that are not in the
+/// cache are recorded as missing from the closure.
+///
+/// This is the walk shared by every closure type: they differ only in how
+/// their roots are collected.
 pub async fn index_closure(
     fetcher: &Fetcher,
     opts: &ClosureOptions,
     builder: &mut ClosureBuilder,
     roots: &[StorePath],
-    release: usize,
+    closure: usize,
 ) -> Result<ClosureReport> {
     let mut report = ClosureReport {
         roots: roots.len(),
         ..Default::default()
     };
-    let bit = Bitset::single(release);
+    let bit = Bitset::single(closure);
     let mut queued: HashSet<StoreHash> = HashSet::new();
     let mut pending: Vec<(StoreHash, String)> = Vec::new();
     for r in roots {
@@ -132,7 +137,7 @@ pub async fn index_closure(
     let missing_set: HashSet<StoreHash> = missing_roots.iter().map(|(h, _)| *h).collect();
     builder.mark_closure(
         root_hashes.into_iter().filter(|h| !missing_set.contains(h)),
-        release,
+        closure,
     );
     for (h, name) in missing_roots {
         builder.add_missing(h, &name, &bit);

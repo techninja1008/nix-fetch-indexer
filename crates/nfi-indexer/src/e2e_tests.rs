@@ -2,8 +2,9 @@
 
 use crate::closure::ClosureOptions;
 use crate::fetch::Fetcher;
-use crate::index::{IndexOptions, index_releases};
+use crate::index::{IndexOptions, Target, index_releases};
 use crate::outpaths::OutpathsOptions;
+use crate::probes::{HELPERS, ProbeOptions};
 use crate::release::{self, ReleaseLocation};
 use nfi_interchange::*;
 use std::io::Write;
@@ -92,14 +93,19 @@ async fn serve(root: &Path) -> String {
     format!("http://{addr}")
 }
 
-fn opts(base: &str, datasets: Vec<Dataset>, eval: &Path) -> IndexOptions {
+fn targets(s: &str) -> Vec<Target> {
+    s.split(',').map(|t| t.parse().unwrap()).collect()
+}
+
+fn opts(base: &str, targets: Vec<Target>, eval: &Path) -> IndexOptions {
     IndexOptions {
-        datasets,
+        targets,
         closure: ClosureOptions {
             cache_url: format!("{base}/cache"),
             concurrency: 4,
             sample: None,
         },
+        probes: ProbeOptions::default(),
         outpaths: OutpathsOptions {
             command: vec![eval.display().to_string()],
             systems: vec!["x86_64-linux".into()],
@@ -126,11 +132,28 @@ fn fake_eval(dir: &Path) -> std::path::PathBuf {
     p
 }
 
-fn names(c: &ClosureSection, release: usize) -> Vec<String> {
+fn names(b: &Bundle, release: usize) -> Vec<String> {
+    typed_names(b, release, STORE_PATHS)
+}
+
+/// Index of the closure of a release with a qualified closure type.
+fn closure_of(b: &Bundle, release: usize, closure_type: &str) -> usize {
+    let ct: ClosureType = closure_type.parse().unwrap();
+    let e = b.eval_index(release as u32, &ct.eval_type).expect("eval exists");
+    b.closure
+        .as_ref()
+        .unwrap()
+        .closure_index(e as u32, &ct.name)
+        .expect("closure exists")
+}
+
+fn typed_names(b: &Bundle, release: usize, closure_type: &str) -> Vec<String> {
+    let ci = closure_of(b, release, closure_type);
+    let c = b.closure.as_ref().unwrap();
     let mut v: Vec<String> = c
         .paths
         .iter()
-        .filter(|p| p.releases.get(release))
+        .filter(|p| p.closures.get(ci))
         .map(|p| p.name.clone())
         .collect();
     v.sort();
@@ -156,19 +179,34 @@ async fn index_two_releases_end_to_end() {
         locs.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(),
         vec!["nixos-25.05.100.aaaaaaaaaaaa", "nixos-25.05.200.bbbbbbbbbbbb"]
     );
-    let b = index_releases(&fetcher, &locs, &opts(&base, Dataset::ALL.to_vec(), &eval), None)
-        .await
-        .unwrap();
+    // Everything that does not need Nix (helper probes: see
+    // helper_probe_closures).
+    let o = opts(&base, targets("store-paths,packages,programs,outpaths"), &eval);
+    let b = index_releases(&fetcher, &locs, &o, None).await.unwrap();
     b.validate().unwrap();
     assert_eq!(b.releases.len(), 2);
     assert_eq!(b.releases[0].commit, "a".repeat(40));
     assert_eq!(b.releases[0].channel, "nixos-25.05");
-    assert_eq!(b.releases[0].datasets, Dataset::ALL.to_vec());
+    assert_eq!(
+        b.releases[0].datasets,
+        [
+            Dataset::Closure,
+            Dataset::Packages,
+            Dataset::Outpaths,
+            Dataset::Programs
+        ]
+    );
+    // Nothing was evaluated, so there is no eval errors section; the
+    // store-paths pseudo-evaluation has one closure per release.
+    assert!(b.eval_errors.is_none());
+    assert_eq!(b.evals.len(), 2);
+    assert!(b.evals.iter().all(|e| e.eval_type == STORE_PATHS));
     let c = b.closure.as_ref().unwrap();
-    assert_eq!(names(c, 0), vec!["p1", "p2", "p3", "p4"]);
-    assert_eq!(names(c, 1), vec!["p1", "p2", "p3", "p5"]);
+    assert_eq!(names(&b, 0), vec!["p1", "p2", "p3", "p4"]);
+    assert_eq!(names(&b, 1), vec!["p1", "p2", "p3", "p5"]);
     assert_eq!(c.missing.len(), 1);
-    assert!(c.missing[0].releases.get(0) && !c.missing[0].releases.get(1));
+    let (c0, c1) = (closure_of(&b, 0, STORE_PATHS), closure_of(&b, 1, STORE_PATHS));
+    assert!(c.missing[0].closures.get(c0) && !c.missing[0].closures.get(c1));
     let p1 = c.paths.iter().find(|p| p.name == "p1").unwrap();
     assert_eq!(p1.nar_size, Some(100));
     assert_eq!(p1.references.len(), 2);
@@ -195,7 +233,7 @@ async fn seeded_run_reuses_known_paths() {
         "{base}/releases/nixos/25.05/nixos-25.05.200.bbbbbbbbbbbb"
     ))
     .unwrap();
-    let o = opts(&base, vec![Dataset::Closure], &eval);
+    let o = opts(&base, targets("store-paths"), &eval);
     let seed = index_releases(&fetcher, std::slice::from_ref(&a), &o, None)
         .await
         .unwrap();
@@ -210,10 +248,7 @@ async fn seeded_run_reuses_known_paths() {
     b.validate().unwrap();
     assert_eq!(b.releases.len(), 1);
     assert_eq!(b.releases[0].name, bl.name);
-    assert_eq!(
-        names(b.closure.as_ref().unwrap(), 0),
-        vec!["p1", "p2", "p3", "p5"]
-    );
+    assert_eq!(names(&b, 0), vec!["p1", "p2", "p3", "p5"]);
     assert!(b.closure.as_ref().unwrap().missing.is_empty());
 
     let mut o2 = o.clone();
@@ -222,6 +257,132 @@ async fn seeded_run_reuses_known_paths() {
         .await
         .unwrap();
     assert_eq!(both.releases.len(), 2);
+}
+
+fn script(dir: &Path, name: &str, body: &str) -> String {
+    let p = dir.join(name);
+    std::fs::write(&p, format!("#!/bin/sh\n{body}")).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    p.display().to_string()
+}
+
+/// Helper closure types, with fake `nix-instantiate` and `nix`: probes
+/// `fetchurl` (two calls sharing a curl-like input built from an uncached
+/// source tarball), `stdenv` (a target) and `broken` (fails to evaluate).
+#[tokio::test]
+async fn helper_probe_closures() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture(dir.path());
+    let base = serve(dir.path()).await;
+    let fetcher = Fetcher::new(1).unwrap();
+    let drv = |n: u32, name: &str| format!("/nix/store/{}-{name}.drv", hash(n));
+    let out = |n: u32, name: &str| format!("/nix/store/{}-{name}", hash(n));
+    let instantiate = script(
+        dir.path(),
+        "fake-nix-instantiate",
+        &format!(
+            r#"case "$*" in
+  *--eval*) echo '{{"broken":"fetch","fetchurl":"fetch","stdenv":"target"}}' ;;
+  *"probes'.broken."*) echo "error: attribute 'nope' missing" >&2; exit 1 ;;
+  *"probes'.fetchurl."*) echo {a}; echo {b} ;;
+  *"probes'.stdenv."*) echo {s} ;;
+  *) exit 2 ;;
+esac
+"#,
+            a = drv(2001, "probe-a.tar.gz"),
+            b = drv(2002, "probe-b.tar.gz"),
+            s = drv(2003, "stdenv"),
+        ),
+    );
+    let graph = serde_json::json!({"derivations": {
+        drv(2001, "probe-a.tar.gz"): {"outputs": {"out": {"path": out(91, "probe-a.tar.gz")}},
+            "inputs": {"drvs": {drv(2004, "curl"): {"outputs": ["out"]}, drv(2006, "arg-a"): {"outputs": ["out"]}}, "srcs": []}},
+        drv(2002, "probe-b.tar.gz"): {"outputs": {"out": {"path": out(92, "probe-b.tar.gz")}},
+            "inputs": {"drvs": {drv(2004, "curl"): {"outputs": ["out"]}}, "srcs": []}},
+        drv(2004, "curl"): {"outputs": {"out": {"path": out(4, "p4")}},
+            "inputs": {"drvs": {drv(2005, "curl.tar.xz"): {"outputs": ["out"]}}, "srcs": []}},
+        drv(2005, "curl.tar.xz"): {"outputs": {"out": {"path": out(98, "curl.tar.xz")}}, "inputs": {"drvs": {}, "srcs": []}},
+        drv(2006, "arg-a"): {"outputs": {"out": {"path": out(97, "arg-a")}}, "inputs": {"drvs": {}, "srcs": []}},
+        drv(2003, "stdenv"): {"outputs": {"out": {"path": out(5, "p5")}}, "inputs": {"drvs": {}, "srcs": []}},
+    }, "version": 4});
+    std::fs::write(dir.path().join("graph.json"), graph.to_string()).unwrap();
+    let nix = script(
+        dir.path(),
+        "fake-nix",
+        &format!("cat {}\n", dir.path().join("graph.json").display()),
+    );
+    let mut o = opts(
+        &base,
+        targets("store-paths,helpers:direct,helpers:full"),
+        Path::new("/bin/false"),
+    );
+    o.probes = ProbeOptions {
+        systems: vec!["x86_64-linux".into()],
+        nix_instantiate: vec![instantiate],
+        nix: vec![nix],
+        jobs: 2,
+    };
+    let a = ReleaseLocation::parse(&format!(
+        "{base}/releases/nixos/25.05/nixos-25.05.100.aaaaaaaaaaaa"
+    ))
+    .unwrap();
+    let b = index_releases(&fetcher, &[a], &o, None).await.unwrap();
+    b.validate().unwrap();
+    let c = b.closure.as_ref().unwrap();
+    assert_eq!(c.closures.len(), 3);
+    assert_eq!(names(&b, 0), vec!["p1", "p2", "p3", "p4"]);
+    // curl (p4) and stdenv (p5), with their runtime closures; not the
+    // argument-specific derivation (97) or the fetches themselves.
+    assert_eq!(
+        typed_names(&b, 0, "helpers:direct"),
+        vec!["p1", "p2", "p3", "p4", "p5"]
+    );
+    assert_eq!(
+        typed_names(&b, 0, "helpers:full"),
+        vec!["p1", "p2", "p3", "p4", "p5"]
+    );
+    // The uncached source tarball is missing from helpers:full only.
+    let full = closure_of(&b, 0, "helpers:full");
+    let direct = closure_of(&b, 0, "helpers:direct");
+    // Both helper closures belong to the one helpers evaluation.
+    let he = b.eval_index(0, HELPERS).unwrap();
+    assert_eq!(c.closures[full].eval as usize, he);
+    assert_eq!(c.closures[direct].eval as usize, he);
+    let tarball = c.missing.iter().find(|m| m.name == "curl.tar.xz").unwrap();
+    assert!(tarball.closures.get(full) && !tarball.closures.get(direct));
+    // The probe that fails to evaluate is an eval error of the probes'
+    // evaluation; the message is not kept.
+    // The store-paths pseudo-evaluation has no error information.
+    let e = b.eval_errors.as_ref().unwrap();
+    assert_eq!(e.evals, Bitset::single(he));
+    assert_eq!(
+        e.errors,
+        vec![EvalError {
+            attr: "broken".into(),
+            system: "x86_64-linux".into(),
+            evals: Bitset::single(he),
+        }]
+    );
+    assert!(b.releases[0].datasets.contains(&Dataset::EvalErrors));
+
+    // One helper closure type runs the same evaluation.
+    o.targets = targets("helpers:direct");
+    let a = ReleaseLocation::parse(&format!(
+        "{base}/releases/nixos/25.05/nixos-25.05.100.aaaaaaaaaaaa"
+    ))
+    .unwrap();
+    let b = index_releases(&fetcher, &[a], &o, None).await.unwrap();
+    b.validate().unwrap();
+    assert_eq!(b.evals.len(), 1);
+    assert_eq!(b.closure.as_ref().unwrap().closures.len(), 1);
+    assert_eq!(b.eval_errors.as_ref().unwrap().errors.len(), 1);
+    // Unknown targets are rejected.
+    assert!("helpers:nope".parse::<Target>().is_err());
+    // An evaluator is not a target: it has no closure type of its own.
+    assert!("helpers".parse::<Target>().is_err());
+    assert!("store-paths".parse::<Target>().is_ok());
+    assert!("eval-errors".parse::<Target>().is_err());
 }
 
 /// Opt-in live smoke test (`NFI_LIVE_TESTS=1`): index a small sample of a real
@@ -237,7 +398,8 @@ async fn live_smoke() {
     let fetcher = Fetcher::new(4).unwrap();
     let loc = ReleaseLocation::parse(&url).unwrap();
     let opts = IndexOptions {
-        datasets: vec![Dataset::Closure, Dataset::Packages, Dataset::Programs],
+        targets: targets("store-paths,packages,programs"),
+        probes: ProbeOptions::default(),
         closure: ClosureOptions {
             sample: Some(25),
             ..Default::default()
@@ -258,7 +420,7 @@ async fn live_smoke() {
         nfi_interchange::Format::Binary(nfi_interchange::Compression::DEFAULT),
     )
     .unwrap();
-    assert_eq!(nfi_interchange::codec::read(&buf[..]).unwrap(), b);
+    assert_eq!(nfi_interchange::codec::read(&buf[..], STORE_PATHS).unwrap(), b);
 }
 
 /// Runs the real nix-eval-jobs (when on PATH and able to evaluate) over a

@@ -67,14 +67,15 @@ pub async fn enqueue(pool: &PgPool, kind: &str, params: Value) -> Result<i64> {
 }
 
 /// Stage an uploaded bundle in chunks, then queue an ingest job for it.
-pub async fn enqueue_upload<S, E>(pool: &PgPool, mut body: S) -> Result<i64>
+pub async fn enqueue_upload<S, E>(pool: &PgPool, mut body: S, params: Value) -> Result<i64>
 where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
     E: std::error::Error + Send + Sync + 'static,
 {
     let id: i64 = sqlx::query_scalar(
-        "INSERT INTO jobs (kind, status, params) VALUES ('ingest', 'staging', '{}') RETURNING id",
+        "INSERT INTO jobs (kind, status, params) VALUES ('ingest', 'staging', $1) RETURNING id",
     )
+    .bind(params)
     .fetch_one(pool)
     .await?;
     let res: Result<usize> = async {
@@ -98,7 +99,7 @@ where
     .await;
     match res {
         Ok(total) => {
-            sqlx::query("UPDATE jobs SET status = 'queued', params = $2 WHERE id = $1")
+            sqlx::query("UPDATE jobs SET status = 'queued', params = params || $2 WHERE id = $1")
                 .bind(id)
                 .bind(json!({"source": "upload", "bytes": total}))
                 .execute(pool)
@@ -230,8 +231,13 @@ async fn run_job(state: &AppState, id: i64, kind: &str, params: &Value) -> Resul
                 load_blob(pool, id).await?
             };
             progress(format!("decoding {} bytes", data.len()));
+            let v2 = params
+                .get("v2_closure_type")
+                .and_then(Value::as_str)
+                .unwrap_or(nfi_interchange::STORE_PATHS)
+                .to_string();
             let bundle =
-                tokio::task::spawn_blocking(move || nfi_interchange::codec::read(&data[..])).await??;
+                tokio::task::spawn_blocking(move || nfi_interchange::codec::read(&data[..], &v2)).await??;
             let report = crate::ingest::ingest(pool, &bundle, &progress).await?;
             let mut result = serde_json::to_value(&report)?;
             if let Some(m) = &state.meili {

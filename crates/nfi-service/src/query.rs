@@ -71,12 +71,12 @@ pub async fn cached_paths(pool: &PgPool, paths: &BTreeSet<String>) -> Result<BTr
     let parsed: Vec<StorePath> = paths.iter().filter_map(|p| StorePath::parse(p).ok()).collect();
     let hashes: Vec<String> = parsed.iter().map(|p| p.hash.to_string()).collect();
     let found: Vec<(String, String, i32)> =
-        sqlx::query_as("SELECT hash, name, cardinality(releases) FROM store_paths WHERE hash = ANY($1)")
+        sqlx::query_as("SELECT hash, name, cardinality(closures) FROM store_paths WHERE hash = ANY($1)")
             .bind(&hashes)
             .fetch_all(pool)
             .await?;
     if let Some((hash, name, _)) = found.iter().find(|(_, _, n)| *n == 0) {
-        return Err(Inconsistent(format!("store path {hash}-{name} belongs to no release")).into());
+        return Err(Inconsistent(format!("store path {hash}-{name} belongs to no closure")).into());
     }
     let found: HashMap<String, String> = found.into_iter().map(|(h, n, _)| (h, n)).collect();
     Ok(parsed
@@ -105,7 +105,7 @@ pub async fn closure(
              UNION
              SELECT unnest(s.refs) FROM store_paths s JOIN c ON s.id = c.id
          )
-         SELECT s.id, s.hash, s.name, s.nar_size, s.file_size, s.refs, cardinality(s.releases)
+         SELECT s.id, s.hash, s.name, s.nar_size, s.file_size, s.refs, cardinality(s.closures)
            FROM c JOIN store_paths s ON s.id = c.id ORDER BY s.hash",
     )
     .bind(&hashes)
@@ -118,10 +118,10 @@ pub async fn closure(
     // References to ids without a row would otherwise silently shrink the
     // closure (the recursive join drops them).
     let mut edges = Vec::new();
-    for (id, _, _, _, _, refs, releases) in &rows {
+    for (id, _, _, _, _, refs, closures) in &rows {
         let path = &by_id[id];
-        if *releases == 0 {
-            return Err(Inconsistent(format!("store path {path} belongs to no release")).into());
+        if *closures == 0 {
+            return Err(Inconsistent(format!("store path {path} belongs to no closure")).into());
         }
         for r in refs {
             let Some(target) = by_id.get(r) else {
@@ -151,16 +151,41 @@ fn sizes(nodes: &[ClosureNode]) -> (u64, u64) {
     })
 }
 
-pub async fn minimise(pool: &PgPool, graph: &ReducedGraph) -> Result<MinimiseResponse> {
+/// Number of indexed store paths with each of `names`.
+async fn indexed_names(pool: &PgPool, names: &[&str]) -> Result<HashMap<String, u64>> {
+    let rows: Vec<(String, i64)> =
+        sqlx::query_as("SELECT name, count(*) FROM store_paths WHERE name = ANY($1) GROUP BY name")
+            .bind(names)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().map(|(n, c)| (n, c as u64)).collect())
+}
+
+pub async fn minimise(
+    pool: &PgPool,
+    graph: &ReducedGraph,
+    close_miss_threshold: u64,
+) -> Result<MinimiseResponse> {
+    use nfi_api::minimise as m;
     let cached = cached_paths(pool, &graph.all_paths()).await?;
-    let plan = nfi_api::minimise::plan(graph, |p| cached.contains(p));
-    let warnings = nfi_api::minimise::anchor_warnings(graph, |p| cached.contains(p));
+    let plan = m::plan(graph, |p| cached.contains(p));
+    let mut warnings = m::anchor_warnings(&plan);
+    if close_miss_threshold > 0 {
+        let names: Vec<&str> = plan.to_build.iter().map(|d| m::drv_name(d)).collect();
+        let indexed = indexed_names(pool, &names).await?;
+        warnings.extend(m::close_miss_warnings(
+            &plan,
+            |n| indexed.get(n).copied().unwrap_or(0),
+            close_miss_threshold,
+        ));
+    }
     let (nodes, edges) = closure(pool, &plan.hits).await?;
     let roots = nfi_api::minimise::roots(&plan.hits, &edges);
     let (nar_size, file_size) = sizes(&nodes);
     Ok(MinimiseResponse {
         requested: plan.requested,
         to_build: plan.to_build,
+        to_fetch: plan.to_fetch,
         roots,
         closure: nodes.into_iter().map(|n| n.path).collect(),
         unresolved: plan.unresolved,

@@ -4,7 +4,7 @@
 //! id, then the (compressed) CBOR encoding of [`Bundle`].
 //! JSON layout: the bundle as a single JSON object (detected by a leading `{`).
 
-use crate::model::Bundle;
+use crate::model::{Bundle, STORE_PATHS};
 use anyhow::{Context, Result, bail};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
@@ -206,12 +206,20 @@ pub enum Detected {
     Json,
 }
 
-/// Read a bundle in either representation (auto-detected).
-pub fn read<R: Read>(r: R) -> Result<Bundle> {
-    read_detect(r).map(|(b, _)| b)
+/// Read a bundle in either representation (auto-detected). Version 2
+/// bundles are upgraded, with their closures given `v2_closure_type`.
+pub fn read<R: Read>(r: R, v2_closure_type: &str) -> Result<Bundle> {
+    read_detect(r, v2_closure_type).map(|(b, _)| b)
 }
 
-pub fn read_detect<R: Read>(r: R) -> Result<(Bundle, Detected)> {
+pub fn read_detect<R: Read>(r: R, v2_closure_type: &str) -> Result<(Bundle, Detected)> {
+    let (mut bundle, detected) = decode(r)?;
+    let v2: crate::ClosureType = v2_closure_type.parse().map_err(anyhow::Error::msg)?;
+    bundle.upgrade(&v2);
+    Ok((bundle, detected))
+}
+
+fn decode<R: Read>(r: R) -> Result<(Bundle, Detected)> {
     let mut r = BufReader::with_capacity(1 << 16, r);
     let head = r.fill_buf()?;
     let first = head.iter().copied().find(|c| !c.is_ascii_whitespace());
@@ -238,17 +246,17 @@ pub fn read_detect<R: Read>(r: R) -> Result<(Bundle, Detected)> {
     Ok((bundle, Detected::Binary { compression_id: id }))
 }
 
-pub fn read_file(path: &Path) -> Result<Bundle> {
+pub fn read_file(path: &Path, v2_closure_type: &str) -> Result<Bundle> {
     let f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    read(f).with_context(|| format!("reading {}", path.display()))
+    read(f, v2_closure_type).with_context(|| format!("reading {}", path.display()))
 }
 
 /// Read from a path, or stdin when the path is `-`.
-pub fn read_path_or_stdin(path: &str) -> Result<Bundle> {
+pub fn read_path_or_stdin(path: &str, v2_closure_type: &str) -> Result<Bundle> {
     if path == "-" {
-        read(std::io::stdin().lock())
+        read(std::io::stdin().lock(), v2_closure_type)
     } else {
-        read_file(Path::new(path))
+        read_file(Path::new(path), v2_closure_type)
     }
 }
 
@@ -270,7 +278,7 @@ pub fn bench(bundle: &Bundle, compressions: &[Compression]) -> Result<Vec<BenchR
         write_binary(bundle, &mut buf, c)?;
         let encode = t.elapsed();
         let t = std::time::Instant::now();
-        let back = read(&buf[..])?;
+        let back = read(&buf[..], STORE_PATHS)?;
         let decode = t.elapsed();
         if &back != bundle {
             bail!("round trip mismatch for {c:?}");

@@ -20,6 +20,9 @@ pub struct ReducedDrv {
     pub input_drvs: BTreeMap<String, BTreeSet<String>>,
     #[serde(default, rename = "inputSrcs")]
     pub input_srcs: BTreeSet<String>,
+    /// Fixed-output derivation (a fetch: its output hash is known up front).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fixed: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,8 +95,20 @@ fn fixed_output_path(drv_path: &str, output: &str, o: &Value) -> Option<String> 
 
 fn reduce_one(drv_path: &str, d: &Value) -> Result<ReducedDrv> {
     let mut r = ReducedDrv::default();
+    if let Some(fixed) = d.get("fixed").and_then(Value::as_bool) {
+        // Already reduced.
+        r.fixed = fixed;
+    }
     if let Some(outs) = d.get("outputs").and_then(Value::as_object) {
         for (name, o) in outs {
+            // Fixed outputs carry their hash (floating CA outputs only an
+            // algorithm), in both the legacy and the current format.
+            if o.get("hash")
+                .and_then(Value::as_str)
+                .is_some_and(|h| !h.is_empty())
+            {
+                r.fixed = true;
+            }
             // Raw: {"path": "..."}, {"hash": ..., "method": ...} for fixed
             // outputs in newer Nix, or neither for floating CA outputs;
             // reduced: "..." or null.
@@ -272,8 +287,13 @@ mod tests {
         let out = |drv: &str| g.derivations[&format!("/nix/store/{drv}")].outputs["out"].clone();
         for (drv, _, _, expected) in cases {
             assert_eq!(out(drv), Some(format!("/nix/store/{expected}")), "{drv}");
+            assert!(g.derivations[&format!("/nix/store/{drv}")].fixed, "{drv}");
         }
         assert_eq!(out("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-floating.drv"), None);
+        assert!(!g.derivations["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-floating.drv"].fixed);
+        // `fixed` survives the reduced form (what clients send).
+        let again = ReducedGraph::from_json(&serde_json::to_value(&g).unwrap()).unwrap();
+        assert_eq!(again, g);
     }
 
     #[test]
@@ -286,7 +306,20 @@ mod tests {
         let g = ReducedGraph::from_json(&v).unwrap();
         let x = &g.derivations["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv"];
         assert_eq!(x.outputs["ca"], None);
+        assert!(!x.fixed);
         assert_eq!(x.input_srcs.len(), 1);
+        // Legacy fixed outputs: {"path", "hashAlgo", "hash"}.
+        let v: Value = serde_json::from_str(
+            r#"{"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-src.tar.gz.drv":{"outputs":{"out":{"path":"/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-src.tar.gz","hashAlgo":"sha256","hash":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}},"inputDrvs":{},"inputSrcs":[]}}"#,
+        )
+        .unwrap();
+        assert!(
+            ReducedGraph::from_json(&v)
+                .unwrap()
+                .derivations
+                .values()
+                .all(|d| d.fixed)
+        );
         assert_eq!(g.all_paths().len(), 2);
     }
 }

@@ -1551,6 +1551,7 @@ dependencies = [
  "bytes",
  "clap",
  "futures",
+ "nfi-api",
  "nfi-interchange",
  "reqwest",
  "rusqlite",

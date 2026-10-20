@@ -26,15 +26,14 @@ async fn live_end_to_end() {
             let fetcher = nfi_indexer::fetch::Fetcher::new(4).unwrap();
             let loc = nfi_indexer::release::ReleaseLocation::parse(&release_url).unwrap();
             let opts = nfi_indexer::index::IndexOptions {
-                datasets: vec![
-                    nfi_interchange::Dataset::Closure,
-                    nfi_interchange::Dataset::Packages,
-                    nfi_interchange::Dataset::Programs,
-                ],
+                targets: ["store-paths", "packages", "programs"]
+                    .map(|t| t.parse().unwrap())
+                    .to_vec(),
                 closure: nfi_indexer::closure::ClosureOptions {
                     sample: Some(200),
                     ..Default::default()
                 },
+                probes: Default::default(),
                 outpaths: Default::default(),
                 include_seed: false,
             };
@@ -51,7 +50,7 @@ async fn live_end_to_end() {
             p
         }
     };
-    let bundle = nfi_interchange::codec::read_file(&bundle_path).unwrap();
+    let bundle = nfi_interchange::codec::read_file(&bundle_path, nfi_interchange::STORE_PATHS).unwrap();
     let commit = bundle.releases[0].commit.clone();
     let started = std::time::Instant::now();
     let data = std::fs::read(&bundle_path).unwrap();
