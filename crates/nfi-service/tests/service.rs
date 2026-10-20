@@ -741,7 +741,7 @@ async fn eval_errors_ingest_and_prune() {
 
     let releases = || async {
         let mut rels: Vec<ReleaseInfo> = c
-            .admin(reqwest::Method::GET, "/admin/v1/releases")
+            .admin(reqwest::Method::GET, "/admin/v1/releases?errors=true")
             .send()
             .await
             .unwrap()
@@ -759,15 +759,23 @@ async fn eval_errors_ingest_and_prune() {
     let ev: Vec<_> = rels[0]
         .evals
         .iter()
-        .map(|e| (e.eval_type.as_str(), e.closures.len(), e.errors.clone()))
+        .map(|e| {
+            (
+                e.eval_type.as_str(),
+                e.closures.len(),
+                e.error_count,
+                e.errors.clone(),
+            )
+        })
         .collect();
     assert_eq!(
         ev,
         [
-            ("store-paths", 1, None),
+            ("store-paths", 1, None, None),
             (
                 "helpers",
                 0,
+                Some(2),
                 Some(vec![
                     "fetchhg@x86_64-linux".to_string(),
                     "fetchsvn@aarch64-linux".to_string()
@@ -779,6 +787,13 @@ async fn eval_errors_ingest_and_prune() {
         rels[1].evals[1].errors,
         Some(vec!["fetchhg@x86_64-linux".to_string()])
     );
+    // Without errors=true only the counts are listed, here and publicly.
+    let (_, public): (u16, Value) = c.get("/v1/releases?channel=nixos-25.05").await;
+    assert_eq!(public[0]["evals"][1]["error_count"], 2);
+    assert!(public[0]["evals"][1].get("errors").is_none(), "{public}");
+    assert_eq!(public[0]["evals"][0]["error_count"], Value::Null);
+    let (_, public): (u16, Vec<ReleaseInfo>) = c.get("/v1/releases?channel=nixos-25.05&errors=true").await;
+    assert_eq!(public[0].evals[1].errors, rels[0].evals[1].errors);
 
     let check = || async {
         let r = c

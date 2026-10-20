@@ -86,15 +86,19 @@ impl Client {
         self.send(rb.json(graph)).await
     }
 
-    /// Indexed releases, optionally only those in `channel`.
-    pub async fn releases(&self, channel: Option<&str>) -> Result<Vec<ReleaseInfo>> {
-        self.releases_at("/v1/releases", channel).await
+    /// Indexed releases, optionally only those in `channel`; `errors` also
+    /// lists each evaluation's errors, not only their count.
+    pub async fn releases(&self, channel: Option<&str>, errors: bool) -> Result<Vec<ReleaseInfo>> {
+        self.releases_at("/v1/releases", channel, errors).await
     }
 
-    async fn releases_at(&self, path: &str, channel: Option<&str>) -> Result<Vec<ReleaseInfo>> {
+    async fn releases_at(&self, path: &str, channel: Option<&str>, errors: bool) -> Result<Vec<ReleaseInfo>> {
         let mut rb = self.req(reqwest::Method::GET, path);
         if let Some(c) = channel {
             rb = rb.query(&[("channel", c)]);
+        }
+        if errors {
+            rb = rb.query(&[("errors", "true")]);
         }
         self.send(rb).await
     }
@@ -102,8 +106,8 @@ impl Client {
     // ----- admin -----
 
     /// [`Client::releases`] through the admin listener.
-    pub async fn admin_releases(&self, channel: Option<&str>) -> Result<Vec<ReleaseInfo>> {
-        self.releases_at("/admin/v1/releases", channel).await
+    pub async fn admin_releases(&self, channel: Option<&str>, errors: bool) -> Result<Vec<ReleaseInfo>> {
+        self.releases_at("/admin/v1/releases", channel, errors).await
     }
 
     /// Upload a bundle; `v2_closure_type` is the closure type to read a

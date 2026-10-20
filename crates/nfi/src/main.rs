@@ -72,6 +72,10 @@ enum Cmd {
         /// Only releases in this channel, e.g. nixos-25.05.
         #[arg(long)]
         channel: Option<String>,
+        /// Also list the attributes that failed to evaluate, not only their
+        /// count.
+        #[arg(long)]
+        errors: bool,
     },
     /// Show a package's metadata and output paths at a nixpkgs commit.
     Show {
@@ -211,8 +215,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Cmd::Releases { channel } => {
-            let rels = client.releases(channel.as_deref()).await?;
+        Cmd::Releases { channel, errors } => {
+            let rels = client.releases(channel.as_deref(), errors).await?;
             if cli.json {
                 print_json(&rels)?;
             } else {

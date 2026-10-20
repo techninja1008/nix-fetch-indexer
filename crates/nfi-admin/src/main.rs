@@ -62,6 +62,10 @@ enum Cmd {
         /// Only releases in this channel.
         #[arg(long)]
         channel: Option<String>,
+        /// Also list the attributes that failed to evaluate, not only their
+        /// count.
+        #[arg(long)]
+        errors: bool,
     },
     /// Remove releases by name, commit (prefix) or channel. With
     /// --closure-type, only remove those closures of the selected releases.
@@ -271,8 +275,8 @@ async fn run(cli: Cli) -> Result<Outcome> {
             }
             Ok(true)
         }
-        Cmd::Releases { channel } => {
-            let rels = client.admin_releases(channel.as_deref()).await?;
+        Cmd::Releases { channel, errors } => {
+            let rels = client.admin_releases(channel.as_deref(), errors).await?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&rels)?);
             } else {
