@@ -776,7 +776,7 @@ async fn eval_errors_ingest_and_prune() {
     // evaluation while its errors are known.
     let r = c
         .admin(reqwest::Method::POST, "/admin/v1/prune")
-        .json(&json!({"commits": [A], "closure_types": ["helpers"]}))
+        .json(&json!({"commits": [A], "closure_types": ["helpers:direct", "helpers:full"]}))
         .send()
         .await
         .unwrap();

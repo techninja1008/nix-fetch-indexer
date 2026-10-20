@@ -210,13 +210,13 @@ fn filter_sections_and_keeps_referenced_paths() {
     let a = sample("r1", &"a".repeat(40), false);
     let b = sample("r2", &"b".repeat(40), true);
     let m = ops::merge([a, b]);
-    let only_pk = ops::filter(&m, |r| r.name == "r1", Some(&[Dataset::Packages]), None);
+    let only_pk = ops::filter(&m, |r| r.name == "r1", Some(&[Dataset::Packages]), None, None);
     assert!(only_pk.closure.is_none() && only_pk.programs.is_none());
     assert_eq!(only_pk.releases[0].datasets, vec![Dataset::Packages]);
     assert_eq!(only_pk.packages.unwrap().entries.len(), 1);
 
     // Pretend p5 (only in r2) references a path with no release bits; it must be retained.
-    let r2 = ops::filter(&m, |r| r.name == "r2", None, None);
+    let r2 = ops::filter(&m, |r| r.name == "r2", None, None, None);
     r2.validate().unwrap();
     assert_eq!(r2.closure.as_ref().unwrap().paths.len(), 5);
     let st = ops::stats(&r2);
@@ -359,20 +359,44 @@ fn closure_types_merge_and_filter() {
     // Evaluations are sorted by release and eval type.
     assert_eq!(ev, [("helpers", 1, Some(0)), ("store-paths", 1, None)]);
 
-    let sel = |s: &str| -> Vec<ClosureSelector> { vec![s.parse().unwrap()] };
-    // Filtering by closure type keeps only that closure, and only eval
-    // errors of the selected eval types.
-    let only_rt = ops::filter(&m, |_| true, None, Some(&sel("store-paths")));
+    let ct = |s: &str| -> Vec<ClosureType> { vec![s.parse().unwrap()] };
+    // Filtering by closure type keeps only that closure and its evaluation.
+    let only_rt = ops::filter(
+        &m,
+        |_| true,
+        Some(&[Dataset::Closure]),
+        Some(&ct("store-paths")),
+        None,
+    );
     only_rt.validate().unwrap();
     assert_eq!(only_rt.evals.len(), 1);
-    assert!(only_rt.eval_errors.as_ref().unwrap().evals.is_empty());
     assert_eq!(only_rt.closure, ops::merge([rt]).closure);
-    let direct = ops::filter(&m, |_| true, None, Some(&sel("helpers:direct")));
+    let direct = ops::filter(
+        &m,
+        |_| true,
+        Some(&[Dataset::Closure]),
+        Some(&ct("helpers:direct")),
+        None,
+    );
     assert_eq!(direct.evals.len(), 1);
-    assert_eq!(direct.eval_errors.as_ref().unwrap().evals.count(), 1);
-    assert_eq!(ops::filter(&m, |_| true, None, Some(&sel("helpers"))), direct);
-    // A release left without closures loses the closure dataset.
-    let none = ops::filter(&m, |_| true, None, Some(&sel("helpers:full")));
+    assert_eq!(direct.closure.as_ref().unwrap().closures.len(), 1);
+    // Filtering by eval type keeps its evaluations, their closures and their
+    // eval errors.
+    let helpers = ops::filter(&m, |_| true, None, None, Some(&["helpers".to_string()]));
+    helpers.validate().unwrap();
+    assert_eq!(helpers.evals.len(), 1);
+    assert_eq!(helpers.eval_errors.as_ref().unwrap().evals.count(), 1);
+    let errors = ops::filter(
+        &m,
+        |_| true,
+        Some(&[Dataset::EvalErrors]),
+        None,
+        Some(&["helpers".to_string()]),
+    );
+    assert!(errors.closure.is_none());
+    assert_eq!(errors.evals.len(), 1);
+    // An eval type is not a closure type: it matches no closure.
+    let none = ops::filter(&m, |_| true, None, Some(&ct("helpers")), None);
     none.validate().unwrap();
     assert!(!none.releases[0].datasets.contains(&Dataset::Closure));
     assert!(none.closure.as_ref().unwrap().paths.is_empty());
@@ -386,12 +410,7 @@ fn closure_type_syntax() {
     let sp: ClosureType = "store-paths".parse().unwrap();
     assert_eq!(sp, ClosureType::new(STORE_PATHS, ""));
     assert_eq!(sp.to_string(), "store-paths");
-    let all: ClosureSelector = "helpers".parse().unwrap();
-    assert!(all.matches("helpers", "direct") && all.matches("helpers", ""));
-    assert!(!all.matches("store-paths", ""));
-    let unnamed: ClosureSelector = "helpers:".parse().unwrap();
-    assert!(unnamed.matches("helpers", "") && !unnamed.matches("helpers", "full"));
-    assert!(":full".parse::<ClosureSelector>().is_err());
+    assert!(":full".parse::<ClosureType>().is_err());
 }
 
 #[test]
@@ -455,7 +474,7 @@ fn eval_errors_merge_filter_and_validate() {
     assert_eq!(ops::merge(parts), m);
 
     // Filtering the section out drops it, and evaluations left with nothing.
-    let no = ops::filter(&m, |_| true, Some(&[Dataset::Closure]), None);
+    let no = ops::filter(&m, |_| true, Some(&[Dataset::Closure]), None, None);
     assert!(no.eval_errors.is_none());
     assert_eq!(no.evals.len(), 1);
     assert!(!no.releases[0].datasets.contains(&Dataset::EvalErrors));

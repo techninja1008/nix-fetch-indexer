@@ -112,7 +112,7 @@ EvalErrorsSection {
   - outpaths: (attr, system, drv_path)
   - programs: (name, system, attr)
   - eval errors: (attr, system); covered evaluations are unioned
-- **Split / filter:** select a subset of releases, sections and/or closure types (by selector: `helpers` selects all of an eval type's closure types, `helpers:full` one; eval errors are kept for the selected eval types), then drop the entries whose bitset becomes empty, and evaluations left with neither closures nor covered errors. A release left without closures loses the closure dataset.
+- **Split / filter:** select a subset of releases, sections, eval types (evaluations with their closures and eval errors) and/or closure types (exact, e.g. `helpers:full`), then drop the entries whose bitset becomes empty, and evaluations left with neither closures nor covered errors. A release left without closures loses the closure dataset.
 
 ## Indexers (`nfi-indexer`)
 
@@ -203,7 +203,7 @@ Membership and references are arrays on the path row, not one row per (path, clo
 
 A store path's references never change, so they are written only once, when the path is new.
 
-**Prune** removes the pruned closures' ids from the arrays, then deletes paths that are left with no closures. It removes whole releases (their evaluations, closures and eval errors cascade), or with `closure_types` (selectors) only the matching closures of the selected releases; evaluations left with neither closures nor indexed errors are removed too.
+**Prune** removes the pruned closures' ids from the arrays, then deletes paths that are left with no closures. It removes whole releases (their evaluations, closures and eval errors cascade), or with `closure_types` only the closures of those closure types of the selected releases; evaluations left with neither closures nor indexed errors are removed too.
 
 **Invariants.** These replace the foreign keys:
 - every reference resolves to an existing path;

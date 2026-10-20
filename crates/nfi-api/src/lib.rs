@@ -251,12 +251,11 @@ pub struct PruneRequest {
     pub commits: Vec<String>,
     #[serde(default)]
     pub channels: Vec<String>,
-    /// Only remove closures matching these selectors from the selected
-    /// releases: `<eval type>` (all its closure types) or `<eval
-    /// type>:<closure type>` (e.g. `helpers:full`). The releases and their
-    /// other data are kept; evaluations left with neither closures nor
-    /// indexed errors are removed. Empty removes the selected releases
-    /// entirely.
+    /// Only remove the closures of these closure types (`<eval
+    /// type>[:<closure type>]`, e.g. `helpers:full`) from the selected
+    /// releases. The releases and their other data are kept; evaluations
+    /// left with neither closures nor indexed errors are removed. Empty
+    /// removes the selected releases entirely.
     #[serde(default)]
     pub closure_types: Vec<String>,
 }

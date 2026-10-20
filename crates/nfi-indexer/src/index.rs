@@ -351,7 +351,7 @@ pub async fn index_releases_with_report(
         let mut b = if seed_releases.is_empty() {
             bundle
         } else {
-            ops::filter(&bundle, |r| new_releases.contains(&r.name), None, None)
+            ops::filter(&bundle, |r| new_releases.contains(&r.name), None, None, None)
         };
         let mut closure = b.closure.take();
         let (releases, evals) = (b.releases.clone(), b.evals.clone());

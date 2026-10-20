@@ -7,7 +7,7 @@ use nfi_indexer::outpaths::OutpathsOptions;
 use nfi_indexer::probes::ProbeOptions;
 use nfi_indexer::release::{self, DEFAULT_RELEASES_BASE, DEFAULT_S3_LIST_BASE, ReleaseLocation};
 use nfi_interchange::codec::{self, Compression, Format};
-use nfi_interchange::{ClosureSelector, Dataset, STORE_PATHS, ops};
+use nfi_interchange::{ClosureType, Dataset, STORE_PATHS, ops};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -82,11 +82,14 @@ enum Cmd {
         /// Sections to keep (closure, packages, outpaths, programs, eval-errors).
         #[arg(long = "section", value_delimiter = ',')]
         sections: Vec<Dataset>,
-        /// Closure types to keep, by evaluator or closure type (e.g.
-        /// `store-paths`, `helpers`, `helpers:direct`). Eval errors are kept
-        /// for the selected evaluators.
+        /// Closure types to keep (`<eval type>[:<closure type>]`, e.g.
+        /// `store-paths`, `helpers:direct`).
         #[arg(long = "closure-type", value_delimiter = ',')]
-        closure_types: Vec<ClosureSelector>,
+        closure_types: Vec<ClosureType>,
+        /// Eval types to keep, with their evaluations' closures and eval
+        /// errors (e.g. `helpers`).
+        #[arg(long = "eval-type", value_delimiter = ',')]
+        eval_types: Vec<String>,
         #[command(flatten)]
         out: OutArgs,
     },
@@ -478,6 +481,7 @@ async fn main() -> Result<()> {
             channels,
             sections,
             closure_types,
+            eval_types,
             out,
         } => {
             let b = read(&input)?;
@@ -498,6 +502,11 @@ async fn main() -> Result<()> {
                     None
                 } else {
                     Some(&closure_types)
+                },
+                if eval_types.is_empty() {
+                    None
+                } else {
+                    Some(&eval_types)
                 },
             );
             write_out(&f, &out).map(|_| ())

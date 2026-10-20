@@ -102,7 +102,7 @@ done <<<"$lines"
 filter_out() {
   case ${out_kind[$2]} in
     closure) "$NFI" filter "$1" --section closure --closure-type "${out_sel[$2]}" -o "$3" ;;
-    eval-errors) "$NFI" filter "$1" --section eval-errors --closure-type "${out_sel[$2]}" -o "$3" ;;
+    eval-errors) "$NFI" filter "$1" --section eval-errors --eval-type "${out_sel[$2]}" -o "$3" ;;
     section) "$NFI" filter "$1" --section "${out_sel[$2]}" -o "$3" ;;
   esac
 }

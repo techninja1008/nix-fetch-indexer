@@ -72,9 +72,8 @@ enum Cmd {
         commits: Vec<String>,
         #[arg(long = "channel")]
         channels: Vec<String>,
-        /// Only remove the closures matching these selectors, keeping the
-        /// releases and their other data: an evaluator (e.g. `helpers`) or
-        /// one of its closure types (e.g. `helpers:full`).
+        /// Only remove the closures of these closure types (e.g.
+        /// `helpers:full`), keeping the releases and their other data.
         #[arg(long = "closure-type", value_delimiter = ',')]
         closure_types: Vec<String>,
         #[arg(long)]

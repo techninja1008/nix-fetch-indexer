@@ -54,47 +54,6 @@ impl std::str::FromStr for ClosureType {
     }
 }
 
-/// Selects closure types: `<eval type>` selects all of an eval type's
-/// closure types, `<eval type>:<name>` one of them (`<eval type>:` the
-/// unnamed one).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ClosureSelector {
-    pub eval_type: String,
-    pub name: Option<String>,
-}
-
-impl ClosureSelector {
-    pub fn matches(&self, eval_type: &str, name: &str) -> bool {
-        self.eval_type == eval_type && self.name.as_deref().is_none_or(|n| n == name)
-    }
-}
-
-impl std::fmt::Display for ClosureSelector {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.name {
-            None => f.write_str(&self.eval_type),
-            Some(n) => write!(f, "{}:{n}", self.eval_type),
-        }
-    }
-}
-
-impl std::str::FromStr for ClosureSelector {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, String> {
-        let (e, n) = match s.split_once(':') {
-            Some((e, n)) => (e, Some(n.to_string())),
-            None => (s, None),
-        };
-        if e.is_empty() {
-            return Err(format!("closure selector {s:?}: empty eval type"));
-        }
-        Ok(Self {
-            eval_type: e.to_string(),
-            name: n,
-        })
-    }
-}
-
 /// Entry types serialise as named-field objects in human-readable formats
 /// (JSON) and as positional arrays in the binary form, which keeps field
 /// names out of every entry. The derived (map) impls are generated as

@@ -3,7 +3,7 @@
 use crate::ingest::WRITE_LOCK;
 use anyhow::Result;
 use nfi_api::PruneRequest;
-use nfi_interchange::{ClosureSelector, ClosureType};
+use nfi_interchange::ClosureType;
 use serde::Serialize;
 use sqlx::{PgPool, Postgres, Transaction};
 
@@ -36,13 +36,13 @@ pub async fn gc(tx: &mut Transaction<'_, Postgres>) -> Result<(u64, u64)> {
 }
 
 pub async fn prune(pool: &PgPool, req: &PruneRequest) -> Result<PruneReport> {
-    let selectors = req
+    let types = req
         .closure_types
         .iter()
-        .map(|s| s.parse::<ClosureSelector>().map_err(anyhow::Error::msg))
+        .map(|s| s.parse::<ClosureType>().map_err(anyhow::Error::msg))
         .collect::<Result<Vec<_>>>()?;
-    let sel_evals: Vec<&str> = selectors.iter().map(|s| s.eval_type.as_str()).collect();
-    let sel_names: Vec<Option<&str>> = selectors.iter().map(|s| s.name.as_deref()).collect();
+    let sel_evals: Vec<&str> = types.iter().map(|t| t.eval_type.as_str()).collect();
+    let sel_names: Vec<&str> = types.iter().map(|t| t.name.as_str()).collect();
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(WRITE_LOCK)
@@ -55,8 +55,8 @@ pub async fn prune(pool: &PgPool, req: &PruneRequest) -> Result<PruneReport> {
         .collect();
     let selected = "SELECT id FROM releases WHERE name = ANY($1) OR channel = ANY($2) OR commit LIKE ANY($3)";
     // Closures being removed: all of the selected releases' closures (cascaded
-    // from the release rows), or only those matching the closure selectors
-    // (`<eval type>` or `<eval type>:<closure type>`).
+    // from the release rows), or only those of the given closure types
+    // (`<eval type>[:<closure type>]`).
     let removed: Vec<(i32, String, String, String)> = sqlx::query_as(&format!(
         "SELECT c.id, r.name, et.name, ct.name FROM closures c
            JOIN evals e ON e.id = c.eval_id
@@ -66,7 +66,7 @@ pub async fn prune(pool: &PgPool, req: &PruneRequest) -> Result<PruneReport> {
           WHERE e.release_id IN ({selected})
             AND (cardinality($4::text[]) = 0
                  OR EXISTS (SELECT 1 FROM unnest($4::text[], $5::text[]) s(eval_type, name)
-                             WHERE s.eval_type = et.name AND (s.name IS NULL OR s.name = ct.name)))"
+                             WHERE s.eval_type = et.name AND s.name = ct.name))"
     ))
     .bind(&req.releases)
     .bind(&req.channels)

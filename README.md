@@ -98,7 +98,8 @@ The `eval-errors` section records attributes that failed to evaluate, keyed by a
 nfi-indexer merge a.nfib b.nfib -o ab.nfib
 nfi-indexer split ab.nfib -o per-release/
 nfi-indexer filter ab.nfib --channel nixos-25.05 --section closure,packages -o f.nfib
-nfi-indexer filter ab.nfib --section closure,eval-errors --closure-type helpers:direct -o helpers.nfib
+nfi-indexer filter ab.nfib --section closure --closure-type helpers:direct -o helpers-direct.nfib
+nfi-indexer filter ab.nfib --section eval-errors --eval-type helpers -o helpers-eval-errors.nfib
 nfi-indexer convert ab.nfib --format json -o ab.json
 nfi-indexer inspect ab.nfib
 nfi-indexer list-channels nixos   # 24.05, 26.05, unstable, ...
@@ -308,7 +309,7 @@ The figures below were measured with embedded PostgreSQL 16 on 4 cores.
 | POST | `/admin/v1/ingest?v2_closure_type=` | Streamed bundle body (binary or JSON), or `{"url": ..., "v2_closure_type": ...}` with `Content-Type: application/json`; returns `{"id"}`. `v2_closure_type` (default `store-paths`) is the closure type to read a version 2 bundle as (`nfi-admin ingest --v2-closure-type`) |
 | GET | `/admin/v1/jobs`, `/admin/v1/jobs/{id}` | Job status, progress and result |
 | GET | `/admin/v1/releases` | Releases (name, commit, channel, series) with their datasets and evaluations: eval type, closure type names, and errors (`<attr>@<system>`, or `null` when not indexed) |
-| POST | `/admin/v1/prune` | `{"releases":[], "commits":[], "channels":[], "closure_types":[]}`; garbage-collects orphaned paths and packages, then rebuilds search. With `closure_types` (`nfi-admin prune --closure-type`), only the matching closures of the selected releases are removed (`helpers` or `helpers:full`, say) and the releases are kept; evaluations left with neither closures nor indexed errors are removed too |
+| POST | `/admin/v1/prune` | `{"releases":[], "commits":[], "channels":[], "closure_types":[]}`; garbage-collects orphaned paths and packages, then rebuilds search. With `closure_types` (`nfi-admin prune --closure-type`), only the closures of those closure types (e.g. `helpers:full`) are removed from the selected releases, and the releases are kept; evaluations left with neither closures nor indexed errors are removed too |
 | POST | `/admin/v1/reindex` | Rebuilds the Meilisearch index from Postgres and swaps it in |
 | POST | `/admin/v1/check` | Checks closure-index consistency (see below); the job result is a report with `ok`, counts and example rows per issue |
 

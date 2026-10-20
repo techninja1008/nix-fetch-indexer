@@ -489,17 +489,18 @@ pub fn normalize(b: &mut Bundle) {
     }
 }
 
-/// Keep only the releases matching `keep`, the sections in `sections` and
-/// the closures matching `closure_types` (all when `None`); with selectors,
-/// eval errors are kept for the selected eval types. Entries left without
-/// releases, closures or evaluations are dropped, and evaluations left with
-/// neither closures nor eval errors; closure paths are kept when referenced
-/// by a kept path.
+/// Keep only the releases matching `keep`, the sections in `sections`, the
+/// evaluations whose eval type is in `eval_types` (with their closures and
+/// eval errors) and the closures whose closure type is in `closure_types`
+/// (all when `None`). Entries left without releases, closures or
+/// evaluations are dropped, and evaluations left with neither closures nor
+/// eval errors; closure paths are kept when referenced by a kept path.
 pub fn filter(
     b: &Bundle,
     keep: impl Fn(&Release) -> bool,
     sections: Option<&[Dataset]>,
-    closure_types: Option<&[ClosureSelector]>,
+    closure_types: Option<&[ClosureType]>,
+    eval_types: Option<&[String]>,
 ) -> Bundle {
     let want = |d: Dataset| sections.is_none_or(|s| s.contains(&d));
     let mut map = vec![None; b.releases.len()];
@@ -523,17 +524,11 @@ pub fn filter(
     let eval_ok: Vec<bool> = b
         .evals
         .iter()
-        .map(|e| {
-            remap(e.release as usize).is_some()
-                && closure_types.is_none_or(|t| t.iter().any(|s| s.eval_type == e.eval_type))
-        })
+        .map(|e| remap(e.release as usize).is_some() && eval_types.is_none_or(|t| t.contains(&e.eval_type)))
         .collect();
     let closure_ok = |cl: &Closure| -> bool {
         eval_ok.get(cl.eval as usize).copied().unwrap_or(false)
-            && closure_types.is_none_or(|t| {
-                t.iter()
-                    .any(|s| s.matches(&b.evals[cl.eval as usize].eval_type, &cl.closure_type))
-            })
+            && closure_types.is_none_or(|t| t.contains(&b.closure_type(cl)))
     };
     let closures_kept = b.closure.as_ref().filter(|_| want(Dataset::Closure));
     let errors_kept = b.eval_errors.as_ref().filter(|_| want(Dataset::EvalErrors));
@@ -683,7 +678,7 @@ pub fn filter(
 pub fn split(b: &Bundle) -> Vec<Bundle> {
     b.releases
         .iter()
-        .map(|r| filter(b, |x| x.name == r.name, None, None))
+        .map(|r| filter(b, |x| x.name == r.name, None, None, None))
         .collect()
 }
 
