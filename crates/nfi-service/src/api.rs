@@ -129,9 +129,19 @@ struct MinimiseParams {
 async fn minimise(
     State(s): State<AppState>,
     Query(p): Query<MinimiseParams>,
-    Json(v): Json<serde_json::Value>,
+    headers: HeaderMap,
+    body: bytes::Bytes,
 ) -> R<MinimiseResponse> {
-    let graph = ReducedGraph::from_json(&v).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    // Read from the bytes rather than through `Json`: a reduced graph is
+    // deserialised directly, which is several times faster than via a `Value`.
+    if !is_json(&headers) {
+        return Err(err(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Expected request with `Content-Type: application/json`",
+        ));
+    }
+    let graph =
+        ReducedGraph::from_slice(&body).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     if graph.derivations.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "no derivations in request"));
     }
@@ -139,6 +149,15 @@ async fn minimise(
         .close_miss_threshold
         .unwrap_or(nfi_api::minimise::DEFAULT_CLOSE_MISS_THRESHOLD);
     Ok(Json(query::minimise(&s.pool, &graph, threshold).await?))
+}
+
+/// `application/json` or a `+json` type, as `Json` accepts.
+fn is_json(headers: &HeaderMap) -> bool {
+    let Some(ct) = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let essence = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    essence == "application/json" || (essence.starts_with("application/") && essence.ends_with("+json"))
 }
 
 #[derive(Deserialize)]
