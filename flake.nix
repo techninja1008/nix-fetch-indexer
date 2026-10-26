@@ -53,6 +53,7 @@
             postInstall = ''
               wrapProgram $out/bin/nfi-indexer --suffix PATH : ${lib.makeBinPath [ pkgs.nix-eval-jobs ]}
               wrapProgram $out/bin/nfi --suffix PATH : ${lib.makeBinPath [ pkgs.nix ]}
+              wrapProgram $out/bin/yoink --suffix PATH : ${lib.makeBinPath [ pkgs.nix ]}
               # For --embedded-postgres / --embedded-meilisearch (single-node mode).
               wrapProgram $out/bin/nfi-service --suffix PATH : ${
                 lib.makeBinPath [
@@ -116,6 +117,8 @@
           nfi-admin = single "nfi-admin";
           nfi-indexer = single "nfi-indexer";
           nfi-service = single "nfi-service";
+          yoink = single "yoink";
+          yoink-service = single "yoink-service";
         }
         // linuxOnly pkgs {
           # OCI images (load with `docker load < result`).
@@ -132,6 +135,17 @@
               ];
               ExposedPorts = {
                 "8080/tcp" = { };
+              };
+              User = "65534:65534";
+            };
+          };
+          yoink-service-image = image {
+            name = "yoink-service";
+            config = {
+              Entrypoint = [ "${workspace}/bin/yoink-service" ];
+              Env = [ "YOINK_LISTEN=0.0.0.0:8090" ];
+              ExposedPorts = {
+                "8090/tcp" = { };
               };
               User = "65534:65534";
             };

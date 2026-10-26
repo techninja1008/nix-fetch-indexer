@@ -1,0 +1,36 @@
+[package]
+name = "yoink"
+description = "Pull a flake's dependencies into a local binary cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[[bin]]
+name = "yoink"
+path = "src/main.rs"
+
+[dependencies]
+yoink-api = { workspace = true, features = ["client"] }
+nfi-api = { workspace = true, features = ["client"] }
+nfi-auth = { workspace = true, features = ["client"] }
+nfi = { path = "../nfi" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+clap.workspace = true
+futures.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+toml = "0.8"
+
+[dev-dependencies]
+tempfile.workspace = true
+axum.workspace = true
+yoink-server.workspace = true
+yoink-mirror-http.workspace = true
+nfi-auth = { workspace = true, features = ["testing"] }
+nfi-interchange.workspace = true
+sha2.workspace = true

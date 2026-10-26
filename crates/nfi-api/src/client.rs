@@ -1,9 +1,34 @@
 //! HTTP client for the query service (public and admin APIs).
 
 use crate::*;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use std::path::Path;
 use std::time::Duration;
+
+/// A non-success HTTP response from the service.
+#[derive(Debug)]
+pub struct HttpError {
+    pub status: u16,
+    pub message: String,
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match reqwest::StatusCode::from_u16(self.status) {
+            Ok(s) => write!(f, "HTTP {s}: {}", self.message),
+            Err(_) => write!(f, "HTTP {}: {}", self.status, self.message),
+        }
+    }
+}
+
+impl std::error::Error for HttpError {}
+
+impl HttpError {
+    /// Whether `e` is (or wraps) a 401 response.
+    pub fn is_unauthorized(e: &anyhow::Error) -> bool {
+        e.downcast_ref::<HttpError>().is_some_and(|h| h.status == 401)
+    }
+}
 
 #[derive(Clone)]
 pub struct Client {
@@ -13,6 +38,15 @@ pub struct Client {
 }
 
 impl Client {
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
+    /// Whether requests carry a bearer token.
+    pub fn has_token(&self) -> bool {
+        self.token.is_some()
+    }
+
     pub fn new(base: &str, token: Option<String>) -> Result<Self> {
         Ok(Self {
             http: reqwest::Client::builder()
@@ -43,9 +77,18 @@ impl Client {
             let msg = serde_json::from_slice::<ErrorBody>(&bytes)
                 .map(|e| e.error)
                 .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).into_owned());
-            bail!("HTTP {status}: {msg}");
+            return Err(HttpError {
+                status: status.as_u16(),
+                message: msg,
+            }
+            .into());
         }
         serde_json::from_slice(&bytes).context("decoding response")
+    }
+
+    /// GET a JSON document, e.g. `nfi_auth::WHOAMI_PATH`.
+    pub async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
+        self.send(self.req(reqwest::Method::GET, path)).await
     }
 
     // ----- public -----

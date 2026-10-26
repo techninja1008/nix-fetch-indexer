@@ -1,0 +1,34 @@
+[package]
+name = "yoink-mirror-http"
+description = "yoink Mirror backend copying from one HTTP binary cache to another"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+yoink-server.workspace = true
+yoink-api.workspace = true
+nfi-interchange.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+futures.workspace = true
+bytes.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+base64.workspace = true
+aws-lc-rs = "1"
+
+[dev-dependencies]
+yoink-api = { workspace = true, features = ["client"] }
+nfi-auth = { workspace = true, features = ["testing"] }
+axum.workspace = true
+serde_json.workspace = true
+xz2.workspace = true
+sha2.workspace = true
+base64.workspace = true
+aws-lc-rs = "1"
