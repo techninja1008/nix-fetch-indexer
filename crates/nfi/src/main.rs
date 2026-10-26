@@ -16,6 +16,10 @@ struct Cli {
     /// Configuration file [default: $XDG_CONFIG_HOME/nfi/config.toml]
     #[arg(long, env = "NFI_CONFIG", global = true)]
     config: Option<PathBuf>,
+    /// Read the bearer token from this file instead of using `nfi login`
+    /// (e.g. a CI-issued ID token) [also: $NFI_TOKEN]
+    #[arg(long, env = "NFI_TOKEN_FILE", global = true)]
+    token_file: Option<PathBuf>,
     /// Print raw JSON responses.
     #[arg(long, global = true)]
     json: bool,
@@ -34,8 +38,18 @@ struct HookArgs {
     no_fetch_hook: bool,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum Cmd {
+    /// Log in to the service with OIDC (device code flow).
+    Login {
+        /// Log in again even if a cached login is still valid.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Forget the cached login for the service.
+    Logout,
+    /// Show who the service thinks you are.
+    Whoami,
     /// Full-text search over packages and programs.
     Search {
         query: Vec<String>,
@@ -161,8 +175,44 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         .clone()
         .or(cfg.url.clone())
         .unwrap_or_else(|| "http://localhost:8080".into());
-    let client = Client::new(&url, None)?;
-    match cli.cmd {
+    let token = match &cli.token_file {
+        Some(f) => Some(nfi_auth::client::read_token_file(f)?),
+        None => std::env::var("NFI_TOKEN").ok().filter(|t| !t.is_empty()),
+    };
+    let login = auth::Login::new("nfi", &url, token)?;
+    match &cli.cmd {
+        Cmd::Login { force } => {
+            let w = login.login(*force).await?;
+            eprintln!("logged in to {url} as {}", auth::describe(&w));
+            return Ok(ExitCode::SUCCESS);
+        }
+        Cmd::Logout => {
+            if login.logout().await? {
+                eprintln!("logged out of {url}");
+            } else {
+                eprintln!("not logged in to {url}");
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
+        Cmd::Whoami => {
+            let w = login.whoami().await?;
+            if cli.json {
+                print_json(&w)?;
+            } else {
+                println!("{}", auth::describe(&w));
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
+        _ => {}
+    }
+    login
+        .run(|client| exec(cli.cmd.clone(), cli.json, &cfg, client))
+        .await
+}
+
+async fn exec(cmd: Cmd, json: bool, cfg: &Config, client: Client) -> Result<ExitCode> {
+    match cmd {
+        Cmd::Login { .. } | Cmd::Logout | Cmd::Whoami => unreachable!("handled in run"),
         Cmd::Search {
             query,
             attr,
@@ -192,7 +242,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 offset: Some(offset),
             };
             let r = client.search(&q).await?;
-            if cli.json {
+            if json {
                 print_json(&r)?;
             } else {
                 for h in &r.hits {
@@ -217,7 +267,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         }
         Cmd::Releases { channel, errors } => {
             let rels = client.releases(channel.as_deref(), errors).await?;
-            if cli.json {
+            if json {
                 print_json(&rels)?;
             } else {
                 print!("{}", nfi_api::releases_table(&rels));
@@ -227,7 +277,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Show { attr, commit, system } => {
             let system = system.or(cfg.system.clone());
             let p = client.package(&attr, &commit, system.as_deref()).await?;
-            if cli.json {
+            if json {
                 print_json(&p)?;
             } else {
                 println!("{} ({})", p.attr, p.system);
@@ -287,9 +337,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             for i in r.items.iter().filter(|i| i.status != ItemStatus::Ok) {
                 eprintln!("warning: {}@{} ({}): {:?}", i.attr, i.commit, i.system, i.status);
             }
-            if cli.json {
+            if json {
                 print_json(&r)?;
-            } else if hook_cmd(&hook, &cfg).is_none() {
+            } else if hook_cmd(&hook, cfg).is_none() {
                 for p in &r.closure {
                     println!("{p}");
                 }
@@ -300,7 +350,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 human_size(r.file_size),
                 human_size(r.nar_size)
             );
-            if let Some(h) = hook_cmd(&hook, &cfg) {
+            if let Some(h) = hook_cmd(&hook, cfg) {
                 let code = run_fetch_hook(&h, &r.closure)?;
                 if code != 0 {
                     return Ok(ExitCode::from(code.clamp(1, 255) as u8));
@@ -333,9 +383,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             }
             let r = client.minimise(&graph, close_miss_threshold).await?;
             let paths = if roots_only { &r.roots } else { &r.closure };
-            if cli.json {
+            if json {
                 print_json(&r)?;
-            } else if hook_cmd(&hook, &cfg).is_none() {
+            } else if hook_cmd(&hook, cfg).is_none() {
                 for p in paths {
                     println!("{p}");
                 }
@@ -356,7 +406,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 human_size(r.file_size),
                 human_size(r.nar_size)
             );
-            if let Some(h) = hook_cmd(&hook, &cfg) {
+            if let Some(h) = hook_cmd(&hook, cfg) {
                 let code = run_fetch_hook(&h, paths)?;
                 if code != 0 {
                     return Ok(ExitCode::from(code.clamp(1, 255) as u8));

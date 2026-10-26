@@ -309,6 +309,15 @@ pub struct TestService {
 /// Start a service on a fresh database. `admin_token` enables admin auth.
 /// Returns `None` (test should be skipped) if Postgres is unavailable.
 pub async fn start_service(admin_token: Option<&str>) -> Option<TestService> {
+    let auth = match admin_token {
+        Some(t) => nfi_service::auth::ServiceAuth::admin_token(t),
+        None => nfi_service::auth::ServiceAuth::open(),
+    };
+    start_service_with(auth).await
+}
+
+/// [`start_service`] with the given authentication settings.
+pub async fn start_service_with(auth: nfi_service::auth::ServiceAuth) -> Option<TestService> {
     let db = fresh_database().await?;
     let pool = nfi_service::connect(&db, 20).await.expect("migrate");
     let meili = services()
@@ -319,7 +328,7 @@ pub async fn start_service(admin_token: Option<&str>) -> Option<TestService> {
     let state = nfi_service::AppState {
         pool,
         meili,
-        admin_token: admin_token.map(str::to_string),
+        auth: std::sync::Arc::new(auth),
         http: reqwest::Client::new(),
         poll_interval: Duration::from_millis(100),
     };

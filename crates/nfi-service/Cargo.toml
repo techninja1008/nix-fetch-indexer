@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 nfi-interchange.workspace = true
 nfi-api.workspace = true
+nfi-auth = { workspace = true, features = ["server"] }
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
@@ -46,4 +47,5 @@ embedded-meilisearch = ["dep:nfi-embedded-meilisearch"]
 
 [dev-dependencies]
 tempfile.workspace = true
+nfi-auth = { workspace = true, features = ["testing"] }
 nfi-testenv = { path = "../nfi-testenv" }

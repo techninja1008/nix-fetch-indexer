@@ -194,7 +194,7 @@ These figures come from `bench-compression` on a full `nixos-25.05` closure bund
 nfi-service \
   --database-url postgres://nfi@localhost/nfi \
   --meili-url http://localhost:7700 \
-  --listen 0.0.0.0:8080 --admin-listen 127.0.0.1:8081   # optional: NFI_ADMIN_TOKEN=...
+  --listen 0.0.0.0:8080 --admin-listen 127.0.0.1:8081   # optional: --admin-token-file /run/secrets/nfi-admin
 ```
 
 **Configuration**
@@ -203,14 +203,15 @@ All options can also be set through the environment:
 
 - `NFI_DATABASE_URL`
 - `NFI_MEILI_URL`, `NFI_MEILI_KEY`, `NFI_MEILI_INDEX`
-- `NFI_LISTEN`, `NFI_ADMIN_LISTEN`, `NFI_ADMIN_TOKEN`
+- `NFI_LISTEN`, `NFI_ADMIN_LISTEN`, `NFI_ADMIN_TOKEN_FILE`
+- `NFI_OIDC_*`, `NFI_MAIN_AUTHZ_CEL_FILE`, `NFI_ALLOW_ANONYMOUS`, `NFI_ADMIN_OIDC`, `NFI_ADMIN_AUTHZ_CEL_FILE` (see [Authentication](#authentication))
 - `NFI_NO_WORKER`
 
-**Container image:** `nfi-service-image` only listens on port 8080 from outside the container. The admin listener is bound to `127.0.0.1:8081` inside the container, so it can't be reached by default. To run admin commands from the host, set a token, listen on all interfaces inside the container, and publish the port on a loopback or private address only:
+**Container image:** `nfi-service-image` only listens on port 8080 from outside the container. The admin listener is bound to `127.0.0.1:8081` inside the container, so it can't be reached by default. To run admin commands from the host, set a token (or use OIDC), listen on all interfaces inside the container, and publish the port on a loopback or private address only:
 
 ```sh
 docker run -p 8080:8080 -p 127.0.0.1:8081:8081 \
-  -e NFI_ADMIN_LISTEN=0.0.0.0:8081 -e NFI_ADMIN_TOKEN=... \
+  -e NFI_ADMIN_LISTEN=0.0.0.0:8081 -e NFI_ADMIN_TOKEN_FILE=/run/secrets/nfi-admin -v ./nfi-admin:/run/secrets/nfi-admin:ro \
   -e NFI_DATABASE_URL=... -e NFI_MEILI_URL=... nfi-service:latest
 ```
 
@@ -268,6 +269,46 @@ The figures below were measured with embedded PostgreSQL 16 on 4 cores.
 | An extra release into that database (315k new paths) | ~24 s |
 | Pruning one release, or a whole channel, from it | ~20 s |
 
+### Authentication
+
+Both listeners are open by default. Optionally, callers log in with OIDC (the device code flow) and send their ID token as a bearer token; the service validates it against the provider's JWKS (signature, `iss`, `aud`, `exp`) and logs every request with the caller's username and session. CEL expressions and secrets are always read from files.
+
+| flag | env | meaning |
+|---|---|---|
+| `--oidc-issuer`, `--oidc-client-id` | `NFI_OIDC_ISSUER`, `NFI_OIDC_CLIENT_ID` | Enable OIDC: the provider and the public client CLIs log in as |
+| `--oidc-audience` | `NFI_OIDC_AUDIENCE` | Expected `aud` (default: the client id) |
+| `--oidc-scopes` | `NFI_OIDC_SCOPES` | Scopes CLIs request (default `openid,profile,offline_access`) |
+| `--oidc-username-cel-file` | `NFI_OIDC_USERNAME_CEL_FILE` | Username, over `claims` (default `preferred_username`, else `sub`) |
+| `--oidc-session-cel-file` | `NFI_OIDC_SESSION_CEL_FILE` | Optional credential or session id to log, over `claims` (e.g. `claims.sid`) |
+| `--main-authz-cel-file` | `NFI_MAIN_AUTHZ_CEL_FILE` | Policy for the public API (default `true`) |
+| `--allow-anonymous` | `NFI_ALLOW_ANONYMOUS` | Let requests without a token use the public API |
+| `--admin-token-file` | `NFI_ADMIN_TOKEN_FILE` | Protect the admin listener with a static bearer token |
+| `--admin-oidc` | `NFI_ADMIN_OIDC` | Protect the admin listener with OIDC instead (needs `--admin-authz-cel-file`) |
+| `--admin-authz-cel-file` | `NFI_ADMIN_AUTHZ_CEL_FILE` | Policy for the admin API |
+
+**Rules**
+
+- Public API with OIDC: a request with a token must carry a valid ID token (401 otherwise) that passes the main policy (403 otherwise). A request without one gets 401, unless `--allow-anonymous`, in which case the policy is skipped.
+- Admin API: open, a static token, or OIDC with the admin policy. The static token and `--admin-oidc` are mutually exclusive.
+- `/healthz` and `/auth/v1/config` never need a token.
+
+**Policies** are CEL expressions that must evaluate to `true`. Variables:
+
+- `claims`: the ID token's claims.
+- `user`: `{"username": ..., "session": ...}` as extracted above.
+- `request`: `{"method": ..., "path": ...}`.
+
+```cel
+'nfi-admins' in claims.groups && request.method != 'DELETE'
+```
+
+**Routes** on each listener that uses OIDC:
+
+| method | path | description |
+|---|---|---|
+| GET | `/auth/v1/config` | `{"issuer", "client_id", "scopes"}` for CLIs to log in with; 404 when the listener doesn't use OIDC |
+| GET | `/auth/v1/whoami` | `{"username", "session"}` of the caller; 401 when not logged in |
+
 ### Public API
 
 | method | path | description |
@@ -303,7 +344,7 @@ The figures below were measured with embedded PostgreSQL 16 on 4 cores.
   - `close_miss` lists derivations to build whose name (name and version) matches indexed paths with a different hash: probably a slightly overridden package, or a build input that isn't indexed. Names matching `close_miss_threshold` indexed paths or more (default 100) are too generic to report; 0 turns the check off (`nfi minimise --close-miss-threshold`).
   - `nfi minimise` prints warnings to stderr.
 
-### Admin API (admin listener only, optional `Authorization: Bearer <token>`)
+### Admin API (admin listener only; optionally authenticated, see [Authentication](#authentication))
 
 | method | path | description |
 |---|---|---|
@@ -356,10 +397,24 @@ nix derivation show --recursive .#foo | nfi minimise -f -
   - `minimise` passes the closure by default, or only the roots with `--roots-only`.
 - Exit status: the CLI exits with the hook's exit status.
 
+**Login**
+
+```sh
+nfi login            # device code flow; prints a URL and code to approve
+nfi whoami           # alice (session ...)
+nfi logout
+NFI_TOKEN=$CI_ID_TOKEN nfi releases     # or --token-file / NFI_TOKEN_FILE
+```
+
+- Tokens: an explicit token (`NFI_TOKEN`, `--token-file`) is sent as is, e.g. an ID token issued to CI with the service's client id as its audience. Otherwise a cached login is used, and refreshed when it expires.
+- Cache: `$XDG_CACHE_HOME/nfi/tokens` (or `$NFI_TOKEN_CACHE`), keyed by provider and client, so `nfi`, `nfi-admin` and `yoink` share a login when their services use the same provider and client. `login` reuses a valid cached login for the same provider unless `--force` is given.
+- On a 401, an interactive CLI (stdin and stderr are terminals) without an explicit token logs in and retries the command once; otherwise it fails and suggests `nfi login`.
+- `nfi-admin` has the same `login`, `logout` and `whoami` commands for the admin listener, and keeps `--token`/`NFI_ADMIN_TOKEN` and `--token-file`/`NFI_ADMIN_TOKEN_FILE` for an explicit token (the static admin token or an ID token).
+
 **Admin CLI**
 
 ```sh
-export NFI_ADMIN_URL=http://127.0.0.1:8081 NFI_ADMIN_TOKEN=...
+export NFI_ADMIN_URL=http://127.0.0.1:8081 NFI_ADMIN_TOKEN=...   # or NFI_ADMIN_TOKEN_FILE, or nfi-admin login
 nfi-admin ingest release.nfib https://example/other.nfib --wait
 nfi-admin releases
 nfi-admin prune --channel nixos-24.11 --wait

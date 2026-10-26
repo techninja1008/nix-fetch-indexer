@@ -130,7 +130,8 @@
                 "NFI_LISTEN=0.0.0.0:8080"
                 # The admin listener stays inside the container by default.
                 # To reach it from outside, override NFI_ADMIN_LISTEN, set
-                # NFI_ADMIN_TOKEN and publish the port on a private address.
+                # NFI_ADMIN_TOKEN_FILE (or NFI_ADMIN_OIDC) and publish the
+                # port on a private address.
                 "NFI_ADMIN_LISTEN=127.0.0.1:8081"
               ];
               ExposedPorts = {

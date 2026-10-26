@@ -1,5 +1,7 @@
 //! Support code for the `nfi` query CLI.
 
+pub mod auth;
+
 use anyhow::{Context, Result, bail};
 use nfi_api::BulkItem;
 use nfi_api::drv::ReducedGraph;
