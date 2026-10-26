@@ -111,7 +111,10 @@ async fn pulls_into_the_target_cache() {
                 .expect("yoink finished")
                 .unwrap();
             drop(d);
-            (out.status.code(), String::from_utf8_lossy(&out.stderr).into_owned())
+            (
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            )
         }
     };
 

@@ -218,7 +218,7 @@ pub struct Args {
     #[arg(long, env = "YOINK_NO_CACHE_INFO")]
     pub no_cache_info: bool,
     /// Per-request timeout in seconds, without data flowing.
-    #[arg(long, env = "YOINK_HTTP_TIMEOUT", default_value_t = 120)]
+    #[arg(long = "http-timeout", env = "YOINK_HTTP_TIMEOUT", default_value_t = 120)]
     pub timeout: u64,
 }
 

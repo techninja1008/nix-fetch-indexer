@@ -16,6 +16,8 @@ See [DESIGN.md](DESIGN.md) for the full design.
 | `nfi-service` | `crates/nfi-service` | Query service: Postgres plus Meilisearch, with a public HTTP/JSON API and a separate admin listener |
 | `nfi` | `crates/nfi` | Query CLI: `search`, `show`, `bulk`, `minimise` (with fetch hooks) |
 | `nfi-admin` | `crates/nfi-admin` | Admin CLI: `ingest`, `jobs`, `releases`, `prune`, `reindex` |
+| `yoink-service` | `crates/yoink-service` | Mirroring service: copies store paths into a binary cache you control (see [yoink](#yoink)) |
+| `yoink` | `crates/yoink` | Mirroring CLI: `yoink nixpkgs#hello` pulls a flake's cached closure into that cache, with a live monitor |
 
 Supporting libraries:
 
@@ -23,6 +25,8 @@ Supporting libraries:
 - `nfi-api`: shared API types, the derivation-graph reducer, the minimise planner and an HTTP client.
 - `nfi-embedded-postgres`, `nfi-embedded-meilisearch`: supervised child-process PostgreSQL and Meilisearch for single-node mode.
 - `nfi-testenv`: ephemeral Postgres and Meilisearch for tests.
+- `nfi-auth`: OIDC token validation and CEL policies for services; device code login and the token cache for CLIs.
+- `yoink-api`, `yoink-server`, `yoink-mirror-http`: yoink's API types and client, service core (with the `Mirror` trait), and HTTP cache backend.
 
 ## Building
 
@@ -423,6 +427,80 @@ nfi-admin reindex --wait
 nfi-admin check --wait      # exit status 3 if the index is inconsistent
 nfi-admin jobs [ID] [--wait]
 ```
+
+## yoink
+
+yoink pulls the dependencies of a flake into a binary cache you control, so that builds don't depend on cache.nixos.org. It mirrors exactly the cached closure that `nfi minimise` reports; whatever must be built or fetched from elsewhere is shown but never acted on.
+
+```sh
+export YOINK_URL=https://yoink.example NFI_URL=https://nfi.example
+yoink login                       # OIDC device flow (also logs in to NFI if it uses another provider/client)
+yoink nixpkgs#hello .#devShells.x86_64-linux.default
+yoink .                           # the current flake's default package
+yoink 'pkg:nix/%2Fnix%2Fstore%2F0xy6xjvbl4bm3pq4w6p2b6vfffw4vi9b-hello-2.12.3'
+YOINK_TOKEN=$CI_ID_TOKEN yoink --plain .#foo   # CI: a pre-obtained ID token, line output
+```
+
+**Targets**
+
+- `pkg:…`: a package URL. Store paths are `pkg:nix/<percent-encoded store path>`; the name may be left out (`/nix/store/<hash>`).
+- Anything containing `#`, or `.` alone: a flake reference. It is evaluated locally (`nix derivation show --recursive`), minimised by NFI, and its closure becomes `pkg:nix` PURLs.
+- `name@version` is reserved for a future npm-like mode and rejected for now; anything else is an error.
+
+**Behaviour**
+
+- The CLI exits only when every path has a result: 0 if all were mirrored, 1 if any failed, or on an unrecoverable error. A dropped connection is resumed by re-posting the unfinished paths (the service deduplicates); it gives up after 5 minutes without progress. `q`/Ctrl-C detaches with status 130, and the service keeps mirroring.
+- **Monitor** (on a terminal): overall progress by path count and by size, and a scrollable field with one indicator per path, in request order. Indicators shrink, from a full line (name, bar, phase, `12.3/45.6 MiB`) down to `[T 57]` (phase abbreviation and percent), to fit as many as possible. Yellow means warnings, red errors. Keys: arrows/`j`/`k` move, Enter shows that path's log, `l` all logs, Esc back, `q` quit; click selects, clicking again opens the log.
+- **Plain mode** (not a terminal, or `--plain`): phase changes, errors and results, one per line; `-v` adds warnings and info, `-vv` progress; `-q` only errors.
+- Configuration: `$XDG_CONFIG_HOME/yoink/config.toml` may set `url`, `nfi_url` and `nix`.
+
+### Service
+
+```sh
+yoink-service \
+  --oidc-issuer https://idp.example --oidc-client-id yoink \
+  --purl-authz-cel-file /etc/yoink/purl.cel \
+  http --target-url https://cache.internal.example --target-bearer-token-file /run/secrets/cache-token
+```
+
+The service always requires an OIDC ID token. Options before the backend subcommand (`http`) belong to the service; each has a `YOINK_*` environment variable:
+
+| option | purpose |
+|---|---|
+| `--listen` | listen address (default `0.0.0.0:8090`) |
+| `--oidc-issuer`, `--oidc-client-id`, `--oidc-audience`, `--oidc-scopes` | as for `nfi-service` (see [Authentication](#authentication)) |
+| `--oidc-username-cel-file`, `--oidc-session-cel-file` | CEL giving the username (default `preferred_username`, else `sub`) and an optional session id for logs |
+| `--authz-cel-file` | CEL policy per request; variables `claims`, `user`, `request` (default `true`) |
+| `--purl-authz-cel-file` | CEL policy per requested PURL; also `purl` (`{type, namespace, name, version, qualifiers, subpath, raw}`), e.g. `purl.type == 'nix'` (default `true`) |
+| `--max-purls` | most PURLs per request (default 100000) |
+
+**API.** `POST /v1/mirror` with `{"purls": [...]}` returns Server-Sent Events: `phases` (the backend's phases: `id`, `name`, one-character `abbrev`), then per PURL `status` (`phase`, optional `progress: {current, max, unit}`), `log` (`level`: `info`, `warning`, `error` or `fatal`, `message`) and finally one `result` (`outcome`: `success` or `fatal`). Every event names its PURL as requested. Jobs outlive the request: re-posting attaches to them. `GET /auth/v1/config` and `GET /auth/v1/whoami` are as on `nfi-service`.
+
+**HTTP backend** (`http`, options with `YOINK_*` variables):
+
+| option | purpose |
+|---|---|
+| `--upstream-url` | cache to copy from (default `https://cache.nixos.org`; may be a proxy of it) |
+| `--target-url` | cache to copy to; must serve `GET` and accept `PUT` |
+| `--{upstream,target}-basic-auth-file` | file with `user:password` |
+| `--{upstream,target}-bearer-token-file` | file with a bearer token |
+| `--{upstream,target}-header-name`, `--{upstream,target}-header-file` | a custom header and the file holding its value (e.g. GitLab `PRIVATE-TOKEN` or `JOB-TOKEN`) |
+| `--nar-layout nar\|flat` | NARs under `nar/` (default) or next to the narinfos |
+| `--signing-key-file` | add a signature with this Nix key (`name:base64`); upstream signatures are always kept |
+| `--concurrency`, `--retries`, `--http-timeout` | paths in flight (16), retries per step for transient errors (5), idle timeout in seconds (120) |
+| `--cache-priority`, `--no-cache-info` | `nix-cache-info` is created on the target with this priority (30) unless disabled |
+
+Each path goes through Queued (`Q`), Checking target (`C`: already there means done), Fetching narinfo (`N`), Transferring NAR (`T`: streamed from upstream into the target, with size and hash checked) and Publishing narinfo (`P`). The narinfo is uploaded last, so a narinfo on the target always means a complete path.
+
+**GitLab generic package registry as the target.** File names there can't contain `/`, so use the flat layout:
+
+```sh
+yoink-service --oidc-issuer https://gitlab.example --oidc-client-id <application id> \
+  http --target-url https://gitlab.example/api/v4/projects/<id>/packages/generic/nix-cache/1 \
+  --nar-layout flat --target-header-name PRIVATE-TOKEN --target-header-file /run/secrets/gitlab-token
+```
+
+Nix then uses `https://gitlab.example/api/v4/projects/<id>/packages/generic/nix-cache/1` as a substituter (with credentials, e.g. a netrc file).
 
 ## Tests
 
