@@ -186,12 +186,16 @@ fn config_errors() {
     let bad = d.path().join("bad.cel");
     std::fs::write(&bad, "(((").unwrap();
     let run = |args: &[&str]| {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_nfi-service"))
-            .args(["--database-url", "postgres://127.0.0.1:1/x"])
-            .args(args)
-            .env_clear()
-            .output()
-            .unwrap();
+        let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_nfi-service"));
+        c.args(["--database-url", "postgres://127.0.0.1:1/x"]).args(args);
+        // Keep the rest of the environment: HTTP clients need SSL_CERT_FILE
+        // where there are no system certificates (the Nix sandbox).
+        for (k, _) in std::env::vars_os() {
+            if k.to_string_lossy().starts_with("NFI_") {
+                c.env_remove(k);
+            }
+        }
+        let out = c.output().unwrap();
         assert!(!out.status.success(), "{args:?} should fail");
         String::from_utf8_lossy(&out.stderr).into_owned()
     };
