@@ -91,9 +91,8 @@
               inherit name;
               tag = "latest";
               contents = [
-                # root and nobody, plus UID/GID 1000 so that the images can
-                # also run as a typical non-root host user (e.g. with
-                # `--user 1000:1000` and a bind mount owned by that user).
+                # root and nobody, plus `user` (UID/GID 1000), which the
+                # images run as by default.
                 (pkgs.dockerTools.fakeNss.override {
                   extraPasswdLines = [ "user:x:1000:1000:user:/var/empty:/bin/sh" ];
                   extraGroupLines = [ "user:x:1000:" ];
@@ -107,7 +106,13 @@
                 mkdir -p -m 1777 tmp var/tmp
                 mkdir -p -m 0755 run
               '';
-              config = config // {
+              # Run as `user` unless an image says otherwise; override with
+              # e.g. `docker run --user` to match the owner of a bind mount.
+              config = {
+                User = "1000:1000";
+              }
+              // config
+              // {
                 Env = [
                   "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
                   "TMPDIR=/tmp"
@@ -143,7 +148,6 @@
               ExposedPorts = {
                 "8080/tcp" = { };
               };
-              User = "65534:65534";
             };
           };
           yoink-service-image = image {
@@ -154,7 +158,6 @@
               ExposedPorts = {
                 "8090/tcp" = { };
               };
-              User = "65534:65534";
             };
           };
           nfi-indexer-image = image {
@@ -167,13 +170,10 @@
         }
       );
 
-      checks = forAll (
-        pkgs:
-        {
-          # Builds everything and runs the full test suite (unit + integration).
-          build = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
-        }
-      );
+      checks = forAll (pkgs: {
+        # Builds everything and runs the full test suite (unit + integration).
+        build = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+      });
 
       devShells = forAll (pkgs: {
         default = pkgs.mkShell {
