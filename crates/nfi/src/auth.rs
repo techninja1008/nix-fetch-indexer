@@ -13,10 +13,17 @@ pub struct Login {
     session: Option<Session>,
     /// The command to suggest when authentication is needed.
     tool: &'static str,
+    /// How to pass a token explicitly, e.g. "set NFI_TOKEN".
+    token_hint: &'static str,
 }
 
 impl Login {
-    pub fn new(tool: &'static str, url: &str, explicit: Option<String>) -> Result<Self> {
+    pub fn new(
+        tool: &'static str,
+        token_hint: &'static str,
+        url: &str,
+        explicit: Option<String>,
+    ) -> Result<Self> {
         let session = match TokenStore::default_location() {
             Ok(s) => Some(Session::new(s)?),
             Err(_) => None,
@@ -26,6 +33,7 @@ impl Login {
             explicit,
             session,
             tool,
+            token_hint,
         })
     }
 
@@ -63,7 +71,24 @@ impl Login {
         };
         match token {
             Some(t) => f(Client::new(&self.url, Some(t))?).await,
-            None => Err(e.context(format!("authentication required: run `{} login`", self.tool))),
+            None => Err(e.context(self.hint().await)),
+        }
+    }
+
+    /// What to do about a 401: log in if the service uses OIDC, otherwise
+    /// pass a token (e.g. a fixed admin token).
+    async fn hint(&self) -> String {
+        let oidc = match &self.session {
+            Some(s) => s.discover(&self.url).await.ok().flatten().is_some(),
+            None => false,
+        };
+        if oidc {
+            format!(
+                "authentication required: run `{} login` or {}",
+                self.tool, self.token_hint
+            )
+        } else {
+            format!("authentication required: {}", self.token_hint)
         }
     }
 

@@ -237,7 +237,12 @@ async fn run(cli: Cli) -> Result<Outcome> {
         (None, Some(f)) => Some(nfi_auth::client::read_token_file(f)?),
         (None, None) => None,
     };
-    let login = nfi::auth::Login::new("nfi-admin", &cli.url, token)?;
+    let login = nfi::auth::Login::new(
+        "nfi-admin",
+        "pass --token or --token-file (NFI_ADMIN_TOKEN, NFI_ADMIN_TOKEN_FILE)",
+        &cli.url,
+        token,
+    )?;
     match &cli.cmd {
         Cmd::Login { force } => {
             let w = login.login(*force).await?;

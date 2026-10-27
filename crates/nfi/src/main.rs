@@ -179,7 +179,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Some(f) => Some(nfi_auth::client::read_token_file(f)?),
         None => std::env::var("NFI_TOKEN").ok().filter(|t| !t.is_empty()),
     };
-    let login = auth::Login::new("nfi", &url, token)?;
+    let login = auth::Login::new("nfi", "set NFI_TOKEN or --token-file", &url, token)?;
     match &cli.cmd {
         Cmd::Login { force } => {
             let w = login.login(*force).await?;
