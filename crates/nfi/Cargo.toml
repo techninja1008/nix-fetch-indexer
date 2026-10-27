@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 nfi-api = { workspace = true, features = ["client"] }
+nfi-auth = { workspace = true, features = ["client"] }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -26,6 +27,8 @@ shell-words.workspace = true
 toml = "0.8"
 
 [dev-dependencies]
+nfi-auth = { workspace = true, features = ["testing"] }
+nfi-service = { path = "../nfi-service" }
 nfi-testenv = { path = "../nfi-testenv" }
 nfi-interchange.workspace = true
 reqwest.workspace = true

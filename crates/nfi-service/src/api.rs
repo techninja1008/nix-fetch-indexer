@@ -1,13 +1,14 @@
 //! HTTP routes for the public and admin listeners.
 
+use crate::auth::{self, AdminAuth, Caller};
 use crate::query::{self, LookupError};
 use crate::{AppState, jobs};
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
-use axum::middleware::{self, Next};
+use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use nfi_api::drv::ReducedGraph;
@@ -44,7 +45,13 @@ pub fn public_router(state: AppState) -> Router {
         .route("/v1/lookup/bulk", post(bulk))
         .route("/v1/minimise", post(minimise))
         .route("/v1/releases", get(releases))
+        .route(nfi_auth::CONFIG_PATH, get(public_auth_config))
+        .route(nfi_auth::WHOAMI_PATH, get(public_whoami))
         .layer(DefaultBodyLimit::max(512 << 20))
+        .layer(middleware::from_fn_with_state(
+            state.auth.clone(),
+            auth::public_auth,
+        ))
         .with_state(state)
 }
 
@@ -57,29 +64,44 @@ pub fn admin_router(state: AppState) -> Router {
         .route("/admin/v1/prune", post(prune))
         .route("/admin/v1/reindex", post(reindex))
         .route("/admin/v1/check", post(check))
+        .route(nfi_auth::CONFIG_PATH, get(admin_auth_config))
+        .route(nfi_auth::WHOAMI_PATH, get(admin_whoami))
         .layer(DefaultBodyLimit::disable())
-        .layer(middleware::from_fn_with_state(state.clone(), admin_auth))
+        .layer(middleware::from_fn_with_state(
+            state.auth.clone(),
+            auth::admin_auth,
+        ))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(state)
 }
 
-async fn admin_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
-    if let Some(token) = &state.admin_token {
-        let ok = req
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .is_some_and(|t| constant_time_eq(t.as_bytes(), token.as_bytes()));
-        if !ok {
-            return err(StatusCode::UNAUTHORIZED, "missing or invalid admin token").into_response();
-        }
+fn admin_oidc(s: &AppState) -> Option<&nfi_auth::server::Authenticator> {
+    match s.auth.admin {
+        AdminAuth::Oidc(_) => s.auth.oidc.as_ref(),
+        _ => None,
     }
-    next.run(req).await
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+async fn public_auth_config(State(s): State<AppState>) -> Response {
+    auth::config_response(s.auth.oidc.as_ref())
+}
+
+async fn admin_auth_config(State(s): State<AppState>) -> Response {
+    auth::config_response(admin_oidc(&s))
+}
+
+async fn public_whoami(State(s): State<AppState>, caller: Option<axum::Extension<Caller>>) -> Response {
+    match s.auth.oidc {
+        Some(_) => auth::whoami_response(caller.as_ref().map(|c| &c.0)),
+        None => auth::config_response(None),
+    }
+}
+
+async fn admin_whoami(State(s): State<AppState>, caller: Option<axum::Extension<Caller>>) -> Response {
+    match admin_oidc(&s) {
+        Some(_) => auth::whoami_response(caller.as_ref().map(|c| &c.0)),
+        None => auth::config_response(None),
+    }
 }
 
 async fn search(State(s): State<AppState>, Query(q): Query<SearchQuery>) -> R<SearchResponse> {

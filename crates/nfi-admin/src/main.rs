@@ -33,8 +33,18 @@ struct Cli {
     cmd: Cmd,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum Cmd {
+    /// Log in to the admin listener with OIDC (device code flow).
+    Login {
+        /// Log in again even if a cached login is still valid.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Forget the cached login for the admin listener.
+    Logout,
+    /// Show who the admin listener thinks you are.
+    Whoami,
     /// Ingest interchange bundles (local files are uploaded; http(s) URLs are fetched by the service).
     Ingest {
         #[arg(required = true)]
@@ -224,19 +234,49 @@ async fn submitted(client: &Client, id: i64, do_wait: bool, json: bool) -> Resul
 async fn run(cli: Cli) -> Result<Outcome> {
     let token = match (&cli.token, &cli.token_file) {
         (Some(t), _) => Some(t.clone()),
-        (None, Some(f)) => Some(
-            std::fs::read_to_string(f)
-                .with_context(|| format!("reading {}", f.display()))?
-                .trim()
-                .to_string(),
-        ),
+        (None, Some(f)) => Some(nfi_auth::client::read_token_file(f)?),
         (None, None) => None,
     };
-    let client = Client::new(&cli.url, token)?;
-    if let Cmd::Check { wait } = cli.cmd {
-        return check_cmd(&client, wait, cli.json).await;
+    let login = nfi::auth::Login::new(
+        "nfi-admin",
+        "pass --token or --token-file (NFI_ADMIN_TOKEN, NFI_ADMIN_TOKEN_FILE)",
+        &cli.url,
+        token,
+    )?;
+    match &cli.cmd {
+        Cmd::Login { force } => {
+            let w = login.login(*force).await?;
+            eprintln!("logged in to {} as {}", cli.url, nfi::auth::describe(&w));
+            return Ok(Outcome::Ok);
+        }
+        Cmd::Logout => {
+            if login.logout().await? {
+                eprintln!("logged out of {}", cli.url);
+            } else {
+                eprintln!("not logged in to {}", cli.url);
+            }
+            return Ok(Outcome::Ok);
+        }
+        Cmd::Whoami => {
+            let w = login.whoami().await?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&w)?);
+            } else {
+                println!("{}", nfi::auth::describe(&w));
+            }
+            return Ok(Outcome::Ok);
+        }
+        _ => {}
     }
-    let ok = match cli.cmd {
+    login.run(|client| exec(cli.cmd.clone(), cli.json, client)).await
+}
+
+async fn exec(cmd: Cmd, json: bool, client: Client) -> Result<Outcome> {
+    if let Cmd::Check { wait } = cmd {
+        return check_cmd(&client, wait, json).await;
+    }
+    let ok = match cmd {
+        Cmd::Login { .. } | Cmd::Logout | Cmd::Whoami => unreachable!("handled in run"),
         Cmd::Ingest {
             sources,
             v2_closure_type,
@@ -251,7 +291,7 @@ async fn run(cli: Cli) -> Result<Outcome> {
                     client.ingest_file(Path::new(s), v2).await?
                 };
                 eprintln!("{s}: job {}", created.id);
-                ok &= submitted(&client, created.id, wait, cli.json).await?;
+                ok &= submitted(&client, created.id, wait, json).await?;
             }
             Ok(ok)
         }
@@ -259,14 +299,14 @@ async fn run(cli: Cli) -> Result<Outcome> {
             id: Some(id),
             wait: true,
             ..
-        } => wait(&client, id, cli.json).await,
+        } => wait(&client, id, json).await,
         Cmd::Jobs { id: Some(id), .. } => {
-            print_job(&client.job(id).await?, cli.json)?;
+            print_job(&client.job(id).await?, json)?;
             Ok(true)
         }
         Cmd::Jobs { id: None, limit, .. } => {
             let jobs = client.jobs(limit).await?;
-            if cli.json {
+            if json {
                 println!("{}", serde_json::to_string_pretty(&jobs)?);
             } else {
                 for j in &jobs {
@@ -277,7 +317,7 @@ async fn run(cli: Cli) -> Result<Outcome> {
         }
         Cmd::Releases { channel, errors } => {
             let rels = client.admin_releases(channel.as_deref(), errors).await?;
-            if cli.json {
+            if json {
                 println!("{}", serde_json::to_string_pretty(&rels)?);
             } else {
                 print!("{}", nfi_api::releases_table(&rels));
@@ -301,11 +341,11 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 bail!("specify --release, --commit and/or --channel");
             }
             let created = client.prune(&req).await?;
-            submitted(&client, created.id, wait, cli.json).await
+            submitted(&client, created.id, wait, json).await
         }
         Cmd::Reindex { wait } => {
             let created = client.reindex().await?;
-            submitted(&client, created.id, wait, cli.json).await
+            submitted(&client, created.id, wait, json).await
         }
         Cmd::Check { .. } => unreachable!("handled above"),
     }?;

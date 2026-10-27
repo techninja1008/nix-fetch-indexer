@@ -17,6 +17,12 @@ A single Cargo workspace:
 | `nfi-embedded-postgres` | lib | Supervised child-process PostgreSQL for single-node mode (`--embedded-postgres`) |
 | `nfi-embedded-meilisearch` | lib | Supervised child-process Meilisearch for single-node mode (`--embedded-meilisearch`) |
 | `nfi-api` | lib | Shared request/response types for the service and CLIs |
+| `nfi-auth` | lib | OIDC ID token validation, CEL claim extraction and authorisation (services); device code login and the token cache (CLIs) |
+| `yoink-api` | lib | yoink API types: PURLs, mirror stream events, SSE client |
+| `yoink-server` | lib | Core of the yoink service: arguments, tracing, auth, the mirror API, jobs and the `Mirror` trait |
+| `yoink-mirror-http` | lib | `Mirror` backend copying from one HTTP binary cache to another |
+| `yoink-service` | bin | The yoink service: `yoink-server` with the HTTP backend wired in |
+| `yoink` | bin | yoink CLI: resolve flakes through `nfi`, mirror their closures, show progress |
 
 Packaging uses Nix flake packages for all binaries, plus a dev shell.
 OCI images for the service are built with Nix `dockerTools`. There is no Dockerfile.
@@ -294,6 +300,51 @@ A store path's references never change, so they are written only once, when the 
 ## Admin CLI (`nfi-admin`)
 
 Commands: `ingest <file|url>...`, `jobs [id]`, `releases`, `prune --release/--commit/--channel`, `reindex`, all with `--wait` support.
+
+## Authentication (`nfi-auth`)
+
+OIDC is optional on `nfi-service` and required on `yoink-service`.
+
+- **Tokens:** clients send an OIDC **ID token** as `Authorization: Bearer`. Services validate it against the issuer's JWKS (fetched via discovery, refetched at most every 30 s for an unknown `kid`): signature (asymmetric algorithms only), `iss`, `aud` (the client id unless configured), `exp`/`nbf` with 60 s leeway.
+- **Principal:** CEL expressions over `claims` give the `username` (default `preferred_username`, else `sub`) and an optional credential/session id (e.g. `claims.sid`). Both go into every request's log span. An empty username rejects the token.
+- **Authorisation:** CEL expressions that must evaluate to `true`. Variables: `claims`, `user` (`{username, session}`), `request` (`{method, path}`), and on yoink's per-PURL policy `purl` (`{type, namespace, name, version, qualifiers, subpath, raw}`). A non-bool result or evaluation error denies (and is logged).
+- **Configuration:** values (issuer, client id) are flags/env; CEL expressions and secrets are always read from files named by flags/env.
+- **Discovery:** each OIDC-enabled listener serves `GET /auth/v1/config` (`{issuer, client_id, scopes}`, unauthenticated) and `GET /auth/v1/whoami`.
+- **CLIs:** device authorization grant (RFC 8628) with a public client, then refresh tokens. Tokens are cached per (issuer, client id) under `$XDG_CACHE_HOME/nfi/tokens` (0600), shared by `nfi`, `nfi-admin` and `yoink`; each service URL remembers the settings it advertised, so a cached token is sent without a discovery round trip. On a 401 an interactive CLI logs in and retries once. Non-interactive use (CI) passes a pre-obtained ID token by env or file, e.g. a CI platform's OIDC token with the right audience.
+
+## yoink
+
+yoink pulls a flake's dependencies into a binary cache under the user's control, so that builds don't depend on cache.nixos.org. It only ever mirrors what is already cached upstream: the `closure` of an `nfi` minimise. What must be built or fetched from elsewhere is reported, never acted on.
+
+**Split of work.** The CLI evaluates and minimises (it talks to `nfi-service`); the service only mirrors. Mirror requests name what to mirror by [PURL](https://github.com/package-url/purl-spec): a store path is `pkg:nix/<percent-encoded store path>`, with no namespace, version, qualifiers or subpath, and the path may omit the name (`/nix/store/<hash>`). Other PURL types are reserved for other backends (and for the npm-like use below).
+
+### Service (`yoink-server`, `yoink-service`)
+
+- **API:** `POST /v1/mirror` `{purls: [...]}` answers with Server-Sent Events: `phases` first (the backend's `{id, name, abbrev}` list), then per PURL any number of `status` (`{purl, phase, progress?: {current, max, unit?}}`, unit only `bytes` so far) and `log` (`{purl, level: info|warning|error|fatal, message}`), and exactly one `result` (`{purl, outcome: success|fatal}`). Every event names the PURL exactly as requested. The stream ends after the last result; a fatal log does not end a PURL by itself, and the reason for a fatal result is in its logs. Keep-alive comments every 15 s.
+- **Jobs:** one per PURL, owned by the backend, not the request. Disconnecting stops nothing; re-posting attaches to running jobs (deduplication is the backend's job), so clients recover from a dropped stream by posting the unfinished PURLs again. Job state is in memory; the target cache is the durable record. A late subscriber gets the current status and the logs kept so far (1000 per job). Updates are forwarded at most every 100 ms per job; progress is merged, but every phase entered is reported, with its last progress.
+- **`Mirror` trait:** `phases()` and `mirror(&Purl) -> Result<Job>`. `Job`/`JobReporter` (phase, progress, logs, outcome) and `JobTable<K>` (dedup by key until the job ends) are provided by the core.
+- **Binaries:** `yoink_server::main` owns the arguments (server options, then a backend subcommand), tracing and serving. A binary supplies a clap subcommand type with one variant per backend and an async function building the `Mirror` from the chosen one; `yoink-service` has only `http`.
+- **Auth:** always on. A request policy runs per API request, and a PURL policy per requested PURL (a denied PURL fails with a fatal log, the others proceed).
+
+### HTTP backend (`yoink-mirror-http`)
+
+- **Caches:** an upstream (default cache.nixos.org, e.g. a proxy of it) and a target accepting `GET`/`PUT` (any HTTP cache with uploads, including a GitLab generic package registry). Each may use basic auth, a bearer token or a custom header (`PRIVATE-TOKEN`, `JOB-TOKEN`), read from files.
+- **Job per store path hash.** Phases: Queued (`Q`, bounded concurrency), Checking target (`C`, `GET <hash>.narinfo`; present means done), Fetching narinfo (`N`), Transferring NAR (`T`, streamed from upstream straight into the target `PUT`, byte progress, size and `FileHash` checked as it streams), Publishing narinfo (`P`). A requested name must match the upstream narinfo.
+- **Integrity:** the narinfo is uploaded only after its NAR, so a narinfo on the target means a complete path. A NAR that fails verification leaves at most an orphaned NAR file, never a narinfo. References are not waited for: the client requests the whole closure.
+- **narinfo:** copied line for line, keeping upstream signatures; only `URL` changes (it isn't signed). `--signing-key-file` adds a signature. NARs go under `nar/` or, with `--nar-layout flat`, next to the narinfos (GitLab generic packages allow no `/` in file names). `nix-cache-info` is created on the target if missing.
+- **Retries:** connection errors, timeouts, HTTP 408/429/5xx and corrupted transfers are retried per step with exponential backoff (`--retries`, default 5) and logged as warnings; other errors (404 upstream, 401/403, name mismatch) are fatal at once.
+
+### CLI (`yoink`)
+
+- **Targets:** `pkg:…` is a PURL; anything containing `#` is a flakeref, as is `.` alone; anything else containing `@` is reserved for `name@version` (not yet supported); anything else is an error.
+- **Flakerefs** are evaluated locally (`nix derivation show --recursive`), minimised by `nfi`, and their `closure` (sorted by name, then hash) becomes `pkg:nix` PURLs. `to_build`/`to_fetch` and warnings are shown but don't affect the exit status.
+- **Completion:** the CLI exits only when every PURL has a result (0 if all succeeded, 1 otherwise) or on an unrecoverable error; a dropped stream is resumed by re-posting the unfinished PURLs with backoff.
+- **TUI:** fullscreen, with overall progress by path count and by size, and a scrollable field of per-PURL indicators in request order. Indicators shrink through several sizes (from a full line with bar, phase name, byte readout and percentage down to `[T 57]`) so as many as possible fit; warnings and errors colour the indicator. Logs are hidden by default and shown in a merged view or per PURL.
+- **Plain mode** (not a terminal, or `--plain`): phase changes, errors and results as lines; `-v`/`-q` adjust.
+
+### Future: npm-like use
+
+`yoink name@version` is reserved for resolving packages through the `nfi` search index and output paths, CLI-side, into `pkg:nix` PURLs (or a new PURL type a backend understands). Nothing in the service depends on flakes, so this needs no service changes.
 
 ## Testing
 

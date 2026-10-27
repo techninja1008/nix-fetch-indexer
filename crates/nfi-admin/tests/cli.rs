@@ -94,3 +94,25 @@ async fn admin_cli_round_trip() {
     let (code, _, err) = tokio::task::block_in_place(|| admin(svc2, &["prune"]));
     assert_eq!(code, 1, "{err}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_admin_token_hint() {
+    let Some(svc) = nfi_testenv::start_service(Some("tok")).await else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let out = tokio::task::block_in_place(|| {
+        Command::new(env!("CARGO_BIN_EXE_nfi-admin"))
+            .args(["--url", &svc.admin_url, "releases"])
+            .env("NFI_TOKEN_CACHE", dir.path().join("tokens"))
+            .env_remove("NFI_ADMIN_TOKEN")
+            .env_remove("NFI_ADMIN_TOKEN_FILE")
+            .output()
+            .unwrap()
+    });
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    // A fixed-token listener has no OIDC login to suggest.
+    assert!(err.contains("pass --token or --token-file"), "{err}");
+    assert!(!err.contains("nfi-admin login"), "{err}");
+}

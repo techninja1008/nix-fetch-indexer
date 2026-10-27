@@ -1,7 +1,9 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
+use nfi_service::auth::{AdminAuth, ServiceAuth};
 use nfi_service::{AppState, api, connect, jobs, search::Meili};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -41,12 +43,107 @@ struct Cli {
     /// Admin listener; keep it on a private interface.
     #[arg(long, env = "NFI_ADMIN_LISTEN", default_value = "127.0.0.1:8081")]
     admin_listen: String,
-    /// Optional static bearer token required on the admin listener.
-    #[arg(long, env = "NFI_ADMIN_TOKEN", hide_env_values = true)]
-    admin_token: Option<String>,
+    /// File holding a static bearer token required on the admin listener.
+    #[arg(long, env = "NFI_ADMIN_TOKEN_FILE", conflicts_with = "admin_oidc")]
+    admin_token_file: Option<PathBuf>,
+    #[command(flatten)]
+    oidc: OidcArgs,
     /// Do not run the background job worker on this replica.
     #[arg(long, env = "NFI_NO_WORKER")]
     no_worker: bool,
+}
+
+/// OIDC login (optional). With an issuer and client id, the public API
+/// accepts ID tokens as bearer tokens; the admin listener does too with
+/// --admin-oidc.
+#[derive(clap::Args)]
+struct OidcArgs {
+    /// OpenID provider issuer URL.
+    #[arg(long, env = "NFI_OIDC_ISSUER", requires = "oidc_client_id")]
+    oidc_issuer: Option<String>,
+    /// Public client that CLIs log in as; ID tokens must be issued to it.
+    #[arg(long, env = "NFI_OIDC_CLIENT_ID", requires = "oidc_issuer")]
+    oidc_client_id: Option<String>,
+    /// Expected ID token audience [default: the client id].
+    #[arg(long, env = "NFI_OIDC_AUDIENCE", requires = "oidc_issuer")]
+    oidc_audience: Option<String>,
+    /// Scopes CLIs request [default: openid,profile,offline_access].
+    #[arg(
+        long,
+        env = "NFI_OIDC_SCOPES",
+        value_delimiter = ',',
+        requires = "oidc_issuer"
+    )]
+    oidc_scopes: Vec<String>,
+    /// File with a CEL expression over `claims` giving the username
+    /// [default: preferred_username, else sub].
+    #[arg(long, env = "NFI_OIDC_USERNAME_CEL_FILE", requires = "oidc_issuer")]
+    oidc_username_cel_file: Option<PathBuf>,
+    /// File with a CEL expression over `claims` giving a credential or
+    /// session id to log (string or null).
+    #[arg(long, env = "NFI_OIDC_SESSION_CEL_FILE", requires = "oidc_issuer")]
+    oidc_session_cel_file: Option<PathBuf>,
+    /// File with a CEL policy (over `claims`, `user`, `request`) that
+    /// authenticated public API requests must pass [default: true].
+    #[arg(long, env = "NFI_MAIN_AUTHZ_CEL_FILE", requires = "oidc_issuer")]
+    main_authz_cel_file: Option<PathBuf>,
+    /// Let requests without a token use the public API (the policy is not
+    /// applied to them).
+    #[arg(long, env = "NFI_ALLOW_ANONYMOUS", requires = "oidc_issuer")]
+    allow_anonymous: bool,
+    /// Authenticate the admin listener with OIDC instead of a static token.
+    #[arg(
+        long,
+        env = "NFI_ADMIN_OIDC",
+        requires_all = ["oidc_issuer", "admin_authz_cel_file"]
+    )]
+    admin_oidc: bool,
+    /// File with the CEL policy admin requests must pass (with --admin-oidc).
+    #[arg(long, env = "NFI_ADMIN_AUTHZ_CEL_FILE", requires = "admin_oidc")]
+    admin_authz_cel_file: Option<PathBuf>,
+}
+
+fn service_auth(admin_token_file: Option<&Path>, o: &OidcArgs) -> Result<ServiceAuth> {
+    use nfi_auth::server::{Authenticator, Expr, OidcSettings, read_trimmed};
+    let oidc = match (&o.oidc_issuer, &o.oidc_client_id) {
+        (Some(issuer), Some(client_id)) => Some(Authenticator::new(OidcSettings {
+            issuer: issuer.clone(),
+            client_id: client_id.clone(),
+            audience: o.oidc_audience.clone(),
+            scopes: o.oidc_scopes.clone(),
+            username: o
+                .oidc_username_cel_file
+                .as_deref()
+                .map(Expr::from_file)
+                .transpose()?,
+            session: o
+                .oidc_session_cel_file
+                .as_deref()
+                .map(Expr::from_file)
+                .transpose()?,
+        })?),
+        (None, None) => None,
+        _ => bail!("--oidc-issuer and --oidc-client-id must be given together"),
+    };
+    let admin = match (admin_token_file, o.admin_oidc) {
+        (Some(_), true) => bail!("--admin-token-file and --admin-oidc are mutually exclusive"),
+        (Some(f), false) => AdminAuth::Token(read_trimmed(f)?),
+        (None, true) => AdminAuth::Oidc(Expr::from_file(
+            o.admin_authz_cel_file
+                .as_deref()
+                .context("--admin-oidc requires --admin-authz-cel-file")?,
+        )?),
+        (None, false) => AdminAuth::Open,
+    };
+    Ok(ServiceAuth {
+        oidc,
+        allow_anonymous: o.allow_anonymous,
+        main_authz: match &o.main_authz_cel_file {
+            Some(f) => Expr::from_file(f)?,
+            None => Expr::new("true")?,
+        },
+        admin,
+    })
 }
 
 /// Child processes owned by this service; stopped when dropped.
@@ -108,6 +205,12 @@ async fn main() -> Result<()> {
     allow(unused_mut, unused_variables)
 )]
 async fn run(cli: Cli, embedded: &mut Embedded) -> Result<()> {
+    let auth = Arc::new(service_auth(cli.admin_token_file.as_deref(), &cli.oidc)?);
+    if let Some(a) = &auth.oidc
+        && let Err(e) = a.prefetch().await
+    {
+        tracing::warn!(error = %e, "could not fetch the OpenID provider's keys yet");
+    }
     let database_url = match (&cli.database_url, &cli.embedded_postgres) {
         (Some(u), _) => u.clone(),
         #[cfg(feature = "embedded-postgres")]
@@ -170,7 +273,7 @@ async fn run(cli: Cli, embedded: &mut Embedded) -> Result<()> {
     let state = AppState {
         pool,
         meili,
-        admin_token: cli.admin_token.filter(|t| !t.is_empty()),
+        auth,
         http: reqwest::Client::builder()
             .timeout(Duration::from_secs(3600))
             .build()?,

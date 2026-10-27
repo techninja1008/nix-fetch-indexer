@@ -53,6 +53,7 @@
             postInstall = ''
               wrapProgram $out/bin/nfi-indexer --suffix PATH : ${lib.makeBinPath [ pkgs.nix-eval-jobs ]}
               wrapProgram $out/bin/nfi --suffix PATH : ${lib.makeBinPath [ pkgs.nix ]}
+              wrapProgram $out/bin/yoink --suffix PATH : ${lib.makeBinPath [ pkgs.nix ]}
               # For --embedded-postgres / --embedded-meilisearch (single-node mode).
               wrapProgram $out/bin/nfi-service --suffix PATH : ${
                 lib.makeBinPath [
@@ -90,7 +91,12 @@
               inherit name;
               tag = "latest";
               contents = [
-                pkgs.dockerTools.fakeNss
+                # root and nobody, plus `user` (UID/GID 1000), which the
+                # images run as by default.
+                (pkgs.dockerTools.fakeNss.override {
+                  extraPasswdLines = [ "user:x:1000:1000:user:/var/empty:/bin/sh" ];
+                  extraGroupLines = [ "user:x:1000:" ];
+                })
                 pkgs.cacert
                 pkgs.bashInteractive
                 pkgs.coreutils-full
@@ -100,7 +106,13 @@
                 mkdir -p -m 1777 tmp var/tmp
                 mkdir -p -m 0755 run
               '';
-              config = config // {
+              # Run as `user` unless an image says otherwise; override with
+              # e.g. `docker run --user` to match the owner of a bind mount.
+              config = {
+                User = "1000:1000";
+              }
+              // config
+              // {
                 Env = [
                   "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
                   "TMPDIR=/tmp"
@@ -116,6 +128,8 @@
           nfi-admin = single "nfi-admin";
           nfi-indexer = single "nfi-indexer";
           nfi-service = single "nfi-service";
+          yoink = single "yoink";
+          yoink-service = single "yoink-service";
         }
         // linuxOnly pkgs {
           # OCI images (load with `docker load < result`).
@@ -127,13 +141,23 @@
                 "NFI_LISTEN=0.0.0.0:8080"
                 # The admin listener stays inside the container by default.
                 # To reach it from outside, override NFI_ADMIN_LISTEN, set
-                # NFI_ADMIN_TOKEN and publish the port on a private address.
+                # NFI_ADMIN_TOKEN_FILE (or NFI_ADMIN_OIDC) and publish the
+                # port on a private address.
                 "NFI_ADMIN_LISTEN=127.0.0.1:8081"
               ];
               ExposedPorts = {
                 "8080/tcp" = { };
               };
-              User = "65534:65534";
+            };
+          };
+          yoink-service-image = image {
+            name = "yoink-service";
+            config = {
+              Entrypoint = [ "${workspace}/bin/yoink-service" ];
+              Env = [ "YOINK_LISTEN=0.0.0.0:8090" ];
+              ExposedPorts = {
+                "8090/tcp" = { };
+              };
             };
           };
           nfi-indexer-image = image {
@@ -146,13 +170,10 @@
         }
       );
 
-      checks = forAll (
-        pkgs:
-        {
-          # Builds everything and runs the full test suite (unit + integration).
-          build = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
-        }
-      );
+      checks = forAll (pkgs: {
+        # Builds everything and runs the full test suite (unit + integration).
+        build = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+      });
 
       devShells = forAll (pkgs: {
         default = pkgs.mkShell {

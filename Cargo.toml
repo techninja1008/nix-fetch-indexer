@@ -12,6 +12,10 @@ readme = "README.md"
 [workspace.dependencies]
 nfi-interchange = { path = "crates/nfi-interchange" }
 nfi-api = { path = "crates/nfi-api" }
+nfi-auth = { path = "crates/nfi-auth" }
+yoink-api = { path = "crates/yoink-api" }
+yoink-server = { path = "crates/yoink-server" }
+yoink-mirror-http = { path = "crates/yoink-mirror-http" }
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
@@ -25,7 +29,7 @@ tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "json", "query", "stream", "gzip"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "json", "query", "stream", "gzip", "form"] }
 futures = "0.3"
 tempfile = "3"
 tar = "0.4"
@@ -39,3 +43,11 @@ tokio-util = { version = "0.7", features = ["io"] }
 shell-words = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 libc = "0.2"
+cel = { version = "0.15", default-features = false, features = ["json", "regex"] }
+jsonwebtoken = { version = "11", default-features = false, features = ["use_pem", "aws_lc_rs"] }
+http = "1"
+base64 = "0.22"
+sha2 = "0.10"
+percent-encoding = "2"
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }

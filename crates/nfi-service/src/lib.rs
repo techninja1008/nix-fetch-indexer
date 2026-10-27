@@ -2,6 +2,7 @@
 #![allow(clippy::type_complexity)]
 
 pub mod api;
+pub mod auth;
 pub mod check;
 pub mod copy;
 pub mod ingest;
@@ -16,7 +17,7 @@ use std::time::Duration;
 pub struct AppState {
     pub pool: sqlx::PgPool,
     pub meili: Option<search::Meili>,
-    pub admin_token: Option<String>,
+    pub auth: std::sync::Arc<auth::ServiceAuth>,
     pub http: reqwest::Client,
     pub poll_interval: Duration,
 }

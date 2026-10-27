@@ -16,6 +16,8 @@ See [DESIGN.md](DESIGN.md) for the full design.
 | `nfi-service` | `crates/nfi-service` | Query service: Postgres plus Meilisearch, with a public HTTP/JSON API and a separate admin listener |
 | `nfi` | `crates/nfi` | Query CLI: `search`, `show`, `bulk`, `minimise` (with fetch hooks) |
 | `nfi-admin` | `crates/nfi-admin` | Admin CLI: `ingest`, `jobs`, `releases`, `prune`, `reindex` |
+| `yoink-service` | `crates/yoink-service` | Mirroring service: copies store paths into a binary cache you control (see [yoink](#yoink)) |
+| `yoink` | `crates/yoink` | Mirroring CLI: `yoink nixpkgs#hello` pulls a flake's cached closure into that cache, with a live monitor |
 
 Supporting libraries:
 
@@ -23,6 +25,8 @@ Supporting libraries:
 - `nfi-api`: shared API types, the derivation-graph reducer, the minimise planner and an HTTP client.
 - `nfi-embedded-postgres`, `nfi-embedded-meilisearch`: supervised child-process PostgreSQL and Meilisearch for single-node mode.
 - `nfi-testenv`: ephemeral Postgres and Meilisearch for tests.
+- `nfi-auth`: OIDC token validation and CEL policies for services; device code login and the token cache for CLIs.
+- `yoink-api`, `yoink-server`, `yoink-mirror-http`: yoink's API types and client, service core (with the `Mirror` trait), and HTTP cache backend.
 
 ## Building
 
@@ -194,7 +198,7 @@ These figures come from `bench-compression` on a full `nixos-25.05` closure bund
 nfi-service \
   --database-url postgres://nfi@localhost/nfi \
   --meili-url http://localhost:7700 \
-  --listen 0.0.0.0:8080 --admin-listen 127.0.0.1:8081   # optional: NFI_ADMIN_TOKEN=...
+  --listen 0.0.0.0:8080 --admin-listen 127.0.0.1:8081   # optional: --admin-token-file /run/secrets/nfi-admin
 ```
 
 **Configuration**
@@ -203,14 +207,15 @@ All options can also be set through the environment:
 
 - `NFI_DATABASE_URL`
 - `NFI_MEILI_URL`, `NFI_MEILI_KEY`, `NFI_MEILI_INDEX`
-- `NFI_LISTEN`, `NFI_ADMIN_LISTEN`, `NFI_ADMIN_TOKEN`
+- `NFI_LISTEN`, `NFI_ADMIN_LISTEN`, `NFI_ADMIN_TOKEN_FILE`
+- `NFI_OIDC_*`, `NFI_MAIN_AUTHZ_CEL_FILE`, `NFI_ALLOW_ANONYMOUS`, `NFI_ADMIN_OIDC`, `NFI_ADMIN_AUTHZ_CEL_FILE` (see [Authentication](#authentication))
 - `NFI_NO_WORKER`
 
-**Container image:** `nfi-service-image` only listens on port 8080 from outside the container. The admin listener is bound to `127.0.0.1:8081` inside the container, so it can't be reached by default. To run admin commands from the host, set a token, listen on all interfaces inside the container, and publish the port on a loopback or private address only:
+**Container image:** `nfi-service-image` only listens on port 8080 from outside the container. The admin listener is bound to `127.0.0.1:8081` inside the container, so it can't be reached by default. To run admin commands from the host, set a token (or use OIDC), listen on all interfaces inside the container, and publish the port on a loopback or private address only:
 
 ```sh
 docker run -p 8080:8080 -p 127.0.0.1:8081:8081 \
-  -e NFI_ADMIN_LISTEN=0.0.0.0:8081 -e NFI_ADMIN_TOKEN=... \
+  -e NFI_ADMIN_LISTEN=0.0.0.0:8081 -e NFI_ADMIN_TOKEN_FILE=/run/secrets/nfi-admin -v ./nfi-admin:/run/secrets/nfi-admin:ro \
   -e NFI_DATABASE_URL=... -e NFI_MEILI_URL=... nfi-service:latest
 ```
 
@@ -268,6 +273,46 @@ The figures below were measured with embedded PostgreSQL 16 on 4 cores.
 | An extra release into that database (315k new paths) | ~24 s |
 | Pruning one release, or a whole channel, from it | ~20 s |
 
+### Authentication
+
+Both listeners are open by default. Optionally, callers log in with OIDC (the device code flow) and send their ID token as a bearer token; the service validates it against the provider's JWKS (signature, `iss`, `aud`, `exp`) and logs every request with the caller's username and session. CEL expressions and secrets are always read from files.
+
+| flag | env | meaning |
+|---|---|---|
+| `--oidc-issuer`, `--oidc-client-id` | `NFI_OIDC_ISSUER`, `NFI_OIDC_CLIENT_ID` | Enable OIDC: the provider and the public client CLIs log in as |
+| `--oidc-audience` | `NFI_OIDC_AUDIENCE` | Expected `aud` (default: the client id) |
+| `--oidc-scopes` | `NFI_OIDC_SCOPES` | Scopes CLIs request (default `openid,profile,offline_access`) |
+| `--oidc-username-cel-file` | `NFI_OIDC_USERNAME_CEL_FILE` | Username, over `claims` (default `preferred_username`, else `sub`) |
+| `--oidc-session-cel-file` | `NFI_OIDC_SESSION_CEL_FILE` | Optional credential or session id to log, over `claims` (e.g. `claims.sid`) |
+| `--main-authz-cel-file` | `NFI_MAIN_AUTHZ_CEL_FILE` | Policy for the public API (default `true`) |
+| `--allow-anonymous` | `NFI_ALLOW_ANONYMOUS` | Let requests without a token use the public API |
+| `--admin-token-file` | `NFI_ADMIN_TOKEN_FILE` | Protect the admin listener with a static bearer token |
+| `--admin-oidc` | `NFI_ADMIN_OIDC` | Protect the admin listener with OIDC instead (needs `--admin-authz-cel-file`) |
+| `--admin-authz-cel-file` | `NFI_ADMIN_AUTHZ_CEL_FILE` | Policy for the admin API |
+
+**Rules**
+
+- Public API with OIDC: a request with a token must carry a valid ID token (401 otherwise) that passes the main policy (403 otherwise). A request without one gets 401, unless `--allow-anonymous`, in which case the policy is skipped.
+- Admin API: open, a static token, or OIDC with the admin policy. The static token and `--admin-oidc` are mutually exclusive.
+- `/healthz` and `/auth/v1/config` never need a token.
+
+**Policies** are CEL expressions that must evaluate to `true`. Variables:
+
+- `claims`: the ID token's claims.
+- `user`: `{"username": ..., "session": ...}` as extracted above.
+- `request`: `{"method": ..., "path": ...}`.
+
+```cel
+'nfi-admins' in claims.groups && request.method != 'DELETE'
+```
+
+**Routes** on each listener that uses OIDC:
+
+| method | path | description |
+|---|---|---|
+| GET | `/auth/v1/config` | `{"issuer", "client_id", "scopes"}` for CLIs to log in with; 404 when the listener doesn't use OIDC |
+| GET | `/auth/v1/whoami` | `{"username", "session"}` of the caller; 401 when not logged in |
+
 ### Public API
 
 | method | path | description |
@@ -303,7 +348,7 @@ The figures below were measured with embedded PostgreSQL 16 on 4 cores.
   - `close_miss` lists derivations to build whose name (name and version) matches indexed paths with a different hash: probably a slightly overridden package, or a build input that isn't indexed. Names matching `close_miss_threshold` indexed paths or more (default 100) are too generic to report; 0 turns the check off (`nfi minimise --close-miss-threshold`).
   - `nfi minimise` prints warnings to stderr.
 
-### Admin API (admin listener only, optional `Authorization: Bearer <token>`)
+### Admin API (admin listener only; optionally authenticated, see [Authentication](#authentication))
 
 | method | path | description |
 |---|---|---|
@@ -356,10 +401,24 @@ nix derivation show --recursive .#foo | nfi minimise -f -
   - `minimise` passes the closure by default, or only the roots with `--roots-only`.
 - Exit status: the CLI exits with the hook's exit status.
 
+**Login**
+
+```sh
+nfi login            # device code flow; prints a URL and code to approve
+nfi whoami           # alice (session ...)
+nfi logout
+NFI_TOKEN=$CI_ID_TOKEN nfi releases     # or --token-file / NFI_TOKEN_FILE
+```
+
+- Tokens: an explicit token (`NFI_TOKEN`, `--token-file`) is sent as is, e.g. an ID token issued to CI with the service's client id as its audience. Otherwise a cached login is used, and refreshed when it expires.
+- Cache: `$XDG_CACHE_HOME/nfi/tokens` (or `$NFI_TOKEN_CACHE`), keyed by provider and client, so `nfi`, `nfi-admin` and `yoink` share a login when their services use the same provider and client. `login` reuses a valid cached login for the same provider unless `--force` is given.
+- On a 401, an interactive CLI (stdin and stderr are terminals) without an explicit token logs in and retries the command once; otherwise it fails and suggests `nfi login`.
+- `nfi-admin` has the same `login`, `logout` and `whoami` commands for the admin listener, and keeps `--token`/`NFI_ADMIN_TOKEN` and `--token-file`/`NFI_ADMIN_TOKEN_FILE` for an explicit token (the static admin token or an ID token).
+
 **Admin CLI**
 
 ```sh
-export NFI_ADMIN_URL=http://127.0.0.1:8081 NFI_ADMIN_TOKEN=...
+export NFI_ADMIN_URL=http://127.0.0.1:8081 NFI_ADMIN_TOKEN=...   # or NFI_ADMIN_TOKEN_FILE, or nfi-admin login
 nfi-admin ingest release.nfib https://example/other.nfib --wait
 nfi-admin releases
 nfi-admin prune --channel nixos-24.11 --wait
@@ -368,6 +427,80 @@ nfi-admin reindex --wait
 nfi-admin check --wait      # exit status 3 if the index is inconsistent
 nfi-admin jobs [ID] [--wait]
 ```
+
+## yoink
+
+yoink pulls the dependencies of a flake into a binary cache you control, so that builds don't depend on cache.nixos.org. It mirrors exactly the cached closure that `nfi minimise` reports; whatever must be built or fetched from elsewhere is shown but never acted on.
+
+```sh
+export YOINK_URL=https://yoink.example NFI_URL=https://nfi.example
+yoink login                       # OIDC device flow (also logs in to NFI if it uses another provider/client)
+yoink nixpkgs#hello .#devShells.x86_64-linux.default
+yoink .                           # the current flake's default package
+yoink 'pkg:nix/%2Fnix%2Fstore%2F0xy6xjvbl4bm3pq4w6p2b6vfffw4vi9b-hello-2.12.3'
+YOINK_TOKEN=$CI_ID_TOKEN yoink --plain .#foo   # CI: a pre-obtained ID token, line output
+```
+
+**Targets**
+
+- `pkg:…`: a package URL. Store paths are `pkg:nix/<percent-encoded store path>`; the name may be left out (`/nix/store/<hash>`).
+- Anything containing `#`, or `.` alone: a flake reference. It is evaluated locally (`nix derivation show --recursive`), minimised by NFI, and its closure becomes `pkg:nix` PURLs.
+- `name@version` is reserved for a future npm-like mode and rejected for now; anything else is an error.
+
+**Behaviour**
+
+- The CLI exits only when every path has a result: 0 if all were mirrored, 1 if any failed, or on an unrecoverable error. A dropped connection is resumed by re-posting the unfinished paths (the service deduplicates); it gives up after 5 minutes without progress. `q`/Ctrl-C detaches with status 130, and the service keeps mirroring.
+- **Monitor** (on a terminal): overall progress by path count and by size, and a scrollable field with one indicator per path, in request order. Indicators shrink, from a full line (name, bar, phase, `12.3/45.6 MiB`) down to `[T 57]` (phase abbreviation and percent), to fit as many as possible. Yellow means warnings, red errors. Keys: arrows/`j`/`k` move, Enter shows that path's log, `l` all logs, Esc back, `q` quit; click selects, clicking again opens the log.
+- **Plain mode** (not a terminal, or `--plain`): phase changes, errors and results, one per line; `-v` adds warnings and info, `-vv` progress; `-q` only errors.
+- Configuration: `$XDG_CONFIG_HOME/yoink/config.toml` may set `url`, `nfi_url` and `nix`.
+
+### Service
+
+```sh
+yoink-service \
+  --oidc-issuer https://idp.example --oidc-client-id yoink \
+  --purl-authz-cel-file /etc/yoink/purl.cel \
+  http --target-url https://cache.internal.example --target-bearer-token-file /run/secrets/cache-token
+```
+
+The service always requires an OIDC ID token. Options before the backend subcommand (`http`) belong to the service; each has a `YOINK_*` environment variable:
+
+| option | purpose |
+|---|---|
+| `--listen` | listen address (default `0.0.0.0:8090`) |
+| `--oidc-issuer`, `--oidc-client-id`, `--oidc-audience`, `--oidc-scopes` | as for `nfi-service` (see [Authentication](#authentication)) |
+| `--oidc-username-cel-file`, `--oidc-session-cel-file` | CEL giving the username (default `preferred_username`, else `sub`) and an optional session id for logs |
+| `--authz-cel-file` | CEL policy per request; variables `claims`, `user`, `request` (default `true`) |
+| `--purl-authz-cel-file` | CEL policy per requested PURL; also `purl` (`{type, namespace, name, version, qualifiers, subpath, raw}`), e.g. `purl.type == 'nix'` (default `true`) |
+| `--max-purls` | most PURLs per request (default 100000) |
+
+**API.** `POST /v1/mirror` with `{"purls": [...]}` returns Server-Sent Events: `phases` (the backend's phases: `id`, `name`, one-character `abbrev`), then per PURL `status` (`phase`, optional `progress: {current, max, unit}`), `log` (`level`: `info`, `warning`, `error` or `fatal`, `message`) and finally one `result` (`outcome`: `success` or `fatal`). Every event names its PURL as requested. Jobs outlive the request: re-posting attaches to them. `GET /auth/v1/config` and `GET /auth/v1/whoami` are as on `nfi-service`.
+
+**HTTP backend** (`http`, options with `YOINK_*` variables):
+
+| option | purpose |
+|---|---|
+| `--upstream-url` | cache to copy from (default `https://cache.nixos.org`; may be a proxy of it) |
+| `--target-url` | cache to copy to; must serve `GET` and accept `PUT` |
+| `--{upstream,target}-basic-auth-file` | file with `user:password` |
+| `--{upstream,target}-bearer-token-file` | file with a bearer token |
+| `--{upstream,target}-header-name`, `--{upstream,target}-header-file` | a custom header and the file holding its value (e.g. GitLab `PRIVATE-TOKEN` or `JOB-TOKEN`) |
+| `--nar-layout nar\|flat` | NARs under `nar/` (default) or next to the narinfos |
+| `--signing-key-file` | add a signature with this Nix key (`name:base64`); upstream signatures are always kept |
+| `--concurrency`, `--retries`, `--http-timeout` | paths in flight (16), retries per step for transient errors (5), idle timeout in seconds (120) |
+| `--cache-priority`, `--no-cache-info` | `nix-cache-info` is created on the target with this priority (30) unless disabled |
+
+Each path goes through Queued (`Q`), Checking target (`C`: already there means done), Fetching narinfo (`N`), Transferring NAR (`T`: streamed from upstream into the target, with size and hash checked) and Publishing narinfo (`P`). The narinfo is uploaded last, so a narinfo on the target always means a complete path.
+
+**GitLab generic package registry as the target.** File names there can't contain `/`, so use the flat layout:
+
+```sh
+yoink-service --oidc-issuer https://gitlab.example --oidc-client-id <application id> \
+  http --target-url https://gitlab.example/api/v4/projects/<id>/packages/generic/nix-cache/1 \
+  --nar-layout flat --target-header-name PRIVATE-TOKEN --target-header-file /run/secrets/gitlab-token
+```
+
+Nix then uses `https://gitlab.example/api/v4/projects/<id>/packages/generic/nix-cache/1` as a substituter (with credentials, e.g. a netrc file).
 
 ## Tests
 

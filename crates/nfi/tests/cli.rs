@@ -17,6 +17,9 @@ fn nfi(url: &str, dir: &Path, args: &[&str]) -> Out {
         .args(args)
         // Isolate from any user config.
         .env("XDG_CONFIG_HOME", dir)
+        .env("NFI_TOKEN_CACHE", dir.join("tokens"))
+        .env_remove("NFI_TOKEN")
+        .env_remove("NFI_TOKEN_FILE")
         .env_remove("NFI_FETCH_HOOK")
         .output()
         .unwrap();

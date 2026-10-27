@@ -1,0 +1,17 @@
+[package]
+name = "yoink-service"
+description = "The yoink mirroring service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[[bin]]
+name = "yoink-service"
+path = "src/main.rs"
+
+[dependencies]
+yoink-server.workspace = true
+yoink-mirror-http.workspace = true
+clap.workspace = true
