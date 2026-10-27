@@ -91,7 +91,13 @@
               inherit name;
               tag = "latest";
               contents = [
-                pkgs.dockerTools.fakeNss
+                # root and nobody, plus UID/GID 1000 so that the images can
+                # also run as a typical non-root host user (e.g. with
+                # `--user 1000:1000` and a bind mount owned by that user).
+                (pkgs.dockerTools.fakeNss.override {
+                  extraPasswdLines = [ "user:x:1000:1000:user:/var/empty:/bin/sh" ];
+                  extraGroupLines = [ "user:x:1000:" ];
+                })
                 pkgs.cacert
                 pkgs.bashInteractive
                 pkgs.coreutils-full
