@@ -61,11 +61,18 @@ fn add(files: &Files, n: u8, nar: &[u8]) {
     f.insert(format!("nar/{fh}.nar"), Bytes::copy_from_slice(nar));
 }
 
-#[tokio::test]
-async fn pulls_into_the_target_cache() {
+struct Stack {
+    url: String,
+    idp: MockIdp,
+    target: Files,
+}
+
+/// The service with the HTTP backend between two caches, the upstream one
+/// holding paths 1 to `n`.
+async fn stack(n: u8) -> Stack {
     let upstream: Files = Default::default();
     let target: Files = Default::default();
-    for n in 1..=40 {
+    for n in 1..=n {
         add(&upstream, n, &vec![n; 10_000 + n as usize * 1000]);
     }
     let mirror = HttpMirror::new(Config {
@@ -91,7 +98,20 @@ async fn pulls_into_the_target_cache() {
     let url = format!("http://{}", l.local_addr().unwrap());
     let state = api::State::new(Arc::new(mirror), auth, 1000);
     tokio::spawn(async move { axum::serve(l, api::router(state)).await.unwrap() });
+    Stack { url, idp, target }
+}
 
+fn narinfo_count(f: &Files) -> usize {
+    f.lock()
+        .unwrap()
+        .keys()
+        .filter(|k| k.ends_with(".narinfo"))
+        .count()
+}
+
+#[tokio::test]
+async fn pulls_into_the_target_cache() {
+    let Stack { url, idp, target } = stack(40).await;
     let token = idp.token(serde_json::json!({"sub": "ci", "preferred_username": "ci"}));
     let run = |purls: Vec<String>| {
         let d = tempfile::tempdir().unwrap();
@@ -137,4 +157,68 @@ async fn pulls_into_the_target_cache() {
     assert_eq!(code, Some(1), "{err}");
     assert!(err.contains("not in the upstream cache"), "{err}");
     assert!(err.contains("40 of 41 paths mirrored, 1 failed"), "{err}");
+}
+
+/// `yoink` on a pseudo-terminal with an empty token cache.
+async fn yoink_tty(url: &str, dir: &std::path::Path, args: &[String]) -> nfi_auth::testing::pty::PtyOutput {
+    let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_yoink"));
+    c.args(args)
+        .env("YOINK_URL", url)
+        .env("NFI_TOKEN_CACHE", dir.join("tokens"))
+        .env("XDG_CONFIG_HOME", dir)
+        .env("HOME", dir)
+        .env("TERM", "xterm-256color")
+        .env_remove("YOINK_TOKEN")
+        .env_remove("YOINK_TOKEN_FILE")
+        .env_remove("NFI_URL");
+    tokio::task::spawn_blocking(move || nfi_auth::testing::pty::run(c, 120, 40, Duration::from_secs(60)))
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn interactive_login_and_monitor() {
+    let s = stack(60).await;
+    let d = tempfile::tempdir().unwrap();
+    let purls = |r: std::ops::RangeInclusive<u8>| -> Vec<String> {
+        r.map(|n| Purl::nix(&store_path(n)).to_string()).collect()
+    };
+
+    // No token and a terminal: log in first, then pull (plain output).
+    let mut args = vec!["--plain".to_string()];
+    args.extend(purls(1..=20));
+    let o = yoink_tty(&s.url, d.path(), &args).await;
+    assert_eq!(o.code, Some(0), "{}", o.text);
+    assert!(
+        o.text.contains("To log in, open") && o.text.contains("CODE-0"),
+        "{}",
+        o.text
+    );
+    assert!(o.text.contains("20 of 20 paths mirrored, 0 failed"), "{}", o.text);
+    assert_eq!((s.idp.device_logins(), narinfo_count(&s.target)), (1, 20));
+
+    // The fullscreen monitor, with the cached login: it runs until every
+    // path has a result, restores the terminal and prints the summary.
+    let o = yoink_tty(&s.url, d.path(), &purls(1..=60)).await;
+    assert_eq!(o.code, Some(0), "{}", o.text);
+    assert!(!o.timed_out);
+    assert!(!o.text.contains("To log in"), "{}", o.text);
+    // Drawn only by the fullscreen monitor (its key hints), not plain mode.
+    assert!(o.text.contains("enter path log"), "{}", o.text);
+    assert!(
+        !o.text.contains(": Transferring NAR"),
+        "no plain lines: {}",
+        o.text
+    );
+    assert!(o.text.contains("60 of 60 paths mirrored, 0 failed"), "{}", o.text);
+    assert_eq!((s.idp.device_logins(), narinfo_count(&s.target)), (1, 60));
+
+    // `whoami` and `logout` from the terminal.
+    let o = yoink_tty(&s.url, d.path(), &["whoami".into()]).await;
+    assert_eq!(o.code, Some(0), "{}", o.text);
+    assert!(o.text.contains("alice"), "{}", o.text);
+    let o = yoink_tty(&s.url, d.path(), &["logout".into()]).await;
+    assert_eq!(o.code, Some(0), "{}", o.text);
+    let o = yoink_tty(&s.url, d.path(), &["whoami".into()]).await;
+    assert_ne!(o.code, Some(0), "{}", o.text);
 }

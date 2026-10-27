@@ -108,3 +108,74 @@ async fn tokens() {
     let o = nfi(&[], &["logout"]);
     assert!(o.stderr.contains("not logged in"), "{}", o.stderr);
 }
+
+/// Run `nfi` on a pseudo-terminal, so that it may prompt for a login.
+async fn nfi_tty(dir: &Path, args: &[&str]) -> nfi_auth::testing::pty::PtyOutput {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_nfi"));
+    c.args(args)
+        .env("XDG_CONFIG_HOME", dir)
+        .env("NFI_TOKEN_CACHE", dir.join("tokens"))
+        .env_remove("NFI_TOKEN")
+        .env_remove("NFI_TOKEN_FILE");
+    tokio::task::spawn_blocking(move || {
+        nfi_auth::testing::pty::run(c, 100, 30, std::time::Duration::from_secs(60))
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn interactive_login() {
+    let idp = MockIdp::start("nfi").await;
+    let auth = ServiceAuth {
+        oidc: Some(Authenticator::new(idp.settings()).unwrap()),
+        allow_anonymous: false,
+        main_authz: Expr::new("true").unwrap(),
+        admin: AdminAuth::Open,
+    };
+    let Some(svc) = nfi_testenv::start_service_with(auth).await else {
+        return;
+    };
+    let d = tempfile::tempdir().unwrap();
+    let url = svc.public_url.as_str();
+
+    // On a terminal, a 401 starts the device flow and the command is retried.
+    let o = nfi_tty(d.path(), &["--url", url, "releases"]).await;
+    assert_eq!(o.code, Some(0), "{}", o.text);
+    assert!(
+        o.text.contains("To log in, open") && o.text.contains("CODE-0"),
+        "{}",
+        o.text
+    );
+    assert_eq!(idp.device_logins(), 1);
+
+    // The login is cached: later commands, even without a terminal, use it.
+    let o = run(
+        env!("CARGO_BIN_EXE_nfi"),
+        d.path(),
+        &[],
+        &["--url", url, "whoami"],
+    );
+    assert_eq!((o.code, o.stdout.trim()), (0, "alice"), "{}", o.stderr);
+
+    // `login` reuses a valid cached login, and `--force` starts a new one.
+    idp.set_login_claims(json!({"sub": "u2", "preferred_username": "carol"}));
+    let o = nfi_tty(d.path(), &["--url", url, "login"]).await;
+    assert_eq!(o.code, Some(0), "{}", o.text);
+    assert_eq!(idp.device_logins(), 1, "{}", o.text);
+    let o = nfi_tty(d.path(), &["--url", url, "login", "--force"]).await;
+    assert_eq!(o.code, Some(0), "{}", o.text);
+    assert!(o.text.contains("CODE-1"), "{}", o.text);
+    assert!(o.text.contains("carol"), "{}", o.text);
+    assert_eq!(idp.device_logins(), 2);
+
+    // An expired login is refreshed without prompting.
+    idp.set_token_lifetime(-10);
+    let o = nfi_tty(d.path(), &["--url", url, "login", "--force"]).await;
+    assert_eq!(o.code, Some(0), "{}", o.text);
+    idp.set_token_lifetime(3600);
+    let o = nfi_tty(d.path(), &["--url", url, "whoami"]).await;
+    assert_eq!(o.code, Some(0), "{}", o.text);
+    assert!(!o.text.contains("To log in"), "{}", o.text);
+    assert_eq!((idp.device_logins(), idp.refreshes()), (3, 1));
+}

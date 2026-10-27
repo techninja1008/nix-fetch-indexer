@@ -2021,6 +2021,7 @@ dependencies = [
  "hex",
  "http",
  "jsonwebtoken",
+ "libc",
  "nfi-auth",
  "reqwest",
  "serde",

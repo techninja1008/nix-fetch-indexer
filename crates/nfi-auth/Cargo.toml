@@ -22,6 +22,7 @@ http = { workspace = true, optional = true }
 cel = { workspace = true, optional = true }
 jsonwebtoken = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
 
 [features]
 # Token validation, claim extraction and CEL authorisation for services.
@@ -29,7 +30,7 @@ server = ["dep:reqwest", "dep:tokio", "dep:tracing", "dep:http", "dep:cel", "dep
 # Device code login, token refresh and the token cache for CLIs.
 client = ["dep:reqwest", "dep:tokio"]
 # An in-process mock OpenID provider for tests.
-testing = ["server", "dep:axum"]
+testing = ["server", "dep:axum", "dep:libc"]
 
 [dev-dependencies]
 tempfile.workspace = true

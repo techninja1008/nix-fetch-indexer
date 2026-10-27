@@ -1,6 +1,10 @@
 //! An in-process mock OpenID provider for tests: discovery, JWKS (one
 //! Ed25519 key), and a device authorization grant that approves on the
-//! second poll.
+//! second poll. [`pty`] runs CLIs on a pseudo-terminal, so that their
+//! interactive paths (device login, fullscreen UIs) can be tested too.
+
+#[cfg(unix)]
+pub mod pty;
 
 use crate::server::OidcSettings;
 use axum::Router;
