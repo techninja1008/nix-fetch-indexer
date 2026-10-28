@@ -33,10 +33,18 @@ Supporting libraries:
 ```sh
 nix build            # all binaries (runs the full test suite, including integration tests)
 nix build .#nfi      # a single binary
-nix build .#nfi-service-image && docker load < result   # OCI image (also .#nfi-indexer-image)
+nix build .#nfi-service-image && docker load < result   # OCI image (also .#nfi-indexer-image, .#yoink-service-image)
 nix develop          # cargo, clippy, postgresql, meilisearch, nix-eval-jobs
 cargo build --release
 ```
+
+The packages live in [`nix/`](nix) and are loaded with `callPackage`. Each image takes its binary as an argument, so another build can be swapped in with `.override`:
+
+```nix
+nfi.packages.x86_64-linux.nfi-service-image.override { nfi-service = my-nfi-service; }
+```
+
+Any package with `bin/nfi-service` (or `bin/nfi-indexer`, `bin/yoink-service` for the other images) works.
 
 ## Indexing
 
