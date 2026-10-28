@@ -10,6 +10,25 @@
   postgresql,
 }:
 
+let
+  # Each binary gets its own output, wrapped with these on its PATH, so a
+  # consumer (e.g. an image) only pulls in the binary it uses. `out` links
+  # to all of them.
+  bins = {
+    nfi = [ nix ];
+    nfi-admin = [ ];
+    nfi-indexer = [ nix-eval-jobs ];
+    # For --embedded-postgres / --embedded-meilisearch (single-node mode).
+    nfi-service = [
+      postgresql
+      meilisearch
+    ];
+    yoink = [ nix ];
+    yoink-service = [ ];
+  };
+  # Output names become shell variables, so they can't contain `-`.
+  outputName = lib.replaceStrings [ "-" ] [ "_" ];
+in
 rustPlatform.buildRustPackage {
   pname = "nix-fetch-indexer";
   version = (lib.importTOML ../Cargo.toml).workspace.package.version;
@@ -39,19 +58,29 @@ rustPlatform.buildRustPackage {
   # Tests bind localhost ports.
   __darwinAllowLocalNetworking = true;
 
+  outputs = [ "out" ] ++ map outputName (lib.attrNames bins);
+
   postInstall = ''
-    wrapProgram $out/bin/nfi-indexer --suffix PATH : ${lib.makeBinPath [ nix-eval-jobs ]}
-    wrapProgram $out/bin/nfi --suffix PATH : ${lib.makeBinPath [ nix ]}
-    wrapProgram $out/bin/yoink --suffix PATH : ${lib.makeBinPath [ nix ]}
-    # For --embedded-postgres / --embedded-meilisearch (single-node mode).
-    wrapProgram $out/bin/nfi-service --suffix PATH : ${
-      lib.makeBinPath [
-        postgresql
-        meilisearch
-      ]
-    }
     rm -f $out/bin/nfi-testenv
-  '';
+  ''
+  + lib.concatStrings (
+    lib.mapAttrsToList (
+      name: path:
+      let
+        output = "$" + outputName name;
+        dir = "${output}/bin";
+      in
+      ''
+        moveToOutput bin/${name} "${output}"
+      ''
+      + lib.optionalString (path != [ ]) ''
+        wrapProgram ${dir}/${name} --suffix PATH : ${lib.makeBinPath path}
+      ''
+      + ''
+        ln -s ${dir}/${name} $out/bin/${name}
+      ''
+    ) bins
+  );
 
   meta = {
     description = "Index NixOS binary cache closures and query minimal fetch sets";

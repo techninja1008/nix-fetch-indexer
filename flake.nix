@@ -21,20 +21,24 @@
         pkgs:
         let
           workspace = pkgs.callPackage ./nix/package.nix { };
-          single =
+          # A single binary's output, with `nix run` / `lib.getExe` pointing
+          # at that binary.
+          bin =
             name:
-            pkgs.callPackage ./nix/single.nix {
-              inherit name;
-              nix-fetch-indexer = workspace;
+            workspace.${pkgs.lib.replaceStrings [ "-" ] [ "_" ] name}
+            // {
+              meta = workspace.meta // {
+                mainProgram = name;
+              };
             };
-          bins = {
-            nfi = single "nfi";
-            nfi-admin = single "nfi-admin";
-            nfi-indexer = single "nfi-indexer";
-            nfi-service = single "nfi-service";
-            yoink = single "yoink";
-            yoink-service = single "yoink-service";
-          };
+          bins = pkgs.lib.genAttrs [
+            "nfi"
+            "nfi-admin"
+            "nfi-indexer"
+            "nfi-service"
+            "yoink"
+            "yoink-service"
+          ] bin;
           mkImage = pkgs.callPackage ./nix/images/mk-image.nix { };
           # Each image takes its binary as an argument, so e.g.
           # `nfi-service-image.override { nfi-service = ...; }` swaps it.

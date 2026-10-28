@@ -1,5 +1,5 @@
 # Swap the binary with e.g. `nfi-service-image.override { nfi-service = ...; }`;
-# any package with `bin/nfi-service` works.
+# any package whose `meta.mainProgram` is set works.
 {
   lib,
   mkImage,
@@ -9,7 +9,7 @@
 mkImage {
   name = "nfi-service";
   config = {
-    Entrypoint = [ (lib.getExe' nfi-service "nfi-service") ];
+    Entrypoint = [ (lib.getExe nfi-service) ];
     Env = [
       "NFI_LISTEN=0.0.0.0:8080"
       # The admin listener stays inside the container by default. To reach it

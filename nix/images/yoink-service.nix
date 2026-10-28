@@ -1,6 +1,6 @@
 # Swap the binary with e.g.
-# `yoink-service-image.override { yoink-service = ...; }`; any package with
-# `bin/yoink-service` works.
+# `yoink-service-image.override { yoink-service = ...; }`; any package whose
+# `meta.mainProgram` is set works.
 {
   lib,
   mkImage,
@@ -10,7 +10,7 @@
 mkImage {
   name = "yoink-service";
   config = {
-    Entrypoint = [ (lib.getExe' yoink-service "yoink-service") ];
+    Entrypoint = [ (lib.getExe yoink-service) ];
     Env = [ "YOINK_LISTEN=0.0.0.0:8090" ];
     ExposedPorts = {
       "8090/tcp" = { };

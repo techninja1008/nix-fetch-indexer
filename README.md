@@ -44,7 +44,7 @@ The packages live in [`nix/`](nix) and are loaded with `callPackage`. Each image
 nfi.packages.x86_64-linux.nfi-service-image.override { nfi-service = my-nfi-service; }
 ```
 
-Any package with `bin/nfi-service` (or `bin/nfi-indexer`, `bin/yoink-service` for the other images) works.
+Any package whose `meta.mainProgram` is set works. Each binary is its own output of the workspace package (`out` links to all of them), so an image only contains its own binary.
 
 ## Indexing
 
