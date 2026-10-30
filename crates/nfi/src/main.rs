@@ -152,11 +152,6 @@ fn hook_cmd(args: &HookArgs, cfg: &Config) -> Option<String> {
         .or_else(|| cfg.fetch_hook.clone())
 }
 
-fn print_json<T: serde::Serialize>(v: &T) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(v)?);
-    Ok(())
-}
-
 fn human_size(n: u64) -> String {
     let units = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut v = n as f64;
@@ -175,10 +170,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         .clone()
         .or(cfg.url.clone())
         .unwrap_or_else(|| "http://localhost:8080".into());
-    let token = match &cli.token_file {
-        Some(f) => Some(nfi_auth::client::read_token_file(f)?),
-        None => std::env::var("NFI_TOKEN").ok().filter(|t| !t.is_empty()),
-    };
+    let token = nfi_auth::client::explicit(cli.token_file.as_deref(), "NFI_TOKEN")?;
     let login = auth::Login::new("nfi", "set NFI_TOKEN or --token-file", &url, token)?;
     match &cli.cmd {
         Cmd::Login { force } => {
@@ -205,12 +197,66 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         }
         _ => {}
     }
+    let input = gather(&cli.cmd, &cfg)?;
     login
-        .run(|client| exec(cli.cmd.clone(), cli.json, &cfg, client))
+        .run(|client| exec(cli.cmd.clone(), &input, cli.json, &cfg, client))
         .await
 }
 
-async fn exec(cmd: Cmd, json: bool, cfg: &Config, client: Client) -> Result<ExitCode> {
+/// A command's local input, gathered before any request so that a retry
+/// after logging in neither re-reads stdin nor re-runs nix.
+enum Input {
+    None,
+    Bulk(BulkRequest),
+    Graph(ReducedGraph),
+}
+
+fn gather(cmd: &Cmd, cfg: &Config) -> Result<Input> {
+    match cmd {
+        Cmd::Bulk {
+            items,
+            file,
+            system,
+            outputs,
+            ..
+        } => {
+            let system = system.clone().or(cfg.system.clone());
+            let mut all = Vec::new();
+            for i in items {
+                all.push(parse_item(i, system.as_deref(), outputs)?);
+            }
+            if let Some(f) = file {
+                all.extend(read_items(f, system.as_deref(), outputs)?);
+            }
+            if all.is_empty() {
+                bail!("no items given");
+            }
+            Ok(Input::Bulk(BulkRequest { items: all }))
+        }
+        Cmd::Minimise {
+            installables,
+            files,
+            nix,
+            ..
+        } => {
+            if installables.is_empty() && files.is_empty() {
+                bail!("give installables and/or --file");
+            }
+            let mut graph = ReducedGraph::default();
+            if !installables.is_empty() {
+                let nix = nix.clone().or(cfg.nix.clone()).unwrap_or_else(|| "nix".into());
+                graph.merge(derivation_graph(&nix, installables)?);
+            }
+            for f in files {
+                graph.merge(read_graph(f)?);
+            }
+            Ok(Input::Graph(graph))
+        }
+        _ => Ok(Input::None),
+    }
+}
+
+async fn exec(cmd: Cmd, input: &Input, json: bool, cfg: &Config, client: Client) -> Result<ExitCode> {
     match cmd {
         Cmd::Login { .. } | Cmd::Logout | Cmd::Whoami => unreachable!("handled in run"),
         Cmd::Search {
@@ -313,33 +359,19 @@ async fn exec(cmd: Cmd, json: bool, cfg: &Config, client: Client) -> Result<Exit
             }
             Ok(ExitCode::SUCCESS)
         }
-        Cmd::Bulk {
-            items,
-            file,
-            system,
-            outputs,
-            strict,
-            hook,
-        } => {
-            let system = system.or(cfg.system.clone());
-            let mut all = Vec::new();
-            for i in &items {
-                all.push(parse_item(i, system.as_deref(), &outputs)?);
-            }
-            if let Some(f) = &file {
-                all.extend(read_items(f, system.as_deref(), &outputs)?);
-            }
-            if all.is_empty() {
-                bail!("no items given");
-            }
-            let r = client.bulk(&BulkRequest { items: all }).await?;
-            let failed = r.items.iter().filter(|i| i.status != ItemStatus::Ok).count();
-            for i in r.items.iter().filter(|i| i.status != ItemStatus::Ok) {
+        Cmd::Bulk { strict, hook, .. } => {
+            let Input::Bulk(req) = input else {
+                unreachable!("gathered in run")
+            };
+            let hook = hook_cmd(&hook, cfg);
+            let r = client.bulk(req).await?;
+            let failed: Vec<_> = r.items.iter().filter(|i| i.status != ItemStatus::Ok).collect();
+            for i in &failed {
                 eprintln!("warning: {}@{} ({}): {:?}", i.attr, i.commit, i.system, i.status);
             }
             if json {
                 print_json(&r)?;
-            } else if hook_cmd(&hook, cfg).is_none() {
+            } else if hook.is_none() {
                 for p in &r.closure {
                     println!("{p}");
                 }
@@ -350,42 +382,33 @@ async fn exec(cmd: Cmd, json: bool, cfg: &Config, client: Client) -> Result<Exit
                 human_size(r.file_size),
                 human_size(r.nar_size)
             );
-            if let Some(h) = hook_cmd(&hook, cfg) {
+            if let Some(h) = hook {
                 let code = run_fetch_hook(&h, &r.closure)?;
                 if code != 0 {
                     return Ok(ExitCode::from(code.clamp(1, 255) as u8));
                 }
             }
-            Ok(if strict && failed > 0 {
+            Ok(if strict && !failed.is_empty() {
                 ExitCode::from(2)
             } else {
                 ExitCode::SUCCESS
             })
         }
         Cmd::Minimise {
-            installables,
-            files,
-            nix,
             roots_only,
             close_miss_threshold,
             hook,
+            ..
         } => {
-            if installables.is_empty() && files.is_empty() {
-                bail!("give installables and/or --file");
-            }
-            let mut graph = ReducedGraph::default();
-            if !installables.is_empty() {
-                let nix = nix.or(cfg.nix.clone()).unwrap_or_else(|| "nix".into());
-                graph.merge(derivation_graph(&nix, &installables)?);
-            }
-            for f in &files {
-                graph.merge(read_graph(f)?);
-            }
-            let r = client.minimise(&graph, close_miss_threshold).await?;
+            let Input::Graph(graph) = input else {
+                unreachable!("gathered in run")
+            };
+            let hook = hook_cmd(&hook, cfg);
+            let r = client.minimise(graph, close_miss_threshold).await?;
             let paths = if roots_only { &r.roots } else { &r.closure };
             if json {
                 print_json(&r)?;
-            } else if hook_cmd(&hook, cfg).is_none() {
+            } else if hook.is_none() {
                 for p in paths {
                     println!("{p}");
                 }
@@ -406,7 +429,7 @@ async fn exec(cmd: Cmd, json: bool, cfg: &Config, client: Client) -> Result<Exit
                 human_size(r.file_size),
                 human_size(r.nar_size)
             );
-            if let Some(h) = hook_cmd(&hook, cfg) {
+            if let Some(h) = hook {
                 let code = run_fetch_hook(&h, paths)?;
                 if code != 0 {
                     return Ok(ExitCode::from(code.clamp(1, 255) as u8));

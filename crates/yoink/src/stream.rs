@@ -53,7 +53,7 @@ pub fn is_fatal(e: &anyhow::Error) -> bool {
 
 fn describe(e: &anyhow::Error) -> String {
     match e.downcast_ref::<HttpError>() {
-        Some(h) if h.status == 401 => format!("{e}; run `yoink login` or set YOINK_TOKEN"),
+        Some(h) if h.status == 401 => format!("{e}; {}", crate::auth::YOINK_HINT),
         _ => format!("{e:#}"),
     }
 }

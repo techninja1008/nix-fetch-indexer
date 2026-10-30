@@ -1,8 +1,8 @@
 //! Optional configuration file (`$XDG_CONFIG_HOME/yoink/config.toml`).
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -15,27 +15,9 @@ pub struct Config {
     pub nix: Option<String>,
 }
 
-pub fn default_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("yoink").join("config.toml"))
-}
-
 /// Load `path`, or the default file if it exists.
 pub fn load(path: Option<&Path>) -> Result<Config> {
-    let (path, explicit) = match path {
-        Some(p) => (p.to_path_buf(), true),
-        None => match default_path() {
-            Some(p) => (p, false),
-            None => return Ok(Config::default()),
-        },
-    };
-    match std::fs::read_to_string(&path) {
-        Ok(s) => toml::from_str(&s).with_context(|| format!("parsing {}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !explicit => Ok(Config::default()),
-        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
-    }
+    nfi::load_toml("yoink", path)
 }
 
 #[cfg(test)]

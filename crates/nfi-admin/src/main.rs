@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use nfi::print_json;
 use nfi_api::client::Client;
 use nfi_api::{JobInfo, JobStatus, PruneRequest};
 use std::path::{Path, PathBuf};
@@ -151,13 +152,7 @@ async fn check_cmd(client: &Client, do_wait: bool, json: bool) -> Result<Outcome
             .await
             .map(Outcome::from);
     }
-    let j = client
-        .wait_job(created.id, |j| {
-            if let Some(p) = &j.progress {
-                eprintln!("job {}: {p}", j.id);
-            }
-        })
-        .await?;
+    let j = wait_job(client, created.id).await?;
     if j.status != JobStatus::Succeeded {
         print_job(&j, json)?;
         return Ok(Outcome::Failed);
@@ -165,7 +160,7 @@ async fn check_cmd(client: &Client, do_wait: bool, json: bool) -> Result<Outcome
     let report: nfi_api::CheckReport =
         serde_json::from_value(j.result.clone().unwrap_or_default()).context("decoding check result")?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        print_json(&report)?;
     } else {
         print_check(&report);
     }
@@ -178,8 +173,7 @@ async fn check_cmd(client: &Client, do_wait: bool, json: bool) -> Result<Outcome
 
 fn print_job(j: &JobInfo, json: bool) -> Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(j)?);
-        return Ok(());
+        return print_json(j);
     }
     let status = match j.status {
         JobStatus::Queued => "queued",
@@ -206,14 +200,19 @@ fn print_job(j: &JobInfo, json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn wait(client: &Client, id: i64, json: bool) -> Result<bool> {
-    let j = client
+/// Wait for a job, printing its progress.
+async fn wait_job(client: &Client, id: i64) -> Result<JobInfo> {
+    client
         .wait_job(id, |j| {
             if let Some(p) = &j.progress {
                 eprintln!("job {}: {p}", j.id);
             }
         })
-        .await?;
+        .await
+}
+
+async fn wait(client: &Client, id: i64, json: bool) -> Result<bool> {
+    let j = wait_job(client, id).await?;
     print_job(&j, json)?;
     Ok(j.status == JobStatus::Succeeded)
 }
@@ -232,10 +231,13 @@ async fn submitted(client: &Client, id: i64, do_wait: bool, json: bool) -> Resul
 }
 
 async fn run(cli: Cli) -> Result<Outcome> {
-    let token = match (&cli.token, &cli.token_file) {
-        (Some(t), _) => Some(t.clone()),
-        (None, Some(f)) => Some(nfi_auth::client::read_token_file(f)?),
-        (None, None) => None,
+    let token = match cli.token.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) => Some(t.to_string()),
+        None => cli
+            .token_file
+            .as_deref()
+            .map(nfi_auth::client::read_token_file)
+            .transpose()?,
     };
     let login = nfi::auth::Login::new(
         "nfi-admin",
@@ -260,7 +262,7 @@ async fn run(cli: Cli) -> Result<Outcome> {
         Cmd::Whoami => {
             let w = login.whoami().await?;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&w)?);
+                print_json(&w)?;
             } else {
                 println!("{}", nfi::auth::describe(&w));
             }
@@ -272,9 +274,6 @@ async fn run(cli: Cli) -> Result<Outcome> {
 }
 
 async fn exec(cmd: Cmd, json: bool, client: Client) -> Result<Outcome> {
-    if let Cmd::Check { wait } = cmd {
-        return check_cmd(&client, wait, json).await;
-    }
     let ok = match cmd {
         Cmd::Login { .. } | Cmd::Logout | Cmd::Whoami => unreachable!("handled in run"),
         Cmd::Ingest {
@@ -307,7 +306,7 @@ async fn exec(cmd: Cmd, json: bool, client: Client) -> Result<Outcome> {
         Cmd::Jobs { id: None, limit, .. } => {
             let jobs = client.jobs(limit).await?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&jobs)?);
+                print_json(&jobs)?;
             } else {
                 for j in &jobs {
                     print_job(j, false)?;
@@ -318,7 +317,7 @@ async fn exec(cmd: Cmd, json: bool, client: Client) -> Result<Outcome> {
         Cmd::Releases { channel, errors } => {
             let rels = client.admin_releases(channel.as_deref(), errors).await?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&rels)?);
+                print_json(&rels)?;
             } else {
                 print!("{}", nfi_api::releases_table(&rels));
             }
@@ -347,7 +346,7 @@ async fn exec(cmd: Cmd, json: bool, client: Client) -> Result<Outcome> {
             let created = client.reindex().await?;
             submitted(&client, created.id, wait, json).await
         }
-        Cmd::Check { .. } => unreachable!("handled above"),
+        Cmd::Check { wait } => return check_cmd(&client, wait, json).await,
     }?;
     Ok(ok.into())
 }

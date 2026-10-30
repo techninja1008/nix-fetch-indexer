@@ -1,21 +1,18 @@
 //! `yoink <TARGET>...`: resolve targets to PURLs, start the mirror request
 //! and monitor it until every PURL has a result.
 
-use crate::auth::with_login;
+use crate::auth::{NFI_HINT, YOINK_HINT, bearer, is_unauthorized, with_login};
 use crate::plain::{Plain, summary};
 use crate::state::{Conn, PlanSummary, State};
 use crate::stream::{Msg, Refresh, drive};
 use crate::targets::{Target, classify, closure_purls, dedupe};
 use crate::tui;
 use anyhow::{Context, Result, bail};
-use nfi_auth::client::{Session, interactive};
+use nfi_auth::client::Session;
 use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::time::Duration;
 use yoink_api::Outcome;
-
-const YOINK_HINT: &str = "run `yoink login` or set YOINK_TOKEN";
-const NFI_HINT: &str = "run `yoink login` (with the NFI URL configured) or set NFI_TOKEN";
 
 pub struct PullOptions {
     pub targets: Vec<String>,
@@ -31,8 +28,8 @@ pub struct PullOptions {
 
 /// Evaluate flake references and ask NFI which cached paths they need.
 async fn resolve_flakes(
-    session: &Session,
-    o: &mut PullOptions,
+    session: Option<&Session>,
+    o: &PullOptions,
     flakes: Vec<String>,
 ) -> Result<(Vec<String>, PlanSummary)> {
     let Some(nfi_url) = o.nfi_url.clone() else {
@@ -42,15 +39,15 @@ async fn resolve_flakes(
     };
     let nix = o.nix.clone();
     let graph = tokio::task::spawn_blocking(move || nfi::derivation_graph(&nix, &flakes)).await??;
-    let mut token = session.bearer(&nfi_url, o.nfi_token.clone()).await?;
+    let explicit = o.nfi_token.is_some();
+    let mut token = bearer(session, &nfi_url, o.nfi_token.clone()).await?;
     let cmt = o.close_miss_threshold;
-    let r = with_login(session, &nfi_url, &mut token, NFI_HINT, |t| {
+    let r = with_login(session, &nfi_url, &mut token, explicit, NFI_HINT, |t| {
         let (graph, url) = (&graph, &nfi_url);
         async move { nfi_api::client::Client::new(url, t)?.minimise(graph, cmt).await }
     })
     .await
     .context("minimising against NFI")?;
-    o.nfi_token = token;
     let mut warnings: Vec<String> = r.warnings.iter().map(|w| w.message.clone()).collect();
     warnings.extend(
         r.unresolved
@@ -66,13 +63,14 @@ async fn resolve_flakes(
     Ok((closure_purls(&r.closure), plan))
 }
 
-pub async fn pull(mut o: PullOptions) -> Result<ExitCode> {
+pub async fn pull(o: PullOptions) -> Result<ExitCode> {
     let targets = o
         .targets
         .iter()
         .map(|t| classify(t))
         .collect::<Result<Vec<_>>>()?;
-    let session = Session::new(nfi_auth::client::TokenStore::default_location()?)?;
+    let session = crate::auth::session()?;
+    let session = session.as_ref();
     let flakes: Vec<String> = targets
         .iter()
         .filter_map(|t| match t {
@@ -83,7 +81,7 @@ pub async fn pull(mut o: PullOptions) -> Result<ExitCode> {
     let (closure, plan) = if flakes.is_empty() {
         (vec![], None)
     } else {
-        let (c, p) = resolve_flakes(&session, &mut o, flakes).await?;
+        let (c, p) = resolve_flakes(session, &o, flakes).await?;
         (c, Some(p))
     };
     // Flake closures go where the first flake reference was given.
@@ -116,9 +114,11 @@ pub async fn pull(mut o: PullOptions) -> Result<ExitCode> {
 
     // The service always requires a token.
     let explicit = o.token.is_some();
-    let mut token = session.bearer(&o.url, o.token.clone()).await?;
-    if token.is_none() && interactive() {
-        token = session.relogin(&o.url, false).await?;
+    let mut token = bearer(session, &o.url, o.token.clone()).await?;
+    if token.is_none()
+        && let Some(s) = session
+    {
+        token = s.relogin(&o.url, false).await?;
     }
     if token.is_none() {
         bail!("{} requires authentication; {YOINK_HINT}", o.url);
@@ -126,8 +126,10 @@ pub async fn pull(mut o: PullOptions) -> Result<ExitCode> {
     let mut client = yoink_api::client::Client::new(&o.url, token.clone())?;
     let mut first = client.mirror(&purls).await;
     if let Err(e) = &first
-        && crate::auth::is_unauthorized(e)
-        && let Some(t) = session.relogin(&o.url, true).await?
+        && !explicit
+        && is_unauthorized(e)
+        && let Some(s) = session
+        && let Some(t) = s.relogin(&o.url, true).await?
     {
         client.set_token(Some(t));
         first = client.mirror(&purls).await;
@@ -136,8 +138,8 @@ pub async fn pull(mut o: PullOptions) -> Result<ExitCode> {
     let mut state = State::new(&purls);
     state.plan = plan;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let refresh = (!explicit).then(|| Refresh {
-        session: session.clone(),
+    let refresh = session.filter(|_| !explicit).map(|s| Refresh {
+        session: s.clone(),
         url: o.url.clone(),
     });
     let driver = tokio::spawn(drive(client, purls, Some(first), refresh, tx));
@@ -179,18 +181,13 @@ pub async fn pull(mut o: PullOptions) -> Result<ExitCode> {
         (state, false)
     };
     driver.abort();
+    eprintln!("{}", summary(&state));
     if quit {
-        eprintln!("{}", summary(&state));
         eprintln!("detached; the service keeps mirroring the remaining paths");
         return Ok(ExitCode::from(130));
     }
-    if use_tui {
-        eprintln!("{}", summary(&state));
-        if let Conn::Failed(e) = &state.conn {
-            eprintln!("error: {e}");
-        }
-    } else {
-        eprintln!("{}", summary(&state));
+    if use_tui && let Conn::Failed(e) = &state.conn {
+        eprintln!("error: {e}");
     }
     let failed = state.items.iter().any(|i| i.outcome != Some(Outcome::Success));
     Ok(if failed {

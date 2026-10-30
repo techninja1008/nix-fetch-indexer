@@ -1,10 +1,10 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::{ArgAction, Args, Parser, Subcommand};
 use nfi_auth::Whoami;
-use nfi_auth::client::{Session, TokenStore};
+use nfi_auth::client::{Session, TokenStore, explicit};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use yoink::auth::explicit;
+use yoink::auth::{NFI_HINT, YOINK_HINT, bearer, with_login};
 use yoink::pull::{PullOptions, pull};
 
 #[derive(Parser)]
@@ -106,8 +106,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 match s.discover(n).await {
                     Ok(Some(cfg_n)) => {
                         // The same provider and client share the login just made.
-                        let same = cfg_n == cfg_y
-                            || (cfg_n.issuer == cfg_y.issuer && cfg_n.client_id == cfg_y.client_id);
+                        let same = cfg_n.issuer == cfg_y.issuer && cfg_n.client_id == cfg_y.client_id;
                         s.login(n, !same, prompt).await?;
                         eprintln!("logged in to {n}");
                     }
@@ -122,26 +121,30 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             for u in [url.clone(), nfi_url.clone()].into_iter().flatten() {
                 if s.logout(&u).await? {
                     eprintln!("logged out of {u}");
+                } else {
+                    eprintln!("not logged in to {u}");
                 }
             }
             Ok(ExitCode::SUCCESS)
         }
         Some(Cmd::Whoami) => {
-            let s = session()?;
+            let s = yoink::auth::session()?;
             let url = need_url()?;
-            let mut targets = vec![(url, token)];
+            let mut targets = vec![(url, token, YOINK_HINT)];
             if let Some(n) = nfi_url {
-                targets.push((n, nfi_token));
+                targets.push((n, nfi_token, NFI_HINT));
             }
             let mut ok = true;
-            for (u, t) in targets {
-                let t = s.bearer(&u, t).await?;
-                match whoami(&u, t).await {
-                    Ok(w) => println!(
-                        "{u}: {}{}",
-                        w.username,
-                        w.session.map(|s| format!(" (session {s})")).unwrap_or_default()
-                    ),
+            for (u, t, hint) in targets {
+                let explicit = t.is_some();
+                let mut t = bearer(s.as_ref(), &u, t).await?;
+                let r = with_login(s.as_ref(), &u, &mut t, explicit, hint, |t| {
+                    let u = &u;
+                    async move { whoami(u, t).await }
+                })
+                .await;
+                match r {
+                    Ok(w) => println!("{u}: {}", nfi::auth::describe(&w)),
                     Err(e) => {
                         ok = false;
                         println!("{u}: {e:#}");
@@ -151,9 +154,6 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE })
         }
         None => {
-            if cli.targets.is_empty() {
-                bail!("no targets given");
-            }
             pull(PullOptions {
                 targets: cli.targets,
                 url: need_url()?,
