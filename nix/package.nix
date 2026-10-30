@@ -29,7 +29,7 @@ let
   # Output names become shell variables, so they can't contain `-`.
   outputName = lib.replaceStrings [ "-" ] [ "_" ];
 in
-rustPlatform.buildRustPackage {
+rustPlatform.buildRustPackage (finalAttrs: {
   pname = "nix-fetch-indexer";
   version = (lib.importTOML ../Cargo.toml).workspace.package.version;
   src = lib.fileset.toSource {
@@ -82,9 +82,21 @@ rustPlatform.buildRustPackage {
     ) bins
   );
 
+  # Each binary's output as a package of its own. Outputs share `meta`, so
+  # these set `mainProgram` to the binary for `nix run` and `lib.getExe`.
+  passthru.bins = lib.mapAttrs (
+    name: _:
+    finalAttrs.finalPackage.${outputName name}
+    // {
+      meta = finalAttrs.finalPackage.meta // {
+        mainProgram = name;
+      };
+    }
+  ) bins;
+
   meta = {
     description = "Index NixOS binary cache closures and query minimal fetch sets";
     license = lib.licenses.mit;
     mainProgram = "nfi";
   };
-}
+})
