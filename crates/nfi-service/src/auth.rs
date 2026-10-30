@@ -138,12 +138,12 @@ fn exempt(req: &Request) -> bool {
 }
 
 pub async fn public_auth(State(auth): State<Arc<ServiceAuth>>, req: Request, next: Next) -> Response {
-    let Some(a) = &auth.oidc else {
-        return next.run(req).await;
-    };
     if exempt(&req) {
         return next.run(req).await;
     }
+    let Some(a) = &auth.oidc else {
+        return run_as(Caller::Anonymous, req, next).await;
+    };
     let caller = if bearer(req.headers()).is_none() && auth.allow_anonymous {
         Caller::Anonymous
     } else {
@@ -160,15 +160,18 @@ pub async fn admin_auth(State(auth): State<Arc<ServiceAuth>>, req: Request, next
         return next.run(req).await;
     }
     let caller = match &auth.admin {
-        AdminAuth::Open => return next.run(req).await,
-        AdminAuth::Token(token) => {
-            if !bearer(req.headers()).is_some_and(|t| token_matches(t, token)) {
-                return auth_error(AuthError::Invalid("missing or invalid admin token".into()));
+        AdminAuth::Open => Caller::Anonymous,
+        AdminAuth::Token(token) => match bearer(req.headers()) {
+            None => return auth_error(AuthError::Missing),
+            Some(t) if !token_matches(t, token) => {
+                return auth_error(AuthError::Invalid("wrong admin token".into()));
             }
-            Caller::AdminToken
-        }
+            Some(_) => Caller::AdminToken,
+        },
         AdminAuth::Oidc(policy) => {
-            let a = auth.oidc.as_ref().expect("admin OIDC requires OIDC settings");
+            let Some(a) = &auth.oidc else {
+                return auth_error(AuthError::Internal("admin OIDC requires OIDC settings".into()));
+            };
             match oidc_caller(a, policy, &req).await {
                 Ok(p) => Caller::User(p),
                 Err(e) => return auth_error(e),
@@ -196,6 +199,6 @@ pub fn config_response(a: Option<&Authenticator>) -> Response {
 pub fn whoami_response(caller: Option<&Caller>) -> Response {
     match caller {
         Some(Caller::User(p)) => Json(p.whoami()).into_response(),
-        _ => auth_error(AuthError::Invalid("not logged in".into())),
+        _ => auth_error(AuthError::Missing),
     }
 }

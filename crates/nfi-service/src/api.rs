@@ -57,6 +57,7 @@ pub fn public_router(state: AppState) -> Router {
 
 pub fn admin_router(state: AppState) -> Router {
     Router::new()
+        .route("/healthz", get(|| async { "ok" }))
         .route("/admin/v1/ingest", post(ingest))
         .route("/admin/v1/jobs", get(list_jobs))
         .route("/admin/v1/jobs/{id}", get(get_job))
@@ -71,7 +72,6 @@ pub fn admin_router(state: AppState) -> Router {
             state.auth.clone(),
             auth::admin_auth,
         ))
-        .route("/healthz", get(|| async { "ok" }))
         .with_state(state)
 }
 

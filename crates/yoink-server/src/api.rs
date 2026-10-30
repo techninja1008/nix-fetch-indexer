@@ -80,7 +80,12 @@ async fn authenticate(AxState(s): AxState<State>, mut req: Request, next: Next) 
     let principal = match s.auth.authenticator.authenticate(token).await {
         Ok(p) => p,
         Err(e) => {
-            tracing::info!(method = %req.method(), path = req.uri().path(), error = %e, "rejected request");
+            let (method, path) = (req.method(), req.uri().path());
+            if matches!(e, AuthError::Internal(_)) {
+                tracing::error!(%method, path, error = %e, "authentication failed");
+            } else {
+                tracing::info!(%method, path, error = %e, "rejected request");
+            }
             return auth_error(e);
         }
     };
@@ -207,6 +212,8 @@ fn events(
     let span = tracing::Span::current();
     tokio::spawn(
         async move {
+            // `purl` is replaced for each PURL.
+            let mut vars = caller.vars;
             for raw in purls {
                 let purl = match Purl::parse(&raw) {
                     Ok(p) => p,
@@ -217,7 +224,6 @@ fn events(
                         continue;
                     }
                 };
-                let mut vars = caller.vars.clone();
                 let mut pj = purl.to_json();
                 pj["raw"] = raw.clone().into();
                 vars.insert("purl".into(), pj);
@@ -259,5 +265,5 @@ fn events(
     let rest = futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|e| (e, rx)) });
     futures::stream::once(async move { vec![phases] })
         .chain(rest)
-        .flat_map(|evs| futures::stream::iter(evs.iter().map(sse).map(Ok).collect::<Vec<_>>()))
+        .flat_map(|evs| futures::stream::iter(evs.into_iter().map(|e| Ok(sse(&e)))))
 }

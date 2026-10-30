@@ -7,10 +7,12 @@
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
 channels=()
 while read -r cfg; do
   channel=$(jq -r .channel <<<"$cfg")
-  n=$(NFI_WORK=$(mktemp -d) "$here/index-channel.sh" --check "$channel")
+  n=$(NFI_WORK=$(mktemp -d -p "$tmp") "$here/index-channel.sh" --check "$channel")
   echo "[$channel] $n new release(s)" >&2
   ((n > 0)) && channels+=("$channel")
 done < <("$here/channels.sh" "${1:-}")
