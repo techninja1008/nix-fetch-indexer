@@ -219,6 +219,10 @@ async fn interactive_login_and_monitor() {
     assert!(o.text.contains("alice"), "{}", o.text);
     let o = yoink_tty(&s.url, d.path(), &["logout".into()]).await;
     assert_eq!(o.code, Some(0), "{}", o.text);
+    assert!(o.text.contains("logged out of"), "{}", o.text);
+    // Logged out, `whoami` logs in again like `nfi whoami`.
     let o = yoink_tty(&s.url, d.path(), &["whoami".into()]).await;
-    assert_ne!(o.code, Some(0), "{}", o.text);
+    assert_eq!(o.code, Some(0), "{}", o.text);
+    assert!(o.text.contains("To log in, open"), "{}", o.text);
+    assert_eq!(s.idp.device_logins(), 2);
 }

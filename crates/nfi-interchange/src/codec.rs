@@ -43,17 +43,46 @@ impl Compression {
 
     /// Parse `name` or `name:level`, e.g. `zstd:19`, `xz:9`, `brotli:11`, `none`.
     pub fn parse(s: &str) -> Result<Self> {
-        let (name, level) = match s.split_once(':') {
-            Some((n, l)) => (n, Some(l.parse::<i64>().context("compression level")?)),
+        let (name, level_str) = match s.split_once(':') {
+            Some((n, l)) => (n, Some(l)),
             None => (s, None),
         };
+        /// The level, or `default` without one; it must be in `range`.
+        fn level<T>(level: Option<&str>, default: T, range: std::ops::RangeInclusive<T>) -> Result<T>
+        where
+            T: std::str::FromStr + PartialOrd + std::fmt::Display,
+            T::Err: std::error::Error + Send + Sync + 'static,
+        {
+            let Some(l) = level else { return Ok(default) };
+            let l = l.parse::<T>().context("compression level")?;
+            if !range.contains(&l) {
+                bail!(
+                    "compression level {l} out of range ({}..={})",
+                    range.start(),
+                    range.end()
+                );
+            }
+            Ok(l)
+        }
         Ok(match name {
             "none" => Compression::None,
-            "zstd" => Compression::Zstd(level.unwrap_or(9) as i32),
-            "xz" => Compression::Xz(level.unwrap_or(9) as u32),
-            "brotli" => Compression::Brotli(level.unwrap_or(11) as u32),
+            "zstd" => Compression::Zstd(level(level_str, 9, zstd::compression_level_range())?),
+            "xz" => Compression::Xz(level(level_str, 9, 0..=9)?),
+            "brotli" => Compression::Brotli(level(level_str, 11, 0..=11)?),
             _ => bail!("unknown compression {name:?} (expected none, zstd, xz, brotli)"),
         })
+    }
+}
+
+impl std::fmt::Display for Compression {
+    /// `none` or `name:level`, as [`Compression::parse`] accepts.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Compression::None => f.write_str("none"),
+            Compression::Zstd(l) => write!(f, "zstd:{l}"),
+            Compression::Xz(l) => write!(f, "xz:{l}"),
+            Compression::Brotli(l) => write!(f, "brotli:{l}"),
+        }
     }
 }
 
@@ -291,4 +320,43 @@ pub fn bench(bundle: &Bundle, compressions: &[Compression]) -> Result<Vec<BenchR
         });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compression_parse_levels() {
+        assert_eq!(Compression::parse("zstd").unwrap(), Compression::Zstd(9));
+        assert_eq!(Compression::parse("zstd:-5").unwrap(), Compression::Zstd(-5));
+        assert_eq!(Compression::parse("xz:0").unwrap(), Compression::Xz(0));
+        assert_eq!(Compression::parse("brotli").unwrap(), Compression::Brotli(11));
+        for bad in [
+            "xz:-1",
+            "xz:10",
+            "brotli:12",
+            "brotli:-1",
+            "zstd:4294967296",
+            "zstd:1000",
+            "zstd:",
+            "zstd:x",
+            "lz4",
+        ] {
+            assert!(Compression::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn compression_display_round_trips() {
+        for c in [
+            Compression::None,
+            Compression::Zstd(19),
+            Compression::Xz(6),
+            Compression::Brotli(11),
+        ] {
+            assert_eq!(Compression::parse(&c.to_string()).unwrap(), c);
+        }
+        assert_eq!(Compression::Zstd(-3).to_string(), "zstd:-3");
+    }
 }

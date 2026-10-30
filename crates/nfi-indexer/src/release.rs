@@ -68,13 +68,11 @@ impl ReleaseLocation {
 /// Sort key for release names: the revision count, e.g. 813814 in
 /// `nixos-25.05.813814.ac62194c3917` or 880000 in `nixos-26.11pre880000.abcdef`.
 pub fn revcount(name: &str) -> u64 {
-    let parts: Vec<&str> = name.split('.').collect();
-    if parts.len() < 2 {
-        return 0;
-    }
     // Stable: `nixos-25.05.813814.<hash>`; pre-releases put the count after
     // a marker: `nixos-26.11pre880000.<hash>`, `nixos-25.05beta772522.<hash>`.
-    let candidate = parts[parts.len() - 2];
+    let Some(candidate) = name.rsplit('.').nth(1) else {
+        return 0;
+    };
     let start = candidate
         .rfind(|c: char| !c.is_ascii_digit())
         .map_or(0, |i| i + 1);

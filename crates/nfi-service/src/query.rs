@@ -42,7 +42,7 @@ pub enum CommitLookup {
 /// Resolve a full commit hash or unique prefix to its release.
 pub async fn resolve_commit(pool: &PgPool, commit: &str) -> Result<CommitLookup> {
     let c = commit.trim().to_lowercase();
-    if c.is_empty() || !c.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !is_commit_prefix(&c) {
         return Ok(CommitLookup::Unknown);
     }
     let rows: Vec<ReleaseRow> = sqlx::query_as(
@@ -250,7 +250,7 @@ pub async fn minimise(
     })
 }
 
-#[derive(sqlx::FromRow)]
+#[derive(Default, sqlx::FromRow)]
 struct PackageRow {
     name: String,
     pname: Option<String>,
@@ -337,17 +337,7 @@ pub async fn lookup(
         return Ok(Err(LookupError::NotFound));
     }
     let cached = cached_paths(pool, &outs.values().cloned().collect()).await?;
-    let p = pkg.unwrap_or(PackageRow {
-        name: String::new(),
-        pname: None,
-        version: None,
-        description: None,
-        homepage: None,
-        license: vec![],
-        main_program: None,
-        broken: false,
-        unfree: false,
-    });
+    let p = pkg.unwrap_or_default();
     Ok(Ok(PackageInfo {
         attr: attr.to_string(),
         system: system.to_string(),

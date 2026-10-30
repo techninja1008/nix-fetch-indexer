@@ -52,7 +52,9 @@ impl Fetcher {
     /// of each opening its own connection.
     pub async fn warm_up(&self, url: &str) {
         let futs = self.clients.iter().map(|c| async move {
-            let _ = c.get(url).send().await.map(|r| r.bytes());
+            if let Ok(r) = c.get(url).send().await {
+                let _ = r.bytes().await;
+            }
         });
         futures::future::join_all(futs).await;
     }

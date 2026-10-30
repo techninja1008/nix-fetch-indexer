@@ -12,6 +12,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 
 /// Advisory lock key serialising all writers (ingest, prune).
 pub const WRITE_LOCK: i64 = 0x6e66_6900;
@@ -250,7 +251,7 @@ pub async fn ingest(
                 if n > 0 {
                     closures_text.push(',');
                 }
-                closures_text.push_str(&id.to_string());
+                let _ = write!(closures_text, "{id}");
             }
             closures_text.push('}');
             paths

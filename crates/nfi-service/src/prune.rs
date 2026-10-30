@@ -1,7 +1,7 @@
 //! Pruning releases and garbage-collecting orphaned rows.
 
 use crate::ingest::WRITE_LOCK;
-use anyhow::Result;
+use anyhow::{Result, bail};
 use nfi_api::PruneRequest;
 use nfi_interchange::ClosureType;
 use serde::Serialize;
@@ -36,6 +36,11 @@ pub async fn gc(tx: &mut Transaction<'_, Postgres>) -> Result<(u64, u64)> {
 }
 
 pub async fn prune(pool: &PgPool, req: &PruneRequest) -> Result<PruneReport> {
+    // Commits become `LIKE` prefix patterns: an empty one would match every
+    // release, and `%`/`_` would act as wildcards.
+    if let Some(c) = req.invalid_commit() {
+        bail!("invalid commit {c:?}: expected a non-empty hex commit prefix");
+    }
     let types = req
         .closure_types
         .iter()

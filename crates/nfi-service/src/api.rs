@@ -57,6 +57,7 @@ pub fn public_router(state: AppState) -> Router {
 
 pub fn admin_router(state: AppState) -> Router {
     Router::new()
+        .route("/healthz", get(|| async { "ok" }))
         .route("/admin/v1/ingest", post(ingest))
         .route("/admin/v1/jobs", get(list_jobs))
         .route("/admin/v1/jobs/{id}", get(get_job))
@@ -71,7 +72,6 @@ pub fn admin_router(state: AppState) -> Router {
             state.auth.clone(),
             auth::admin_auth,
         ))
-        .route("/healthz", get(|| async { "ok" }))
         .with_state(state)
 }
 
@@ -319,6 +319,12 @@ async fn prune(State(s): State<AppState>, Json(req): Json<PruneRequest>) -> Resu
         return Err(err(
             StatusCode::BAD_REQUEST,
             "specify releases, commits or channels to prune",
+        ));
+    }
+    if let Some(c) = req.invalid_commit() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!("invalid commit {c:?}: expected a non-empty hex commit prefix"),
         ));
     }
     let id = jobs::enqueue(&s.pool, "prune", serde_json::to_value(&req)?).await?;

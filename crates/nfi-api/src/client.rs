@@ -26,7 +26,8 @@ impl std::error::Error for HttpError {}
 impl HttpError {
     /// Whether `e` is (or wraps) a 401 response.
     pub fn is_unauthorized(e: &anyhow::Error) -> bool {
-        e.downcast_ref::<HttpError>().is_some_and(|h| h.status == 401)
+        e.chain()
+            .any(|c| c.downcast_ref::<HttpError>().is_some_and(|h| h.status == 401))
     }
 }
 

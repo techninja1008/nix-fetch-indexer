@@ -435,12 +435,23 @@ impl Session {
         let Some(cfg) = self.discover(url).await? else {
             bail!("{url} does not use OIDC login");
         };
-        self.store.save_service(url, &cfg)?;
-        if !force && let Some(t) = self.cached_token_for(&cfg).await? {
-            return Ok((cfg, t));
+        let t = self.login_with(url, &cfg, force, prompt).await?;
+        Ok((cfg, t))
+    }
+
+    /// [`Session::login`] with already discovered settings.
+    async fn login_with(
+        &self,
+        url: &str,
+        cfg: &AuthConfig,
+        force: bool,
+        prompt: impl FnOnce(&DevicePrompt),
+    ) -> Result<String> {
+        self.store.save_service(url, cfg)?;
+        if !force && let Some(t) = self.cached_token_for(cfg).await? {
+            return Ok(t);
         }
-        let t = self.device_login(&cfg, prompt).await?;
-        Ok((cfg, t.id_token))
+        Ok(self.device_login(cfg, prompt).await?.id_token)
     }
 
     /// The token to send to a service: `explicit` (e.g. from `--token-file`
@@ -458,10 +469,13 @@ impl Session {
     /// login for the same provider is not reused. `None` if no login is
     /// possible.
     pub async fn relogin(&self, url: &str, rejected: bool) -> Result<Option<String>> {
-        if !interactive() || self.discover(url).await?.is_none() {
+        if !interactive() {
             return Ok(None);
         }
-        let (_, t) = self.login(url, rejected, |p| eprintln!("{p}")).await?;
+        let Some(cfg) = self.discover(url).await? else {
+            return Ok(None);
+        };
+        let t = self.login_with(url, &cfg, rejected, |p| eprintln!("{p}")).await?;
         Ok(Some(t))
     }
 
@@ -489,10 +503,23 @@ pub fn read_token_file(path: &Path) -> Result<String> {
     Ok(s.to_string())
 }
 
-/// Whether a device login can be prompted for (stdin and stderr are terminals).
+/// A token given explicitly: from `file`, else the environment variable
+/// `env` (trimmed; empty means none).
+pub fn explicit(file: Option<&Path>, env: &str) -> Result<Option<String>> {
+    if let Some(f) = file {
+        return Ok(Some(read_token_file(f)?));
+    }
+    Ok(std::env::var(env)
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty()))
+}
+
+/// Whether a device login can be prompted for (stderr is a terminal; the
+/// device flow never reads stdin, so it may be a pipe).
 pub fn interactive() -> bool {
     use std::io::IsTerminal;
-    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+    std::io::stderr().is_terminal()
 }
 
 #[cfg(test)]

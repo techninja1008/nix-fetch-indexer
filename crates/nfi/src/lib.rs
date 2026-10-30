@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use nfi_api::BulkItem;
 use nfi_api::drv::ReducedGraph;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -20,26 +21,41 @@ pub struct Config {
     pub nix: Option<String>,
 }
 
-pub fn default_config_path() -> Option<PathBuf> {
+/// `$XDG_CONFIG_HOME/<app>/config.toml` (or under `~/.config`).
+pub fn config_path(app: &str) -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("nfi").join("config.toml"))
+    Some(base.join(app).join("config.toml"))
 }
 
-pub fn load_config(path: Option<&Path>) -> Result<Config> {
+pub fn default_config_path() -> Option<PathBuf> {
+    config_path("nfi")
+}
+
+/// Load the TOML config `path`, or `app`'s default file if it exists.
+pub fn load_toml<T: DeserializeOwned + Default>(app: &str, path: Option<&Path>) -> Result<T> {
     let (path, explicit) = match path {
         Some(p) => (p.to_path_buf(), true),
-        None => match default_config_path() {
+        None => match config_path(app) {
             Some(p) => (p, false),
-            None => return Ok(Config::default()),
+            None => return Ok(T::default()),
         },
     };
     match std::fs::read_to_string(&path) {
         Ok(s) => toml::from_str(&s).with_context(|| format!("parsing {}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !explicit => Ok(Config::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !explicit => Ok(T::default()),
         Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
     }
+}
+
+pub fn load_config(path: Option<&Path>) -> Result<Config> {
+    load_toml("nfi", path)
+}
+
+pub fn print_json<T: serde::Serialize>(v: &T) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(v)?);
+    Ok(())
 }
 
 /// Build the fetch hook command line: `{}` in any argument is replaced by
