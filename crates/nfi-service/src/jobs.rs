@@ -135,13 +135,13 @@ async fn store_chunk(pool: &PgPool, job: i64, seq: i32, data: &[u8]) -> Result<(
     Ok(())
 }
 
-async fn load_blob(pool: &PgPool, job: i64) -> Result<Vec<u8>> {
+async fn load_blob(pool: &PgPool, job: i64) -> Result<Bytes> {
     let chunks: Vec<Vec<u8>> =
         sqlx::query_scalar("SELECT data FROM job_blob_chunks WHERE job_id = $1 ORDER BY seq")
             .bind(job)
             .fetch_all(pool)
             .await?;
-    Ok(chunks.concat())
+    Ok(Bytes::from(chunks.concat()))
 }
 
 pub async fn get(pool: &PgPool, id: i64) -> Result<Option<JobInfo>> {
@@ -226,7 +226,7 @@ async fn run_job(state: &AppState, id: i64, kind: &str, params: &Value) -> Resul
             let data = if let Some(url) = params.get("url").and_then(Value::as_str) {
                 progress(format!("downloading {url}"));
                 let resp = state.http.get(url).send().await?.error_for_status()?;
-                resp.bytes().await?.to_vec()
+                resp.bytes().await?
             } else {
                 load_blob(pool, id).await?
             };

@@ -324,7 +324,7 @@ pub fn roots(hits: &BTreeSet<String>, edges: &[(String, String)]) -> Vec<String>
     let mut reached: HashSet<&str> = HashSet::new();
     let mut stack: Vec<&str> = hits
         .iter()
-        .flat_map(|h| adj.get(h.as_str()).cloned().unwrap_or_default())
+        .flat_map(|h| adj.get(h.as_str()).into_iter().flatten().copied())
         .collect();
     while let Some(n) = stack.pop() {
         if reached.insert(n)

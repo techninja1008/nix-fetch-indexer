@@ -107,29 +107,9 @@ fn start_postgres(dir: &Path) -> Result<String> {
     let data = dir.join("pg");
     let sock = dir.join("pgsock");
     std::fs::create_dir_all(&sock)?;
-    let root = is_root();
-    let cmd = |prog: &str| -> Command {
-        if root {
-            // Postgres refuses to run as root; use the postgres (or nobody) user.
-            let user = if Command::new("id")
-                .arg("postgres")
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-            {
-                "postgres"
-            } else {
-                "nobody"
-            };
-            let mut c = Command::new("runuser");
-            c.args(["-u", user, "--"]).arg(bindir.join(prog));
-            c
-        } else {
-            Command::new(bindir.join(prog))
-        }
-    };
-    if root {
-        let user = if Command::new("id")
+    // Postgres refuses to run as root; use the postgres (or nobody) user.
+    let run_as = is_root().then(|| {
+        if Command::new("id")
             .arg("postgres")
             .output()
             .map(|o| o.status.success())
@@ -138,7 +118,18 @@ fn start_postgres(dir: &Path) -> Result<String> {
             "postgres"
         } else {
             "nobody"
-        };
+        }
+    });
+    let cmd = |prog: &str| -> Command {
+        if let Some(user) = run_as {
+            let mut c = Command::new("runuser");
+            c.args(["-u", user, "--"]).arg(bindir.join(prog));
+            c
+        } else {
+            Command::new(bindir.join(prog))
+        }
+    };
+    if let Some(user) = run_as {
         Command::new("chown").args(["-R", user]).arg(dir).status()?;
         Command::new("chmod").arg("755").arg(dir).status()?;
     }

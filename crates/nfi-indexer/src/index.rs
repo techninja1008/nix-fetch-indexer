@@ -165,7 +165,7 @@ pub async fn index_releases_with_report(
             builder.extend_section(c, &|i| emap.get(i).copied());
         }
     }
-    let seed_sections = seed.clone();
+    let seed_sections = seed;
 
     // Deduplicated as each release is added: consecutive releases share most
     // entries, and a whole channel would otherwise hold ~100x the entries.
