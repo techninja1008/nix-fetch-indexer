@@ -321,6 +321,21 @@ impl PruneRequest {
     pub fn is_empty(&self) -> bool {
         self.releases.is_empty() && self.commits.is_empty() && self.channels.is_empty()
     }
+
+    /// The first commit that is not a valid commit prefix, if any. Commits
+    /// select releases by prefix, so an empty one would select them all.
+    pub fn invalid_commit(&self) -> Option<&str> {
+        self.commits
+            .iter()
+            .map(String::as_str)
+            .find(|c| !is_commit_prefix(c))
+    }
+}
+
+/// Whether `s` is a non-empty string of hex digits (either case), usable as
+/// a commit prefix.
+pub fn is_commit_prefix(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -422,5 +437,17 @@ mod tests {
             t.ends_with("    helpers errors: a@x86_64-linux b@aarch64-linux\n"),
             "{t}"
         );
+    }
+
+    #[test]
+    fn prune_request_rejects_non_hex_commits() {
+        let req = |c: &str| PruneRequest {
+            commits: vec!["abc123".into(), c.into()],
+            ..Default::default()
+        };
+        assert_eq!(req("DEADbeef").invalid_commit(), None);
+        for bad in ["", "%", "ab_c", "abc%", " abc", "xyz"] {
+            assert_eq!(req(bad).invalid_commit(), Some(bad));
+        }
     }
 }

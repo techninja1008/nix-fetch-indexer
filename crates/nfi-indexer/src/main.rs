@@ -215,9 +215,7 @@ fn format_label(format: Format) -> String {
     match format {
         Format::Json => "json".into(),
         Format::Binary(Compression::None) => "binary (uncompressed)".into(),
-        Format::Binary(Compression::Zstd(l)) => format!("binary (zstd:{l})"),
-        Format::Binary(Compression::Xz(l)) => format!("binary (xz:{l})"),
-        Format::Binary(Compression::Brotli(l)) => format!("binary (brotli:{l})"),
+        Format::Binary(c) => format!("binary ({c})"),
     }
 }
 
@@ -589,12 +587,7 @@ async fn main() -> Result<()> {
                 "algorithm", "bytes", "encode", "decode"
             );
             for r in codec::bench(&b, &algos)? {
-                let label = match r.compression {
-                    Compression::None => "none".to_string(),
-                    Compression::Zstd(l) => format!("zstd:{l}"),
-                    Compression::Xz(l) => format!("xz:{l}"),
-                    Compression::Brotli(l) => format!("brotli:{l}"),
-                };
+                let label = r.compression.to_string();
                 println!(
                     "{label:<12} {:>14} {:>12.2?} {:>12.2?}",
                     r.bytes, r.encode, r.decode

@@ -364,9 +364,9 @@ fn program_key(p: &Program) -> (String, String, String) {
 pub fn merge(inputs: impl IntoIterator<Item = Bundle>) -> Bundle {
     let mut out = Bundle::default();
     let mut closure: Option<ClosureBuilder> = None;
-    let mut packages: Option<(HashMap<Package, usize>, Vec<Package>)> = None;
-    let mut outpaths: Option<(HashMap<_, usize>, Vec<Outpaths>)> = None;
-    let mut programs: Option<(HashMap<_, usize>, Vec<Program>)> = None;
+    let mut packages: Option<Dedup<_, Package>> = None;
+    let mut outpaths: Option<Dedup<_, Outpaths>> = None;
+    let mut programs: Option<Dedup<_, Program>> = None;
     let mut eval_errors: Option<EvalErrorsBuilder> = None;
 
     for input in inputs {
@@ -393,52 +393,40 @@ pub fn merge(inputs: impl IntoIterator<Item = Bundle>) -> Bundle {
                 .extend_section(e, &eremap);
         }
         if let Some(s) = input.packages {
-            let (idx, v) = packages.get_or_insert_with(Default::default);
-            for e in s.entries {
-                let bits = e.releases.remap(remap);
-                let k = package_key(&e);
-                match idx.get(&k) {
-                    Some(&i) => v[i].releases.union_with(&bits),
-                    None => {
-                        idx.insert(k, v.len());
-                        v.push(Package { releases: bits, ..e });
-                    }
-                }
-            }
+            packages
+                .get_or_insert_with(Dedup::packages)
+                .extend(s.entries.into_iter().map(|e| Package {
+                    releases: e.releases.remap(remap),
+                    ..e
+                }));
         }
         if let Some(s) = input.outpaths {
-            let (idx, v) = outpaths.get_or_insert_with(Default::default);
-            for e in s.entries {
-                let bits = e.releases.remap(remap);
-                let k = outpaths_key(&e);
-                match idx.get(&k) {
-                    Some(&i) => v[i].releases.union_with(&bits),
-                    None => {
-                        idx.insert(k, v.len());
-                        v.push(Outpaths { releases: bits, ..e });
-                    }
-                }
-            }
+            outpaths
+                .get_or_insert_with(Dedup::outpaths)
+                .extend(s.entries.into_iter().map(|e| Outpaths {
+                    releases: e.releases.remap(remap),
+                    ..e
+                }));
         }
         if let Some(s) = input.programs {
-            let (idx, v) = programs.get_or_insert_with(Default::default);
-            for e in s.entries {
-                let bits = e.releases.remap(remap);
-                let k = program_key(&e);
-                match idx.get(&k) {
-                    Some(&i) => v[i].releases.union_with(&bits),
-                    None => {
-                        idx.insert(k, v.len());
-                        v.push(Program { releases: bits, ..e });
-                    }
-                }
-            }
+            programs
+                .get_or_insert_with(Dedup::programs)
+                .extend(s.entries.into_iter().map(|e| Program {
+                    releases: e.releases.remap(remap),
+                    ..e
+                }));
         }
     }
     out.closure = closure.map(ClosureBuilder::finish);
-    out.packages = packages.map(|(_, entries)| PackagesSection { entries });
-    out.outpaths = outpaths.map(|(_, entries)| OutpathsSection { entries });
-    out.programs = programs.map(|(_, entries)| ProgramsSection { entries });
+    out.packages = packages.map(|d| PackagesSection {
+        entries: d.into_entries(),
+    });
+    out.outpaths = outpaths.map(|d| OutpathsSection {
+        entries: d.into_entries(),
+    });
+    out.programs = programs.map(|d| ProgramsSection {
+        entries: d.into_entries(),
+    });
     out.eval_errors = eval_errors.map(EvalErrorsBuilder::finish);
     sort_evals(&mut out);
     normalize(&mut out);

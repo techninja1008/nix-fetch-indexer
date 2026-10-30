@@ -90,13 +90,7 @@ impl Meili {
     }
 
     async fn ensure_index_named(&self, uid: &str) -> Result<()> {
-        let exists = self
-            .req(reqwest::Method::GET, &format!("/indexes/{uid}"))
-            .send()
-            .await?
-            .status()
-            .is_success();
-        if !exists {
+        if !self.index_exists(uid).await? {
             let t = self
                 .send(
                     self.req(reqwest::Method::POST, "/indexes")
@@ -169,7 +163,7 @@ impl Meili {
                         .json(&json!({"filter": filter, "fields": ["id"], "limit": 1000, "offset": offset})),
                     )
                     .await?;
-                let results = r["results"].as_array().cloned().unwrap_or_default();
+                let results = r["results"].as_array().map_or(&[][..], Vec::as_slice);
                 ids.extend(
                     results
                         .iter()
