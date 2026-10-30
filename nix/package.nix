@@ -82,17 +82,22 @@ rustPlatform.buildRustPackage (finalAttrs: {
     ) bins
   );
 
-  # Each binary's output as a package of its own. Outputs share `meta`, so
-  # these set `mainProgram` to the binary for `nix run` and `lib.getExe`.
-  passthru.bins = lib.mapAttrs (
-    name: _:
-    finalAttrs.finalPackage.${outputName name}
-    // {
-      meta = finalAttrs.finalPackage.meta // {
-        mainProgram = name;
-      };
-    }
-  ) bins;
+  # Outputs share `meta`, so replace each binary's output with one whose
+  # `mainProgram` is that binary (for `nix run` and `lib.getExe`). `all` holds
+  # the outputs as built, before passthru is applied.
+  passthru = lib.listToAttrs (
+    map (
+      name:
+      lib.nameValuePair (outputName name) (
+        lib.findFirst (o: o.outputName == outputName name) null finalAttrs.finalPackage.all
+        // {
+          meta = finalAttrs.finalPackage.meta // {
+            mainProgram = name;
+          };
+        }
+      )
+    ) (lib.attrNames bins)
+  );
 
   meta = {
     description = "Index NixOS binary cache closures and query minimal fetch sets";

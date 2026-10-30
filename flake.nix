@@ -21,7 +21,13 @@
         pkgs:
         let
           workspace = pkgs.callPackage ./nix/package.nix { };
-          bins = workspace.bins;
+          bins = {
+            inherit (workspace) nfi yoink;
+            nfi-admin = workspace.nfi_admin;
+            nfi-indexer = workspace.nfi_indexer;
+            nfi-service = workspace.nfi_service;
+            yoink-service = workspace.yoink_service;
+          };
           mkImage = pkgs.callPackage ./nix/images/mk-image.nix { };
           # Each image takes its binary as an argument, so e.g.
           # `nfi-service-image.override { nfi-service = ...; }` swaps it.
