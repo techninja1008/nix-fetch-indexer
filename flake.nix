@@ -20,153 +20,34 @@
       packages = forAll (
         pkgs:
         let
-          inherit (pkgs) lib;
-          workspace = pkgs.rustPlatform.buildRustPackage {
-            pname = "nix-fetch-indexer";
-            version = (lib.importTOML ./Cargo.toml).workspace.package.version;
-            src = lib.fileset.toSource {
-              root = ./.;
-              fileset = lib.fileset.unions [
-                ./Cargo.toml
-                ./Cargo.lock
-                ./LICENSE
-                ./crates
-              ];
-            };
-            cargoLock.lockFile = ./Cargo.lock;
-            nativeBuildInputs = [ pkgs.makeWrapper ];
-
-            # The integration tests start ephemeral Postgres and Meilisearch
-            # instances; require them so the tests cannot silently skip.
-            nativeCheckInputs = [
-              pkgs.postgresql
-              pkgs.meilisearch
-              # reqwest's platform verifier refuses to build a client without
-              # CA certificates, even for plain-HTTP test servers; cacert's
-              # setup hook sets SSL_CERT_FILE inside the sandbox.
-              pkgs.cacert
-            ];
-            env.NFI_TEST_REQUIRE_SERVICES = "1";
-            # Tests bind localhost ports.
-            __darwinAllowLocalNetworking = true;
-
-            postInstall = ''
-              wrapProgram $out/bin/nfi-indexer --suffix PATH : ${lib.makeBinPath [ pkgs.nix-eval-jobs ]}
-              wrapProgram $out/bin/nfi --suffix PATH : ${lib.makeBinPath [ pkgs.nix ]}
-              wrapProgram $out/bin/yoink --suffix PATH : ${lib.makeBinPath [ pkgs.nix ]}
-              # For --embedded-postgres / --embedded-meilisearch (single-node mode).
-              wrapProgram $out/bin/nfi-service --suffix PATH : ${
-                lib.makeBinPath [
-                  pkgs.postgresql
-                  pkgs.meilisearch
-                ]
-              }
-              rm -f $out/bin/nfi-testenv
-            '';
-
-            meta = {
-              description = "Index NixOS binary cache closures and query minimal fetch sets";
-              license = lib.licenses.mit;
-              mainProgram = "nfi";
-            };
+          workspace = pkgs.callPackage ./nix/package.nix { };
+          bins = {
+            inherit (workspace) nfi yoink;
+            nfi-admin = workspace.nfi_admin;
+            nfi-indexer = workspace.nfi_indexer;
+            nfi-service = workspace.nfi_service;
+            yoink-service = workspace.yoink_service;
           };
-          single =
-            name:
-            pkgs.runCommand name { meta.mainProgram = name; } ''
-              mkdir -p $out/bin
-              ln -s ${workspace}/bin/${name} $out/bin/${name}
-              if [ -e ${workspace}/bin/.${name}-wrapped ]; then
-                ln -s ${workspace}/bin/.${name}-wrapped $out/bin/.${name}-wrapped
-              fi
-            '';
-          # Shared base for the OCI images: passwd/group entries, CA
-          # certificates, a shell (initdb needs /bin/sh) and enough tools to
-          # `docker exec -it <container> bash` for debugging.
+          mkImage = pkgs.callPackage ./nix/images/mk-image.nix { };
+          # Each image takes its binary as an argument, so e.g.
+          # `nfi-service-image.override { nfi-service = ...; }` swaps it.
           image =
-            {
-              name,
-              config,
-            }:
-            pkgs.dockerTools.buildLayeredImage {
-              inherit name;
-              tag = "latest";
-              contents = [
-                # root and nobody, plus `user` (UID/GID 1000), which the
-                # images run as by default.
-                (pkgs.dockerTools.fakeNss.override {
-                  extraPasswdLines = [ "user:x:1000:1000:user:/var/empty:/bin/sh" ];
-                  extraGroupLines = [ "user:x:1000:" ];
-                })
-                pkgs.cacert
-                pkgs.bashInteractive
-                pkgs.coreutils-full
-                pkgs.htop
-              ];
-              extraCommands = ''
-                mkdir -p -m 1777 tmp var/tmp
-                mkdir -p -m 0755 run
-              '';
-              # Run as `user` unless an image says otherwise; override with
-              # e.g. `docker run --user` to match the owner of a bind mount.
-              config = {
-                User = "1000:1000";
-              }
-              // config
-              // {
-                Env = [
-                  "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-                  "TMPDIR=/tmp"
-                ]
-                ++ config.Env or [ ];
-              };
+            name:
+            pkgs.callPackage ./nix/images/${name}.nix {
+              inherit mkImage;
+              ${name} = bins.${name};
             };
         in
         {
           default = workspace;
           nix-fetch-indexer = workspace;
-          nfi = single "nfi";
-          nfi-admin = single "nfi-admin";
-          nfi-indexer = single "nfi-indexer";
-          nfi-service = single "nfi-service";
-          yoink = single "yoink";
-          yoink-service = single "yoink-service";
         }
+        // bins
         // linuxOnly pkgs {
           # OCI images (load with `docker load < result`).
-          nfi-service-image = image {
-            name = "nfi-service";
-            config = {
-              Entrypoint = [ "${workspace}/bin/nfi-service" ];
-              Env = [
-                "NFI_LISTEN=0.0.0.0:8080"
-                # The admin listener stays inside the container by default.
-                # To reach it from outside, override NFI_ADMIN_LISTEN, set
-                # NFI_ADMIN_TOKEN_FILE (or NFI_ADMIN_OIDC) and publish the
-                # port on a private address.
-                "NFI_ADMIN_LISTEN=127.0.0.1:8081"
-              ];
-              ExposedPorts = {
-                "8080/tcp" = { };
-              };
-            };
-          };
-          yoink-service-image = image {
-            name = "yoink-service";
-            config = {
-              Entrypoint = [ "${workspace}/bin/yoink-service" ];
-              Env = [ "YOINK_LISTEN=0.0.0.0:8090" ];
-              ExposedPorts = {
-                "8090/tcp" = { };
-              };
-            };
-          };
-          nfi-indexer-image = image {
-            name = "nfi-indexer";
-            config = {
-              Entrypoint = [ "${workspace}/bin/nfi-indexer" ];
-              WorkingDir = "/tmp";
-            };
-          };
+          nfi-service-image = image "nfi-service";
+          yoink-service-image = image "yoink-service";
+          nfi-indexer-image = image "nfi-indexer";
         }
       );
 
