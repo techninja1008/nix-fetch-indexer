@@ -73,20 +73,22 @@ impl Job {
         F: FnOnce(JobReporter) -> Fut,
         Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
     {
-        Self::start_then(phase, work, || {})
+        Self::start_then(phase, work, |_| {})
     }
 
-    fn start_then<F, Fut>(phase: &str, work: F, done: impl FnOnce() + Send + 'static) -> Job
+    /// As [`Job::start`], then run `done` (not if `work` panics).
+    fn start_then<F, Fut>(phase: &str, work: F, done: impl FnOnce(&Job) + Send + 'static) -> Job
     where
         F: FnOnce(JobReporter) -> Fut,
         Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
     {
         let (job, reporter) = Job::new(phase);
         let fut = work(reporter.clone_inner());
+        let j = job.clone();
         tokio::spawn(async move {
             let r = fut.await;
             reporter.finish(r);
-            done();
+            done(&j);
         });
         job
     }
@@ -317,31 +319,29 @@ impl<K: Eq + Hash + Clone + Send + 'static> JobTable<K> {
         Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
     {
         let mut jobs = self.jobs.lock().unwrap();
-        if let Some(j) = jobs.get(&key) {
+        // A finished job may linger: briefly before its task removes it, or
+        // for good if its work panicked (the task is then gone).
+        if let Some(j) = jobs.get(&key)
+            && j.outcome().is_none()
+        {
             return j.clone();
         }
         // The task must not remove the entry before it is inserted; it can't,
-        // as removal takes the lock we hold. It may remove a newer job only
-        // if it is the same one.
+        // as removal takes the lock we hold. It removes the entry only if it
+        // is still its own job, not a newer one.
         let table = self.jobs.clone();
         let k = key.clone();
-        let slot: Arc<Mutex<Option<Job>>> = Default::default();
-        let s = slot.clone();
-        let job = Job::start_then(phase, work, move || {
-            let mine = s.lock().unwrap().take();
+        let job = Job::start_then(phase, work, move |mine| {
             let mut t = table.lock().unwrap();
-            if let (Some(m), Some(j)) = (mine, t.get(&k))
-                && m.same(j)
-            {
+            if t.get(&k).is_some_and(|j| j.same(mine)) {
                 t.remove(&k);
             }
         });
-        *slot.lock().unwrap() = Some(job.clone());
         jobs.insert(key, job.clone());
         job
     }
 
-    /// Number of running jobs.
+    /// Number of jobs in the table (running, or finished but not yet removed).
     pub fn len(&self) -> usize {
         self.jobs.lock().unwrap().len()
     }
@@ -451,5 +451,20 @@ mod tests {
         assert!(t.is_empty());
         let c = t.get_or_start("k", "q", |_r| async { Ok(()) });
         assert!(!c.same(&a));
+    }
+
+    #[tokio::test]
+    async fn table_replaces_panicked() {
+        let t = JobTable::default();
+        let a = t.get_or_start("k", "q", |_r| async { panic!("oops") });
+        let mut s = a.subscribe();
+        while s.next().await.is_some() {}
+        assert_eq!(a.outcome(), Some(Outcome::Fatal));
+        // The task died before removing the entry; it must not be reused.
+        let b = t.get_or_start("k", "q", |_r| async { Ok(()) });
+        assert!(!b.same(&a));
+        let mut s = b.subscribe();
+        while s.next().await.is_some() {}
+        assert_eq!(b.outcome(), Some(Outcome::Success));
     }
 }

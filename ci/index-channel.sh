@@ -72,8 +72,10 @@ group() {
 endgroup() {
   if [[ $in_group == true ]]; then echo "::endgroup::" >&2; in_group=false; fi
 }
-# Close any open group on exit (including on failure).
-trap endgroup EXIT
+# A work directory we created, removed on exit.
+tmp_work=""
+# Close any open group and clean up on exit (including on failure).
+trap 'endgroup; [[ -z $tmp_work ]] || rm -rf "$tmp_work"' EXIT
 
 # Closure type targets, and the evaluators that record eval errors.
 closure_targets=" store-paths helpers:direct helpers:full "
@@ -139,7 +141,12 @@ per_release=$(jq -r .per_release <<<"$cfg")
 cumulative=$(jq -r .cumulative <<<"$cfg")
 start=$(jq -r .start <<<"$cfg")
 
-work=${NFI_WORK:-$(mktemp -d)}
+if [[ -n ${NFI_WORK:-} ]]; then
+  work=$NFI_WORK
+else
+  work=$(mktemp -d)
+  tmp_work=$work
+fi
 mkdir -p "$work"
 
 # ---------- storage backends ----------
@@ -334,7 +341,7 @@ if [[ $per_release == true ]]; then
     fi
     for ds in "${outputs[@]}"; do new_parts[$ds]+=" $work/$name-$ds.nfib"; done
     # The next release is seeded from this one (all of its closures).
-    [[ -n $seed && $seed == "$work/"*"-full.nfib" ]] && rm -f "$seed"
+    [[ -n $seed && $seed == "$work/"*"-full.nfib" ]] && { rm -f "$seed"; seed=""; }
     if [[ -f $work/$name.nfib ]]; then
       mv "$work/$name.nfib" "$work/$name-full.nfib"
       seed=$work/$name-full.nfib
