@@ -308,11 +308,18 @@ impl Authenticator {
         if let Some(r) = find(&k) {
             return r;
         }
-        if k.set.is_none() || k.fetched.is_none_or(|t| t.elapsed() >= JWKS_MIN_REFRESH) {
+        // Rate-limit fetches even while no key set has been fetched, so an
+        // unreachable provider is not queried once per request.
+        if k.fetched.is_none_or(|t| t.elapsed() >= JWKS_MIN_REFRESH) {
             self.refresh(&mut k).await?;
             if let Some(r) = find(&k) {
                 return r;
             }
+        }
+        if k.set.is_none() {
+            return Err(AuthError::Unavailable(
+                "the OpenID provider's signing keys have not been fetched yet".into(),
+            ));
         }
         Err(AuthError::Invalid(format!(
             "unknown signing key {}",
