@@ -2,8 +2,8 @@
 # workspace) is its own derivation, so a change only rebuilds the crates it
 # touches and the crates that depend on them.
 #
-# Cargo.nix is generated from Cargo.lock and not checked in; create or update
-# it with `nix run .#generate-cargo-nix`.
+# Cargo.nix is generated from Cargo.lock by `nix run .#generate-cargo-nix`
+# (which the pre-commit hook runs when a Cargo.toml or Cargo.lock changes).
 {
   lib,
   pkgs,
@@ -22,11 +22,7 @@
 }:
 
 let
-  cargoNix =
-    if builtins.pathExists ./Cargo.nix then
-      import ./Cargo.nix { inherit pkgs; }
-    else
-      throw "nix/Cargo.nix is missing: generate it with `nix run .#generate-cargo-nix`";
+  cargoNix = import ./Cargo.nix { inherit pkgs; };
   # crate2nix resolves features separately for each workspace member, so
   # building each binary on its own would build a shared library once per
   # feature set it ends up with. Like cargo, unify features across the

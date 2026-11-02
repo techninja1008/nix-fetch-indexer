@@ -3,9 +3,18 @@
 
   # Channel tarball (as used by the default `nixpkgs` registry entry).
   inputs.nixpkgs.url = "https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz";
+  inputs.git-hooks = {
+    url = "github:cachix/git-hooks.nix";
+    inputs.nixpkgs.follows = "nixpkgs";
+    inputs.flake-compat.follows = "";
+  };
 
   outputs =
-    { self, nixpkgs }:
+    {
+      self,
+      nixpkgs,
+      git-hooks,
+    }:
     let
       systems = [
         "x86_64-linux"
@@ -15,6 +24,36 @@
       ];
       forAll = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
       linuxOnly = pkgs: pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux;
+      # Git hooks, installed by `nix develop` and run on every file in CI
+      # (.github/workflows/checks.yml). git-hooks.nix doesn't support
+      # x86_64-darwin, so there is no dev shell hook there.
+      preCommit =
+        pkgs:
+        let
+          inherit (pkgs.stdenv.hostPlatform) system;
+        in
+        git-hooks.lib.${system}.run {
+          src = ./.;
+          hooks = {
+            # Needs network access (cargo fetches crate manifests), so this
+            # isn't a flake check.
+            cargo-nix = {
+              enable = true;
+              name = "nix/Cargo.nix is up to date";
+              entry = pkgs.lib.getExe self.packages.${system}.generate-cargo-nix;
+              files = "(^|/)Cargo\\.(toml|lock)$";
+              pass_filenames = false;
+            };
+            nixfmt = {
+              enable = true;
+              excludes = [ "^nix/Cargo\\.nix$" ];
+            };
+            rustfmt = {
+              enable = true;
+              packageOverrides = { inherit (pkgs) cargo rustfmt; };
+            };
+          };
+        };
     in
     {
       packages = forAll (
@@ -67,20 +106,30 @@
         // pkgs.lib.mapAttrs' (name: pkgs.lib.nameValuePair "test-${name}") workspace.tests
       );
 
-      devShells = forAll (pkgs: {
-        default = pkgs.mkShell {
-          packages = [
-            pkgs.cargo
-            pkgs.rustc
-            pkgs.clippy
-            pkgs.rustfmt
-            pkgs.rust-analyzer
-            pkgs.postgresql
-            pkgs.meilisearch
-            pkgs.nix-eval-jobs
-          ];
-        };
-      });
+      devShells = forAll (
+        pkgs:
+        let
+          hooks = pkgs.lib.optionalAttrs (git-hooks.lib ? ${pkgs.stdenv.hostPlatform.system}) (
+            preCommit pkgs
+          );
+        in
+        {
+          default = pkgs.mkShell {
+            packages = [
+              pkgs.cargo
+              pkgs.rustc
+              pkgs.clippy
+              pkgs.rustfmt
+              pkgs.rust-analyzer
+              pkgs.postgresql
+              pkgs.meilisearch
+              pkgs.nix-eval-jobs
+            ]
+            ++ hooks.enabledPackages or [ ];
+            shellHook = hooks.shellHook or "";
+          };
+        }
+      );
 
       formatter = forAll (pkgs: pkgs.nixfmt-rfc-style);
     };

@@ -78,7 +78,9 @@ let
     fetchgit-submodules = fetchWith pkgs.fetchgit { fetchSubmodules = true; } (gitArgs pkgs.fetchgit);
     fetchgit-leave-dot-git = fetchWith pkgs.fetchgit { leaveDotGit = true; } (gitArgs pkgs.fetchgit);
     fetchgit-lfs = fetchWith pkgs.fetchgit { fetchLFS = true; } (gitArgs pkgs.fetchgit);
-    fetchgit-sparse = fetchWith pkgs.fetchgit { sparseCheckout = [ "nfi-probe" ]; } (gitArgs pkgs.fetchgit);
+    fetchgit-sparse = fetchWith pkgs.fetchgit { sparseCheckout = [ "nfi-probe" ]; } (
+      gitArgs pkgs.fetchgit
+    );
     fetchFromGitHub = fetch pkgs.fetchFromGitHub (githubArgs pkgs.fetchFromGitHub);
     fetchFromGitHub-submodules = fetchWith pkgs.fetchFromGitHub { fetchSubmodules = true; } (
       githubArgs pkgs.fetchFromGitHub

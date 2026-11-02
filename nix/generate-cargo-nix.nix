@@ -1,6 +1,6 @@
-# `nix run .#generate-cargo-nix`: (re)generates nix/Cargo.nix, which
-# package.nix imports, from Cargo.lock. Run it after cloning and after
-# changing dependencies or workspace members.
+# `nix run .#generate-cargo-nix`: regenerates nix/Cargo.nix, which package.nix
+# imports, from Cargo.lock. The pre-commit hook runs it whenever a Cargo.toml or
+# Cargo.lock changes, and CI checks that the committed file is up to date.
 {
   writeShellApplication,
   cargo,
@@ -20,9 +20,5 @@ writeShellApplication {
   text = ''
     cd "$(git rev-parse --show-toplevel)"
     crate2nix generate -f Cargo.toml -o nix/Cargo.nix
-    # The file is gitignored, and flakes only see files git knows about:
-    # record it as intent-to-add so `nix build .` can import it without its
-    # contents being staged.
-    git add --intent-to-add --force nix/Cargo.nix
   '';
 }

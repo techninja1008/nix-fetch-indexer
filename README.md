@@ -31,22 +31,21 @@ Supporting libraries:
 ## Building
 
 ```sh
-nix run .#generate-cargo-nix   # once after cloning, see below
 nix build            # all binaries
 nix flake check      # also runs the full test suite, including integration tests
 nix build .#nfi      # a single binary
 nix build .#nfi-service-image && docker load < result   # OCI image (also .#nfi-indexer-image, .#yoink-service-image)
-nix develop          # cargo, clippy, postgresql, meilisearch, nix-eval-jobs
+nix develop          # cargo, clippy, postgresql, meilisearch, nix-eval-jobs; installs the git hooks
 cargo build --release
 ```
 
-The packages live in [`nix/`](nix) and are loaded with `callPackage`. The workspace is built with [crate2nix](https://github.com/nix-community/crate2nix): every crate, third-party or from the workspace, is its own derivation, so a change only rebuilds the crates it touches and the crates that depend on them. Each workspace crate's tests are a separate check (e.g. `.#checks.x86_64-linux.test-nfi-service`) that runs them with [cargo-nextest](https://nexte.st), so binaries and images don't wait for them. The crate graph, `nix/Cargo.nix`, is generated from `Cargo.lock` and is not checked in. Generate it after cloning, and again after changing dependencies or workspace members:
+The packages live in [`nix/`](nix) and are loaded with `callPackage`. The workspace is built with [crate2nix](https://github.com/nix-community/crate2nix): every crate, third-party or from the workspace, is its own derivation, so a change only rebuilds the crates it touches and the crates that depend on them. Each workspace crate's tests are a separate check (e.g. `.#checks.x86_64-linux.test-nfi-service`) that runs them with [cargo-nextest](https://nexte.st), so binaries and images don't wait for them. The crate graph, [`nix/Cargo.nix`](nix/Cargo.nix), is generated from `Cargo.lock`. Regenerate it after changing dependencies or workspace members:
 
 ```sh
 nix run .#generate-cargo-nix
 ```
 
-Flakes only see files that git knows about, so the generator records the (gitignored) file as intent-to-add: it shows as `A` in `git status` but its contents are not staged. Don't commit it, e.g. with `git commit -a`. Because the file is not in the repository, the flake can't be built straight from GitHub (`nix build github:...`); build from a checkout.
+`nix develop` installs git hooks ([git-hooks.nix](https://github.com/cachix/git-hooks.nix)) that do this whenever a `Cargo.toml` or `Cargo.lock` changes, and check Nix (nixfmt) and Rust (rustfmt) formatting. CI runs the same hooks on every file, so a stale `nix/Cargo.nix` or unformatted code fails the build.
 
 Each image takes its binary as an argument, so another build can be swapped in with `.override`:
 
