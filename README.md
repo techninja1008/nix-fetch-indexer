@@ -305,6 +305,7 @@ Both listeners are open by default. Optionally, callers log in with OIDC (the de
 | `--oidc-scopes` | `NFI_OIDC_SCOPES` | Scopes CLIs request (default `openid,profile,offline_access`) |
 | `--oidc-username-cel-file` | `NFI_OIDC_USERNAME_CEL_FILE` | Username, over `claims` (default `preferred_username`, else `sub`) |
 | `--oidc-session-cel-file` | `NFI_OIDC_SESSION_CEL_FILE` | Optional credential or session id to log, over `claims` (e.g. `claims.sid`) |
+| `--oidc-whoami-cel-file` | `NFI_OIDC_WHOAMI_CEL_FILE` | The map `whoami` reports as `additional_info`, over `claims` and `user` (default `claims`) |
 | `--main-authz-cel-file` | `NFI_MAIN_AUTHZ_CEL_FILE` | Policy for the public API (default `true`) |
 | `--allow-anonymous` | `NFI_ALLOW_ANONYMOUS` | Let requests without a token use the public API |
 | `--admin-token-file` | `NFI_ADMIN_TOKEN_FILE` | Protect the admin listener with a static bearer token |
@@ -316,6 +317,8 @@ Both listeners are open by default. Optionally, callers log in with OIDC (the de
 - Public API with OIDC: a request with a token must carry a valid ID token (401 otherwise) that passes the main policy (403 otherwise). A request without one gets 401, unless `--allow-anonymous`, in which case the policy is skipped.
 - Admin API: open, a static token, or OIDC with the admin policy. The static token and `--admin-oidc` are mutually exclusive.
 - `/healthz` and `/auth/v1/config` never need a token.
+- Startup: the provider's keys are fetched at once. If it is unreachable the service starts anyway (requests get 503 until its keys can be fetched); if its discovery document names another issuer, the service exits.
+- Logs: every accepted request is logged with its method, path, user and session (`-` if none) and its status; a rejected one as `request rejected` with the status and reason.
 
 **Policies** are CEL expressions that must evaluate to `true`. Variables:
 
@@ -331,8 +334,8 @@ Both listeners are open by default. Optionally, callers log in with OIDC (the de
 
 | method | path | description |
 |---|---|---|
-| GET | `/auth/v1/config` | `{"issuer", "client_id", "scopes"}` for CLIs to log in with; 404 when the listener doesn't use OIDC |
-| GET | `/auth/v1/whoami` | `{"username", "session"}` of the caller; 401 when not logged in |
+| GET | `/auth/v1/config` | `{"issuer", "client_id", "scopes", "anonymous"}` for CLIs to log in with (`anonymous`: requests without a token are served too); 404 when the listener doesn't use OIDC |
+| GET | `/auth/v1/whoami` | `{"username", "session", "additional_info"}` of the caller (`additional_info`: the whoami expression's map, by default the token's claims); 401 when not logged in, 404 when the listener doesn't use OIDC |
 
 ### Public API
 
@@ -491,6 +494,7 @@ The service always requires an OIDC ID token. Options before the backend subcomm
 | `--listen` | listen address (default `0.0.0.0:8090`) |
 | `--oidc-issuer`, `--oidc-client-id`, `--oidc-audience`, `--oidc-scopes` | as for `nfi-service` (see [Authentication](#authentication)) |
 | `--oidc-username-cel-file`, `--oidc-session-cel-file` | CEL giving the username (default `preferred_username`, else `sub`) and an optional session id for logs |
+| `--oidc-whoami-cel-file` | CEL map reported by whoami as `additional_info`; variables `claims`, `user` (default `claims`) |
 | `--authz-cel-file` | CEL policy per request; variables `claims`, `user`, `request` (default `true`) |
 | `--purl-authz-cel-file` | CEL policy per requested PURL; also `purl` (`{type, namespace, name, version, qualifiers, subpath, raw}`), e.g. `purl.type == 'nix'` (default `true`) |
 | `--max-purls` | most PURLs per request (default 100000) |

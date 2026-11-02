@@ -54,15 +54,7 @@ async fn validates_tokens() {
 
 #[tokio::test]
 async fn unreachable_provider() {
-    let a = Authenticator::new(OidcSettings {
-        issuer: "http://127.0.0.1:1".into(),
-        client_id: "c".into(),
-        audience: None,
-        scopes: vec![],
-        username: None,
-        session: None,
-    })
-    .unwrap();
+    let a = Authenticator::new(OidcSettings::new("http://127.0.0.1:1", "c")).unwrap();
     let idp = MockIdp::start("c").await;
     let r = a.authenticate(&idp.token(json!({"sub": "1"}))).await;
     assert!(matches!(r, Err(AuthError::Unavailable(_))), "{r:?}");

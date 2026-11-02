@@ -83,6 +83,10 @@ struct OidcArgs {
     /// session id to log (string or null).
     #[arg(long, env = "NFI_OIDC_SESSION_CEL_FILE", requires = "oidc_issuer")]
     oidc_session_cel_file: Option<PathBuf>,
+    /// File with a CEL expression over `claims` and `user` giving the map
+    /// whoami reports as `additional_info` [default: claims].
+    #[arg(long, env = "NFI_OIDC_WHOAMI_CEL_FILE", requires = "oidc_issuer")]
+    oidc_whoami_cel_file: Option<PathBuf>,
     /// File with a CEL policy (over `claims`, `user`, `request`) that
     /// authenticated public API requests must pass [default: true].
     #[arg(long, env = "NFI_MAIN_AUTHZ_CEL_FILE", requires = "oidc_issuer")]
@@ -103,28 +107,8 @@ struct OidcArgs {
     admin_authz_cel_file: Option<PathBuf>,
 }
 
-fn service_auth(admin_token_file: Option<&Path>, o: &OidcArgs) -> Result<ServiceAuth> {
+async fn service_auth(admin_token_file: Option<&Path>, o: &OidcArgs) -> Result<ServiceAuth> {
     use nfi_auth_server::{Authenticator, Expr, OidcSettings, read_trimmed};
-    let oidc = match (&o.oidc_issuer, &o.oidc_client_id) {
-        (Some(issuer), Some(client_id)) => Some(Authenticator::new(OidcSettings {
-            issuer: issuer.clone(),
-            client_id: client_id.clone(),
-            audience: o.oidc_audience.clone(),
-            scopes: o.oidc_scopes.clone(),
-            username: o
-                .oidc_username_cel_file
-                .as_deref()
-                .map(Expr::from_file)
-                .transpose()?,
-            session: o
-                .oidc_session_cel_file
-                .as_deref()
-                .map(Expr::from_file)
-                .transpose()?,
-        })?),
-        (None, None) => None,
-        _ => bail!("--oidc-issuer and --oidc-client-id must be given together"),
-    };
     let admin = match (admin_token_file, o.admin_oidc) {
         (Some(_), true) => bail!("--admin-token-file and --admin-oidc are mutually exclusive"),
         (Some(f), false) => AdminAuth::Token(read_trimmed(f)?),
@@ -135,15 +119,29 @@ fn service_auth(admin_token_file: Option<&Path>, o: &OidcArgs) -> Result<Service
         )?),
         (None, false) => AdminAuth::Open,
     };
-    Ok(ServiceAuth {
-        oidc,
-        allow_anonymous: o.allow_anonymous,
-        main_authz: match &o.main_authz_cel_file {
-            Some(f) => Expr::from_file(f)?,
-            None => Expr::new("true")?,
-        },
-        admin,
-    })
+    let (issuer, client_id) = match (&o.oidc_issuer, &o.oidc_client_id) {
+        (Some(i), Some(c)) => (i, c),
+        (None, None) => {
+            return match admin {
+                AdminAuth::Open => Ok(ServiceAuth::open()),
+                AdminAuth::Token(t) => Ok(ServiceAuth::admin_token(&t)),
+                AdminAuth::Oidc(_) => bail!("--admin-oidc requires --oidc-issuer and --oidc-client-id"),
+            };
+        }
+        _ => bail!("--oidc-issuer and --oidc-client-id must be given together"),
+    };
+    let settings = OidcSettings::from_files(
+        issuer,
+        client_id,
+        o.oidc_audience.clone(),
+        o.oidc_scopes.clone(),
+        o.oidc_username_cel_file.as_deref(),
+        o.oidc_session_cel_file.as_deref(),
+        o.oidc_whoami_cel_file.as_deref(),
+    )?;
+    let main = Expr::from_file_or(o.main_authz_cel_file.as_deref(), "true")?;
+    let authenticator = Authenticator::start(settings).await?;
+    Ok(ServiceAuth::oidc(authenticator, main, o.allow_anonymous, admin))
 }
 
 /// Child processes owned by this service; stopped when dropped.
@@ -205,12 +203,7 @@ async fn main() -> Result<()> {
     allow(unused_mut, unused_variables)
 )]
 async fn run(cli: Cli, embedded: &mut Embedded) -> Result<()> {
-    let auth = Arc::new(service_auth(cli.admin_token_file.as_deref(), &cli.oidc)?);
-    if let Some(a) = &auth.oidc
-        && let Err(e) = a.prefetch().await
-    {
-        tracing::warn!(error = %e, "could not fetch the OpenID provider's keys yet");
-    }
+    let auth = Arc::new(service_auth(cli.admin_token_file.as_deref(), &cli.oidc).await?);
     let database_url = match (&cli.database_url, &cli.embedded_postgres) {
         (Some(u), _) => u.clone(),
         #[cfg(feature = "embedded-postgres")]

@@ -14,7 +14,7 @@ pub use job::{Job, JobReporter, JobTable};
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use nfi_auth_server::{Authenticator, Expr, OidcSettings};
+use nfi_auth_server::{Authenticator, Expr, Guard, OidcSettings};
 use std::future::Future;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -39,11 +39,25 @@ pub trait Mirror: Send + Sync + 'static {
 /// both; the per-PURL policy also has `purl`: `{type, namespace, name,
 /// version, qualifiers, subpath, raw}`, where `raw` is the PURL as given.
 pub struct Auth {
-    pub authenticator: Authenticator,
-    /// Evaluated once per API request.
-    pub request: Expr,
+    /// OIDC (never anonymous) with the per-request policy.
+    pub guard: Arc<Guard>,
     /// Evaluated for each PURL of a mirror request.
     pub purl: Expr,
+}
+
+impl Auth {
+    /// `request` is evaluated once per API request, `purl` for each PURL of
+    /// a mirror request.
+    pub fn new(authenticator: Arc<Authenticator>, request: Expr, purl: Expr) -> Self {
+        Auth {
+            guard: Arc::new(Guard::Oidc {
+                authenticator,
+                policy: request,
+                anonymous: false,
+            }),
+            purl,
+        }
+    }
 }
 
 /// Arguments shared by every yoink-service binary.
@@ -73,6 +87,10 @@ pub struct ServerArgs {
     /// `claims` (e.g. `claims.sid`), for logs.
     #[arg(long, env = "YOINK_OIDC_SESSION_CEL_FILE")]
     pub oidc_session_cel_file: Option<PathBuf>,
+    /// File with a CEL expression over `claims` and `user` giving the map
+    /// whoami reports as `additional_info` [default: claims].
+    #[arg(long, env = "YOINK_OIDC_WHOAMI_CEL_FILE")]
+    pub oidc_whoami_cel_file: Option<PathBuf>,
     /// File with a CEL expression (vars: claims, user, request) that must be
     /// true for every API request [default: true].
     #[arg(long, env = "YOINK_AUTHZ_CEL_FILE")]
@@ -96,36 +114,22 @@ struct Cli<B: Subcommand> {
     backend: B,
 }
 
-fn expr_or(path: &Option<PathBuf>, default: &str) -> Result<Expr> {
-    match path {
-        Some(p) => Expr::from_file(p),
-        None => Expr::new(default),
-    }
-}
-
 impl ServerArgs {
-    pub fn auth(&self) -> Result<Auth> {
-        let authenticator = Authenticator::new(OidcSettings {
-            issuer: self.oidc_issuer.clone(),
-            client_id: self.oidc_client_id.clone(),
-            audience: self.oidc_audience.clone(),
-            scopes: self.oidc_scopes.clone(),
-            username: self
-                .oidc_username_cel_file
-                .as_deref()
-                .map(Expr::from_file)
-                .transpose()?,
-            session: self
-                .oidc_session_cel_file
-                .as_deref()
-                .map(Expr::from_file)
-                .transpose()?,
-        })?;
-        Ok(Auth {
-            authenticator,
-            request: expr_or(&self.authz_cel_file, "true")?,
-            purl: expr_or(&self.purl_authz_cel_file, "true")?,
-        })
+    /// Read the expressions and start the authenticator (fetching the
+    /// provider's keys; see `Authenticator::start`).
+    pub async fn auth(&self) -> Result<Auth> {
+        let settings = OidcSettings::from_files(
+            &self.oidc_issuer,
+            &self.oidc_client_id,
+            self.oidc_audience.clone(),
+            self.oidc_scopes.clone(),
+            self.oidc_username_cel_file.as_deref(),
+            self.oidc_session_cel_file.as_deref(),
+            self.oidc_whoami_cel_file.as_deref(),
+        )?;
+        let request = Expr::from_file_or(self.authz_cel_file.as_deref(), "true")?;
+        let purl = Expr::from_file_or(self.purl_authz_cel_file.as_deref(), "true")?;
+        Ok(Auth::new(Authenticator::start(settings).await?, request, purl))
     }
 }
 
@@ -162,10 +166,7 @@ where
 }
 
 async fn run(args: ServerArgs, mirror: impl Future<Output = Result<Arc<dyn Mirror>>>) -> Result<()> {
-    let auth = args.auth()?;
-    if let Err(e) = auth.authenticator.prefetch().await {
-        tracing::warn!(error = %e, "could not fetch the OpenID provider's keys yet");
-    }
+    let auth = args.auth().await?;
     let mirror = mirror.await.context("starting the mirror backend")?;
     let state = api::State::new(mirror, auth, args.max_purls);
     let listener = tokio::net::TcpListener::bind(&args.listen)

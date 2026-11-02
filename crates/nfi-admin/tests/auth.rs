@@ -37,12 +37,12 @@ fn run(bin: &str, dir: &Path, env: &[(&str, &str)], args: &[&str]) -> Out {
 #[tokio::test(flavor = "multi_thread")]
 async fn tokens() {
     let idp = MockIdp::start("nfi").await;
-    let auth = ServiceAuth {
-        oidc: Some(Authenticator::new(OidcSettings::new(idp.issuer(), idp.client_id())).unwrap()),
-        allow_anonymous: false,
-        main_authz: Expr::new("true").unwrap(),
-        admin: AdminAuth::Oidc(Expr::new("user.username == 'root'").unwrap()),
-    };
+    let auth = ServiceAuth::oidc(
+        std::sync::Arc::new(Authenticator::new(OidcSettings::new(idp.issuer(), idp.client_id())).unwrap()),
+        Expr::new("true").unwrap(),
+        false,
+        AdminAuth::Oidc(Expr::new("user.username == 'root'").unwrap()),
+    );
     let Some(svc) = nfi_testenv::start_service_with(auth).await else {
         return;
     };

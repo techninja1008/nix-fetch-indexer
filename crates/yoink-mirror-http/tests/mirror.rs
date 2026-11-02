@@ -146,11 +146,11 @@ async fn start(target: Cache, prefix: &str, f: impl FnOnce(&mut Config)) -> Env 
     f(&mut cfg);
     let mirror = HttpMirror::new(cfg).await.unwrap();
     let idp = MockIdp::start("yoink").await;
-    let auth = Auth {
-        authenticator: Authenticator::new(OidcSettings::new(idp.issuer(), idp.client_id())).unwrap(),
-        request: Expr::new("true").unwrap(),
-        purl: Expr::new("true").unwrap(),
-    };
+    let auth = Auth::new(
+        Arc::new(Authenticator::new(OidcSettings::new(idp.issuer(), idp.client_id())).unwrap()),
+        Expr::new("true").unwrap(),
+        Expr::new("true").unwrap(),
+    );
     let state = api::State::new(Arc::new(mirror), auth, 1000);
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", l.local_addr().unwrap());

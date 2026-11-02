@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 /// Where a service advertises its [`AuthConfig`] (unauthenticated GET; 404
 /// when OIDC is not configured on that listener).
 pub const CONFIG_PATH: &str = "/auth/v1/config";
-/// Where a service reports the caller's [`Whoami`] (401 without a valid token).
+/// Where a service reports the caller's [`Whoami`] (401 without a valid
+/// token; 404 when OIDC is not configured on that listener).
 pub const WHOAMI_PATH: &str = "/auth/v1/whoami";
 
 /// The OIDC settings a service advertises to its clients.
@@ -38,6 +39,10 @@ pub struct Whoami {
     pub username: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// What the service's whoami expression made of the token (by default
+    /// its claims); empty from services that predate it.
+    #[serde(default)]
+    pub additional_info: serde_json::Map<String, serde_json::Value>,
 }
 
 /// The JSON body of an error response.

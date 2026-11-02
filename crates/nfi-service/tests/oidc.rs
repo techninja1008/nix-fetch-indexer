@@ -5,19 +5,18 @@ use nfi_auth_server::{Authenticator, Expr, OidcSettings};
 use nfi_service::auth::{AdminAuth, ServiceAuth};
 use nfi_test_support::MockIdp;
 use serde_json::json;
+use std::sync::Arc;
 
 fn auth(idp: &MockIdp, allow_anonymous: bool, admin: AdminAuth) -> ServiceAuth {
     let mut s = OidcSettings::new(idp.issuer(), idp.client_id());
     s.session = Some(Expr::new("has(claims.sid) ? claims.sid : null").unwrap());
-    ServiceAuth {
-        oidc: Some(Authenticator::new(s).unwrap()),
+    ServiceAuth::oidc(
+        Arc::new(Authenticator::new(s).unwrap()),
+        Expr::new("has(claims.groups) && 'nfi' in claims.groups && request.method in ['GET', 'POST']")
+            .unwrap(),
         allow_anonymous,
-        main_authz: Expr::new(
-            "has(claims.groups) && 'nfi' in claims.groups && request.method in ['GET', 'POST']",
-        )
-        .unwrap(),
         admin,
-    }
+    )
 }
 
 async fn get(url: String, token: Option<&str>) -> reqwest::Response {
@@ -48,6 +47,7 @@ async fn public_api() {
     assert_eq!(cfg.issuer, idp.issuer());
     assert_eq!(cfg.client_id, "nfi");
     assert!(cfg.scopes.contains(&"openid".to_string()));
+    assert!(!cfg.anonymous);
 
     let r = get(u("/v1/releases"), None).await;
     assert_eq!(r.status(), 401);
@@ -59,13 +59,11 @@ async fn public_api() {
     assert_eq!(get(u("/v1/releases"), Some(&good)).await.status(), 200);
 
     let me: Whoami = get(u(WHOAMI_PATH), Some(&good)).await.json().await.unwrap();
-    assert_eq!(
-        me,
-        Whoami {
-            username: "alice".into(),
-            session: Some("s1".into())
-        }
-    );
+    assert_eq!(me.username, "alice");
+    assert_eq!(me.session.as_deref(), Some("s1"));
+    // By default, additional_info is the token's claims.
+    assert_eq!(me.additional_info["groups"], json!(["nfi"]));
+    assert_eq!(me.additional_info["iss"], idp.issuer());
     assert_eq!(get(u(WHOAMI_PATH), None).await.status(), 401);
 
     // The admin listener is open, and advertises no OIDC.
@@ -100,6 +98,7 @@ async fn public_api() {
         "--allow-anonymous",
         "--admin-oidc",
         "--main-authz-cel-file",
+        "--oidc-whoami-cel-file",
     ] {
         assert!(help.contains(flag), "{flag} missing from --help");
     }
@@ -112,6 +111,8 @@ async fn anonymous_allowed() {
         return;
     };
     let u = |p: &str| format!("{}{p}", svc.public_url);
+    let cfg: AuthConfig = get(u(CONFIG_PATH), None).await.json().await.unwrap();
+    assert!(cfg.anonymous);
     // Anonymous requests skip the policy; tokens are still checked.
     assert_eq!(get(u("/v1/releases"), None).await.status(), 200);
     assert_eq!(get(u("/v1/releases"), Some("garbage")).await.status(), 401);
@@ -133,6 +134,7 @@ async fn admin_oidc() {
     assert_eq!(get(u("/healthz"), None).await.status(), 200);
     let cfg: AuthConfig = get(u(CONFIG_PATH), None).await.json().await.unwrap();
     assert_eq!(cfg.client_id, "nfi");
+    assert!(!cfg.anonymous);
     assert_eq!(get(u("/admin/v1/jobs"), None).await.status(), 401);
     assert_eq!(get(u("/admin/v1/jobs"), Some(&alice)).await.status(), 403);
     assert_eq!(get(u("/admin/v1/jobs"), Some(&root)).await.status(), 200);
@@ -224,4 +226,31 @@ fn config_errors() {
     assert!(e.contains("--oidc-client-id"), "{e}");
     let e = run(&[&oidc[..], &["--main-authz-cel-file", bad.to_str().unwrap()]].concat());
     assert!(e.contains("compiling CEL"), "{e}");
+    let e = run(&[&oidc[..], &["--oidc-whoami-cel-file", bad.to_str().unwrap()]].concat());
+    assert!(e.contains("compiling CEL"), "{e}");
+}
+
+/// A provider whose discovery document names another issuer stops the
+/// service at startup (an unreachable one does not: see `config_errors`,
+/// which gets as far as the database).
+#[tokio::test(flavor = "multi_thread")]
+async fn issuer_mismatch() {
+    let idp = MockIdp::start("nfi").await;
+    let issuer = idp.issuer().replace("127.0.0.1", "localhost");
+    let mut c = tokio::process::Command::new(env!("CARGO_BIN_EXE_nfi-service"));
+    c.args(["--database-url", "postgres://127.0.0.1:1/x"]).args([
+        "--oidc-issuer",
+        &issuer,
+        "--oidc-client-id",
+        "nfi",
+    ]);
+    for (k, _) in std::env::vars_os() {
+        if k.to_string_lossy().starts_with("NFI_") {
+            c.env_remove(k);
+        }
+    }
+    let out = c.output().await.unwrap();
+    assert!(!out.status.success());
+    let e = String::from_utf8_lossy(&out.stderr);
+    assert!(e.contains("issuer mismatch"), "{e}");
 }

@@ -1,6 +1,6 @@
 //! An in-process mock OpenID provider for tests: discovery, JWKS (one
-//! Ed25519 key), and a device authorization grant that approves on the
-//! second poll. [`pty`] runs CLIs on a pseudo-terminal, so that their
+//! Ed25519 key at a time; [`MockIdp::rotate_key`] switches to a second one),
+//! and a device authorization grant that approves on the second poll. [`pty`] runs CLIs on a pseudo-terminal, so that their
 //! interactive paths (device login, fullscreen UIs) can be tested too.
 
 #[cfg(unix)]
@@ -12,16 +12,29 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// A fixed test-only key; never trust it outside tests.
-const KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+/// Fixed test-only keys (PEM, public `x`, key id); never trust them
+/// outside tests.
+const KEYS: [(&str, &str, &str); 2] = [
+    (
+        "-----BEGIN PRIVATE KEY-----
 MC4CAQAwBQYDK2VwBCIEIF72m8OXAiDCKpJZHZT5LR+HpEM1hIh/Cz780L7gVQ/p
 -----END PRIVATE KEY-----
-";
-const KEY_X: &str = "1MXjeBTbKUuBzqXMCFEMmf641-FsJ5I2RrLXzH7KSY4";
-const KID: &str = "test-key";
+",
+        "1MXjeBTbKUuBzqXMCFEMmf641-FsJ5I2RrLXzH7KSY4",
+        "test-key",
+    ),
+    (
+        "-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIEiwxMFUKdp4Y46rQl8dPl6p1cfK2r+Y7b+03ybpVXxK
+-----END PRIVATE KEY-----
+",
+        "4_QIx86QKBWM3DSGCNEygYLIjYzT6tXBDgbde4Z_kqk",
+        "test-key-2",
+    ),
+];
 
 struct Inner {
     issuer: String,
@@ -33,6 +46,14 @@ struct Inner {
     device_logins: AtomicUsize,
     refreshes: AtomicUsize,
     token_lifetime: Mutex<i64>,
+    /// Index into [`KEYS`] of the signing (and published) key.
+    key: AtomicUsize,
+    /// Published instead of the current key's JWKS when set.
+    jwks: Mutex<Option<serde_json::Value>>,
+    /// Discovery and JWKS answer 503 while set.
+    down: AtomicBool,
+    /// Discovery and JWKS requests served or refused so far.
+    key_fetches: AtomicUsize,
 }
 
 #[derive(Clone)]
@@ -61,6 +82,10 @@ impl MockIdp {
                 device_logins: AtomicUsize::new(0),
                 refreshes: AtomicUsize::new(0),
                 token_lifetime: Mutex::new(3600),
+                key: AtomicUsize::new(0),
+                jwks: Mutex::new(None),
+                down: AtomicBool::new(false),
+                key_fetches: AtomicUsize::new(0),
             }),
         };
         let app = Router::new()
@@ -84,6 +109,12 @@ impl MockIdp {
     /// Sign an ID token with `claims`, filling in `iss`, `aud`, `iat` and
     /// `exp` unless given.
     pub fn token(&self, claims: serde_json::Value) -> String {
+        let kid = KEYS[self.inner.key.load(Ordering::SeqCst)].2;
+        self.token_with_kid(claims, kid)
+    }
+
+    /// [`MockIdp::token`] with the current key but `kid` in the header.
+    pub fn token_with_kid(&self, claims: serde_json::Value, kid: &str) -> String {
         let mut c = claims.as_object().cloned().unwrap_or_default();
         let lifetime = *self.inner.token_lifetime.lock().unwrap();
         c.entry("iss").or_insert(self.inner.issuer.clone().into());
@@ -91,8 +122,9 @@ impl MockIdp {
         c.entry("iat").or_insert(now().into());
         c.entry("exp").or_insert((now() + lifetime).into());
         let mut h = Header::new(Algorithm::EdDSA);
-        h.kid = Some(KID.into());
-        let key = EncodingKey::from_ed_pem(KEY_PEM.as_bytes()).unwrap();
+        h.kid = Some(kid.into());
+        let pem = KEYS[self.inner.key.load(Ordering::SeqCst)].0;
+        let key = EncodingKey::from_ed_pem(pem.as_bytes()).unwrap();
         jsonwebtoken::encode(&h, &c, &key).unwrap()
     }
 
@@ -104,6 +136,43 @@ impl MockIdp {
     /// Lifetime of tokens issued from now on, in seconds (may be negative).
     pub fn set_token_lifetime(&self, secs: i64) {
         *self.inner.token_lifetime.lock().unwrap() = secs;
+    }
+
+    /// Sign new tokens with the other key, and publish only that one.
+    pub fn rotate_key(&self) {
+        self.inner.key.fetch_xor(1, Ordering::SeqCst);
+    }
+
+    /// The JWK of the current key.
+    pub fn jwk(&self) -> serde_json::Value {
+        let (_, x, kid) = KEYS[self.inner.key.load(Ordering::SeqCst)];
+        serde_json::json!({
+            "kty": "OKP", "crv": "Ed25519", "x": x, "kid": kid, "alg": "EdDSA", "use": "sig",
+        })
+    }
+
+    /// Publish this JWK set instead of the current key's (`None`: back to it).
+    pub fn set_jwks(&self, jwks: Option<serde_json::Value>) {
+        *self.inner.jwks.lock().unwrap() = jwks;
+    }
+
+    /// While down, discovery and JWKS requests get 503.
+    pub fn set_down(&self, down: bool) {
+        self.inner.down.store(down, Ordering::SeqCst);
+    }
+
+    /// Discovery and JWKS requests received so far (including refused ones).
+    pub fn key_fetches(&self) -> usize {
+        self.inner.key_fetches.load(Ordering::SeqCst)
+    }
+
+    /// Count a discovery or JWKS request; `Some` (a 503) while down.
+    fn key_request(&self) -> Option<Response> {
+        self.inner.key_fetches.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .down
+            .load(Ordering::SeqCst)
+            .then(|| (axum::http::StatusCode::SERVICE_UNAVAILABLE, "down").into_response())
     }
 
     pub fn device_logins(&self) -> usize {
@@ -120,6 +189,9 @@ impl MockIdp {
 }
 
 async fn discovery(State(i): State<MockIdp>) -> Response {
+    if let Some(r) = i.key_request() {
+        return r;
+    }
     let b = &i.inner.issuer;
     axum::Json(serde_json::json!({
         "issuer": b,
@@ -130,11 +202,12 @@ async fn discovery(State(i): State<MockIdp>) -> Response {
     .into_response()
 }
 
-async fn jwks() -> Response {
-    axum::Json(serde_json::json!({"keys": [{
-        "kty": "OKP", "crv": "Ed25519", "x": KEY_X, "kid": KID, "alg": "EdDSA", "use": "sig",
-    }]}))
-    .into_response()
+async fn jwks(State(i): State<MockIdp>) -> Response {
+    if let Some(r) = i.key_request() {
+        return r;
+    }
+    let set = i.inner.jwks.lock().unwrap().clone();
+    axum::Json(set.unwrap_or_else(|| serde_json::json!({"keys": [i.jwk()]}))).into_response()
 }
 
 async fn device(State(i): State<MockIdp>, Form(f): Form<HashMap<String, String>>) -> Response {

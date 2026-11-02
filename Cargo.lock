@@ -2016,6 +2016,7 @@ name = "nfi-auth"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2039,6 +2040,7 @@ name = "nfi-auth-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "cel",
  "http",
  "jsonwebtoken",
@@ -2052,6 +2054,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

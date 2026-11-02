@@ -1,18 +1,18 @@
 //! HTTP routes for the public and admin listeners.
 
-use crate::auth::{self, AdminAuth, Caller};
 use crate::query::{self, LookupError};
 use crate::{AppState, jobs};
-use axum::Json;
-use axum::Router;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{MethodRouter, get, post};
+use axum::{Extension, Json, Router};
 use nfi_api::*;
+use nfi_auth_server::{Caller, Guard};
 use serde::Deserialize;
+use std::sync::Arc;
 
 pub struct AppError(StatusCode, String);
 
@@ -36,27 +36,37 @@ fn err(status: StatusCode, msg: impl Into<String>) -> AppError {
 
 type R<T> = Result<Json<T>, AppError>;
 
+/// `CONFIG_PATH` and `WHOAMI_PATH` handlers for a listener's guard.
+fn auth_routes(guard: &Arc<Guard>) -> (MethodRouter<AppState>, MethodRouter<AppState>) {
+    let g = guard.clone();
+    let config = get(move || async move { g.config_response() });
+    let g = guard.clone();
+    let whoami =
+        get(move |c: Option<Extension<Caller>>| async move { g.whoami_response(c.as_ref().map(|c| &c.0)) });
+    (config, whoami)
+}
+
 pub fn public_router(state: AppState) -> Router {
+    let guard = state.auth.public.clone();
+    let (config, whoami) = auth_routes(&guard);
     Router::new()
-        .route("/healthz", get(|| async { "ok" }))
         .route("/v1/search", get(search))
         .route("/v1/packages/{*attr}", get(package))
         .route("/v1/lookup/bulk", post(bulk))
         .route("/v1/minimise", post(minimise))
         .route("/v1/releases", get(releases))
-        .route(nfi_auth::CONFIG_PATH, get(public_auth_config))
-        .route(nfi_auth::WHOAMI_PATH, get(public_whoami))
+        .route(nfi_auth::WHOAMI_PATH, whoami)
         .layer(DefaultBodyLimit::max(512 << 20))
-        .layer(middleware::from_fn_with_state(
-            state.auth.clone(),
-            auth::public_auth,
-        ))
+        .layer(middleware::from_fn_with_state(guard, nfi_auth_server::middleware))
+        .route("/healthz", get(|| async { "ok" }))
+        .route(nfi_auth::CONFIG_PATH, config)
         .with_state(state)
 }
 
 pub fn admin_router(state: AppState) -> Router {
+    let guard = state.auth.admin.clone();
+    let (config, whoami) = auth_routes(&guard);
     Router::new()
-        .route("/healthz", get(|| async { "ok" }))
         .route("/admin/v1/ingest", post(ingest))
         .route("/admin/v1/jobs", get(list_jobs))
         .route("/admin/v1/jobs/{id}", get(get_job))
@@ -64,43 +74,12 @@ pub fn admin_router(state: AppState) -> Router {
         .route("/admin/v1/prune", post(prune))
         .route("/admin/v1/reindex", post(reindex))
         .route("/admin/v1/check", post(check))
-        .route(nfi_auth::CONFIG_PATH, get(admin_auth_config))
-        .route(nfi_auth::WHOAMI_PATH, get(admin_whoami))
+        .route(nfi_auth::WHOAMI_PATH, whoami)
         .layer(DefaultBodyLimit::disable())
-        .layer(middleware::from_fn_with_state(
-            state.auth.clone(),
-            auth::admin_auth,
-        ))
+        .layer(middleware::from_fn_with_state(guard, nfi_auth_server::middleware))
+        .route("/healthz", get(|| async { "ok" }))
+        .route(nfi_auth::CONFIG_PATH, config)
         .with_state(state)
-}
-
-fn admin_oidc(s: &AppState) -> Option<&nfi_auth_server::Authenticator> {
-    match s.auth.admin {
-        AdminAuth::Oidc(_) => s.auth.oidc.as_ref(),
-        _ => None,
-    }
-}
-
-async fn public_auth_config(State(s): State<AppState>) -> Response {
-    auth::config_response(s.auth.oidc.as_ref())
-}
-
-async fn admin_auth_config(State(s): State<AppState>) -> Response {
-    auth::config_response(admin_oidc(&s))
-}
-
-async fn public_whoami(State(s): State<AppState>, caller: Option<axum::Extension<Caller>>) -> Response {
-    match s.auth.oidc {
-        Some(_) => auth::whoami_response(caller.as_ref().map(|c| &c.0)),
-        None => auth::config_response(None),
-    }
-}
-
-async fn admin_whoami(State(s): State<AppState>, caller: Option<axum::Extension<Caller>>) -> Response {
-    match admin_oidc(&s) {
-        Some(_) => auth::whoami_response(caller.as_ref().map(|c| &c.0)),
-        None => auth::config_response(None),
-    }
 }
 
 async fn search(State(s): State<AppState>, Query(q): Query<SearchQuery>) -> R<SearchResponse> {
