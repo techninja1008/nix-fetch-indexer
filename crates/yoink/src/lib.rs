@@ -2,7 +2,6 @@
 //! paths) into a local binary cache through a yoink service, and monitor the
 //! pull.
 
-pub mod auth;
 pub mod client;
 pub mod config;
 pub mod format;

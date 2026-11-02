@@ -1,6 +1,5 @@
 //! Support code for the `nfi` query CLI, and its API client.
 
-pub mod auth;
 pub mod client;
 pub mod http;
 
@@ -58,6 +57,38 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
 pub fn print_json<T: serde::Serialize>(v: &T) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(v)?);
     Ok(())
+}
+
+/// `whoami` for the service at `url`, without logging in: prints who it
+/// sees (`json`: the whole response). False if not authenticated.
+pub async fn whoami(creds: &nfi_auth_client::Credentials, url: &str, json: bool) -> Result<bool> {
+    let r = client::Client::new(url, creds.current().await?)?
+        .get_json::<nfi_auth::Whoami>(nfi_auth::WHOAMI_PATH)
+        .await;
+    let w = match r {
+        Ok(w) => w,
+        Err(e) => match e.downcast_ref::<http::HttpError>().map(|h| h.status) {
+            Some(401) => {
+                println!("{url}: not authenticated");
+                return Ok(false);
+            }
+            Some(404) => {
+                println!("{url}: does not use login");
+                return Ok(true);
+            }
+            _ => return Err(e),
+        },
+    };
+    if json {
+        return print_json(&w).map(|()| true);
+    }
+    println!("{url}: {}", nfi_auth_client::describe(&w));
+    if !w.additional_info.is_empty() {
+        for l in serde_json::to_string_pretty(&w.additional_info)?.lines() {
+            println!("  {l}");
+        }
+    }
+    Ok(true)
 }
 
 /// Build the fetch hook command line: `{}` in any argument is replaced by

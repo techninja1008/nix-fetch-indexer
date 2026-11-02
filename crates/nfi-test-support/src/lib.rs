@@ -1,7 +1,11 @@
 //! An in-process mock OpenID provider for tests: discovery, JWKS (one
 //! Ed25519 key at a time; [`MockIdp::rotate_key`] switches to a second one),
-//! and a device authorization grant that approves on the second poll. [`pty`] runs CLIs on a pseudo-terminal, so that their
-//! interactive paths (device login, fullscreen UIs) can be tested too.
+//! a device authorization grant that approves on the second poll, and
+//! rotating refresh tokens (each works once). It also answers
+//! [`nfi_auth::CONFIG_PATH`] like a service using it, so CLI credentials can
+//! be pointed at it directly. [`pty`] runs CLIs on a pseudo-terminal, so
+//! that their interactive paths (device login, fullscreen UIs) can be tested
+//! too.
 
 #[cfg(unix)]
 pub mod pty;
@@ -11,7 +15,7 @@ use axum::extract::{Form, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -45,6 +49,8 @@ struct Inner {
     pending: Mutex<HashMap<String, usize>>,
     device_logins: AtomicUsize,
     refreshes: AtomicUsize,
+    /// Refresh tokens already used (and so no longer valid).
+    used_refresh_tokens: Mutex<HashSet<String>>,
     token_lifetime: Mutex<i64>,
     /// Index into [`KEYS`] of the signing (and published) key.
     key: AtomicUsize,
@@ -81,6 +87,7 @@ impl MockIdp {
                 pending: Default::default(),
                 device_logins: AtomicUsize::new(0),
                 refreshes: AtomicUsize::new(0),
+                used_refresh_tokens: Default::default(),
                 token_lifetime: Mutex::new(3600),
                 key: AtomicUsize::new(0),
                 jwks: Mutex::new(None),
@@ -93,6 +100,7 @@ impl MockIdp {
             .route("/jwks", get(jwks))
             .route("/device", post(device))
             .route("/token", post(token))
+            .route(nfi_auth::CONFIG_PATH, get(config))
             .with_state(idp.clone());
         tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
         idp
@@ -202,6 +210,16 @@ async fn discovery(State(i): State<MockIdp>) -> Response {
     .into_response()
 }
 
+async fn config(State(i): State<MockIdp>) -> Response {
+    axum::Json(nfi_auth::AuthConfig {
+        issuer: i.inner.issuer.clone(),
+        client_id: i.inner.client_id.clone(),
+        scopes: vec!["openid".into()],
+        anonymous: false,
+    })
+    .into_response()
+}
+
 async fn jwks(State(i): State<MockIdp>) -> Response {
     if let Some(r) = i.key_request() {
         return r;
@@ -262,16 +280,22 @@ async fn token(State(i): State<MockIdp>, Form(f): Form<HashMap<String, String>>)
             }))
             .into_response()
         }
-        Some("refresh_token") if f.get("refresh_token").is_some_and(|t| t.starts_with("rt-")) => {
-            i.inner.refreshes.fetch_add(1, Ordering::SeqCst);
+        Some("refresh_token") => {
+            let rt = f.get("refresh_token").cloned().unwrap_or_default();
+            if !rt.starts_with("rt-") || !i.inner.used_refresh_tokens.lock().unwrap().insert(rt) {
+                return oauth_error("invalid_grant");
+            }
+            // Slow enough for concurrent refreshes to overlap.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let n = i.inner.refreshes.fetch_add(1, Ordering::SeqCst);
             axum::Json(serde_json::json!({
                 "id_token": i.login_token(),
                 "access_token": "opaque",
+                "refresh_token": format!("rt-refreshed-{n}"),
                 "token_type": "Bearer",
             }))
             .into_response()
         }
-        Some("refresh_token") => oauth_error("invalid_grant"),
         _ => oauth_error("unsupported_grant_type"),
     }
 }

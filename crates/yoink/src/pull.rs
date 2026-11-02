@@ -1,19 +1,21 @@
 //! `yoink <TARGET>...`: resolve targets to PURLs, start the mirror request
 //! and monitor it until every PURL has a result.
 
-use crate::auth::{NFI_HINT, YOINK_HINT, bearer, with_login};
 use crate::plain::{Plain, summary};
 use crate::state::{Conn, PlanSummary, State};
-use crate::stream::{Msg, Refresh, drive};
+use crate::stream::{Msg, drive};
 use crate::targets::{Target, classify, closure_purls, dedupe};
 use crate::tui;
 use anyhow::{Context, Result, bail};
-use nfi::http::is_unauthorized;
-use nfi_auth_client::Session;
+use nfi::http::retry;
+use nfi_auth_client::Credentials;
 use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::time::Duration;
 use yoink_api::Outcome;
+
+pub const YOINK_HINT: &str = "set YOINK_TOKEN or pass --token-file";
+pub const NFI_HINT: &str = "set NFI_TOKEN or pass --nfi-token-file";
 
 pub struct PullOptions {
     pub targets: Vec<String>,
@@ -29,23 +31,17 @@ pub struct PullOptions {
 
 /// Evaluate flake references and ask NFI which cached paths they need.
 async fn resolve_flakes(
-    session: Option<&Session>,
+    creds: &Credentials,
+    nfi_url: &str,
     o: &PullOptions,
     flakes: Vec<String>,
 ) -> Result<(Vec<String>, PlanSummary)> {
-    let Some(nfi_url) = o.nfi_url.clone() else {
-        bail!(
-            "flake references need the NFI service: set --nfi-url, NFI_URL or `nfi_url` in the config file"
-        );
-    };
     let nix = o.nix.clone();
     let graph = tokio::task::spawn_blocking(move || nfi::derivation_graph(&nix, &flakes)).await??;
-    let explicit = o.nfi_token.is_some();
-    let mut token = bearer(session, &nfi_url, o.nfi_token.clone()).await?;
+    let client = nfi::client::Client::new(nfi_url, None)?;
     let cmt = o.close_miss_threshold;
-    let r = with_login(session, &nfi_url, &mut token, explicit, NFI_HINT, |t| {
-        let (graph, url) = (&graph, &nfi_url);
-        async move { nfi::client::Client::new(url, t)?.minimise(graph, cmt).await }
+    let r = retry(creds, true, |t| async {
+        client.with_token(t).minimise(&graph, cmt).await
     })
     .await
     .context("minimising against NFI")?;
@@ -70,8 +66,6 @@ pub async fn pull(o: PullOptions) -> Result<ExitCode> {
         .iter()
         .map(|t| classify(t))
         .collect::<Result<Vec<_>>>()?;
-    let session = crate::auth::session()?;
-    let session = session.as_ref();
     let flakes: Vec<String> = targets
         .iter()
         .filter_map(|t| match t {
@@ -79,11 +73,29 @@ pub async fn pull(o: PullOptions) -> Result<ExitCode> {
             Target::Purl(_) => None,
         })
         .collect();
-    let (closure, plan) = if flakes.is_empty() {
-        (vec![], None)
-    } else {
-        let (c, p) = resolve_flakes(session, &o, flakes).await?;
-        (c, Some(p))
+    let nfi = match &o.nfi_url {
+        _ if flakes.is_empty() => None,
+        Some(u) => Some((
+            u.as_str(),
+            Credentials::new("yoink", u, o.nfi_token.clone(), NFI_HINT),
+        )),
+        None => bail!(
+            "flake references need the NFI service: set --nfi-url, NFI_URL or `nfi_url` in the config file"
+        ),
+    };
+    // Log in to both services up front, before evaluating anything and
+    // before the monitor takes over the terminal.
+    let creds = Credentials::new("yoink", &o.url, o.token.clone(), YOINK_HINT);
+    creds.token(true).await?;
+    if let Some((_, c)) = &nfi {
+        c.token(true).await?;
+    }
+    let (closure, plan) = match &nfi {
+        None => (vec![], None),
+        Some((url, c)) => {
+            let (c, p) = resolve_flakes(c, url, &o, flakes).await?;
+            (c, Some(p))
+        }
     };
     // Flake closures go where the first flake reference was given.
     let mut purls = Vec::new();
@@ -113,37 +125,17 @@ pub async fn pull(o: PullOptions) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    // The service always requires a token.
-    let explicit = o.token.is_some();
-    let mut token = bearer(session, &o.url, o.token.clone()).await?;
-    if token.is_none()
-        && let Some(s) = session
-    {
-        token = s.relogin(&o.url, false).await?;
-    }
-    if token.is_none() {
-        bail!("{} requires authentication; {YOINK_HINT}", o.url);
-    }
-    let mut client = crate::client::Client::new(&o.url, token.clone())?;
-    let mut first = client.mirror(&purls).await;
-    if let Err(e) = &first
-        && !explicit
-        && is_unauthorized(e)
-        && let Some(s) = session
-        && let Some(t) = s.relogin(&o.url, true).await?
-    {
-        client.set_token(Some(t));
-        first = client.mirror(&purls).await;
-    }
+    let client = crate::client::Client::new(&o.url, None)?;
+    let first = retry(&creds, true, |t| async {
+        client.with_token(t).mirror(&purls).await
+    })
+    .await;
+    let client = client.with_token(creds.token(false).await.ok().flatten());
 
     let mut state = State::new(&purls);
     state.plan = plan;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let refresh = session.filter(|_| !explicit).map(|s| Refresh {
-        session: s.clone(),
-        url: o.url.clone(),
-    });
-    let driver = tokio::spawn(drive(client, purls, Some(first), refresh, tx));
+    let driver = tokio::spawn(drive(client, purls, Some(first), creds, tx));
 
     let (state, quit) = if use_tui {
         let app = tui::App::new(state, o.targets.join(" "), o.url.clone());

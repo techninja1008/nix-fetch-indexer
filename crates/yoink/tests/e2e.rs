@@ -213,16 +213,32 @@ async fn interactive_login_and_monitor() {
     assert!(o.text.contains("60 of 60 paths mirrored, 0 failed"), "{}", o.text);
     assert_eq!((s.idp.device_logins(), narinfo_count(&s.target)), (1, 60));
 
-    // `whoami` and `logout` from the terminal.
+    // `whoami`, `login` and `logout` from the terminal.
     let o = yoink_tty(&s.url, d.path(), &["whoami".into()]).await;
     assert_eq!(o.code, Some(0), "{}", o.text);
-    assert!(o.text.contains("alice"), "{}", o.text);
+    assert!(o.text.contains(&format!("{}: alice", s.url)), "{}", o.text);
+    let o = yoink_tty(&s.url, d.path(), &["login".into()]).await;
+    assert_eq!(o.code, Some(0), "{}", o.text);
+    assert!(
+        o.text.contains(&format!("logged in to {} as alice", s.url)),
+        "{}",
+        o.text
+    );
+    assert_eq!(s.idp.device_logins(), 1);
     let o = yoink_tty(&s.url, d.path(), &["logout".into()]).await;
     assert_eq!(o.code, Some(0), "{}", o.text);
     assert!(o.text.contains("logged out of"), "{}", o.text);
-    // Logged out, `whoami` logs in again like `nfi whoami`.
+    // Logged out, `whoami` reports it rather than logging in.
     let o = yoink_tty(&s.url, d.path(), &["whoami".into()]).await;
+    assert_eq!(o.code, Some(1), "{}", o.text);
+    assert!(
+        o.text.contains(&format!("{}: not authenticated", s.url)),
+        "{}",
+        o.text
+    );
+    assert!(!o.text.contains("To log in"), "{}", o.text);
+    let o = yoink_tty(&s.url, d.path(), &["login".into()]).await;
     assert_eq!(o.code, Some(0), "{}", o.text);
-    assert!(o.text.contains("To log in, open"), "{}", o.text);
+    assert!(o.text.contains("CODE-1"), "{}", o.text);
     assert_eq!(s.idp.device_logins(), 2);
 }

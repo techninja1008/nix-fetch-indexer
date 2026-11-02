@@ -36,8 +36,12 @@ impl Client {
         &self.base
     }
 
-    pub fn set_token(&mut self, token: Option<String>) {
-        self.token = token;
+    /// The same client (sharing its connections) sending `token`.
+    pub fn with_token(&self, token: Option<String>) -> Self {
+        Self {
+            token,
+            ..self.clone()
+        }
     }
 
     fn req(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {

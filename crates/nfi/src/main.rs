@@ -1,9 +1,11 @@
 use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
 use nfi::client::Client;
+use nfi::http::retry;
 use nfi::*;
 use nfi_api::drv::ReducedGraph;
 use nfi_api::{BulkRequest, ItemStatus, SearchQuery};
+use nfi_auth_client::Credentials;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -16,8 +18,9 @@ struct Cli {
     /// Configuration file [default: $XDG_CONFIG_HOME/nfi/config.toml]
     #[arg(long, env = "NFI_CONFIG", global = true)]
     config: Option<PathBuf>,
-    /// Read the bearer token from this file instead of using `nfi login`
-    /// (e.g. a CI-issued ID token) [also: $NFI_TOKEN]
+    /// Read the bearer token (e.g. a CI-issued ID token) from this file
+    /// instead of using the login; takes precedence over $NFI_TOKEN, which
+    /// holds the token itself
     #[arg(long, env = "NFI_TOKEN_FILE", global = true)]
     token_file: Option<PathBuf>,
     /// Print raw JSON responses.
@@ -27,7 +30,7 @@ struct Cli {
     cmd: Cmd,
 }
 
-#[derive(Args, Clone)]
+#[derive(Args)]
 struct HookArgs {
     /// Command run with a file listing the resolved store paths; `{}` is
     /// replaced by the file path (appended if absent) [env: NFI_FETCH_HOOK]
@@ -38,7 +41,7 @@ struct HookArgs {
     no_fetch_hook: bool,
 }
 
-#[derive(Subcommand, Clone)]
+#[derive(Subcommand)]
 enum Cmd {
     /// Log in to the service with OIDC (device code flow).
     Login {
@@ -46,9 +49,11 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
-    /// Forget the cached login for the service.
+    /// Forget the cached login for the service (and every service sharing
+    /// its OpenID provider and client).
     Logout,
-    /// Show who the service thinks you are.
+    /// Show who the service sees you as, without logging in (exit 1 when
+    /// not authenticated).
     Whoami,
     /// Full-text search over packages and programs.
     Search {
@@ -163,6 +168,8 @@ fn human_size(n: u64) -> String {
     format!("{v:.1} {}", units[u])
 }
 
+const TOKEN_HINT: &str = "set NFI_TOKEN or pass --token-file";
+
 async fn run(cli: Cli) -> Result<ExitCode> {
     let cfg = load_config(cli.config.as_deref())?;
     let url = cli
@@ -171,15 +178,15 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         .or(cfg.url.clone())
         .unwrap_or_else(|| "http://localhost:8080".into());
     let token = nfi_auth_client::explicit(cli.token_file.as_deref(), "NFI_TOKEN")?;
-    let login = auth::Login::new("nfi", "set NFI_TOKEN or --token-file", &url, token)?;
+    let creds = Credentials::new("nfi", &url, token, TOKEN_HINT);
     match &cli.cmd {
         Cmd::Login { force } => {
-            let w = login.login(*force).await?;
-            eprintln!("logged in to {url} as {}", auth::describe(&w));
+            let w = creds.login(*force).await?;
+            eprintln!("logged in to {url} as {}", nfi_auth_client::describe(&w));
             return Ok(ExitCode::SUCCESS);
         }
         Cmd::Logout => {
-            if login.logout().await? {
+            if creds.logout().await? {
                 eprintln!("logged out of {url}");
             } else {
                 eprintln!("not logged in to {url}");
@@ -187,76 +194,41 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
         Cmd::Whoami => {
-            let w = login.whoami().await?;
-            if cli.json {
-                print_json(&w)?;
+            return Ok(if whoami(&creds, &url, cli.json).await? {
+                ExitCode::SUCCESS
             } else {
-                println!("{}", auth::describe(&w));
-            }
-            return Ok(ExitCode::SUCCESS);
+                ExitCode::FAILURE
+            });
         }
         _ => {}
     }
-    let input = gather(&cli.cmd, &cfg)?;
-    login
-        .run(|client| exec(cli.cmd.clone(), &input, cli.json, &cfg, client))
-        .await
+    validate(&cli.cmd)?;
+    // Log in now, before reading stdin or evaluating anything.
+    creds.token(true).await?;
+    let client = Client::new(&url, None)?;
+    exec(cli.cmd, cli.json, &cfg, &client, &creds).await
 }
 
-/// A command's local input, gathered before any request so that a retry
-/// after logging in neither re-reads stdin nor re-runs nix.
-enum Input {
-    None,
-    Bulk(BulkRequest),
-    Graph(ReducedGraph),
-}
-
-fn gather(cmd: &Cmd, cfg: &Config) -> Result<Input> {
+/// The argument checks that need no I/O.
+fn validate(cmd: &Cmd) -> Result<()> {
     match cmd {
-        Cmd::Bulk {
-            items,
-            file,
-            system,
-            outputs,
-            ..
-        } => {
-            let system = system.clone().or(cfg.system.clone());
-            let mut all = Vec::new();
-            for i in items {
-                all.push(parse_item(i, system.as_deref(), outputs)?);
-            }
-            if let Some(f) = file {
-                all.extend(read_items(f, system.as_deref(), outputs)?);
-            }
-            if all.is_empty() {
+        Cmd::Bulk { items, file, .. } => {
+            if items.is_empty() && file.is_none() {
                 bail!("no items given");
             }
-            Ok(Input::Bulk(BulkRequest { items: all }))
+            for i in items {
+                parse_item(i, None, &None)?;
+            }
         }
         Cmd::Minimise {
-            installables,
-            files,
-            nix,
-            ..
-        } => {
-            if installables.is_empty() && files.is_empty() {
-                bail!("give installables and/or --file");
-            }
-            let mut graph = ReducedGraph::default();
-            if !installables.is_empty() {
-                let nix = nix.clone().or(cfg.nix.clone()).unwrap_or_else(|| "nix".into());
-                nfi_drv::merge(&mut graph, derivation_graph(&nix, installables)?);
-            }
-            for f in files {
-                nfi_drv::merge(&mut graph, read_graph(f)?);
-            }
-            Ok(Input::Graph(graph))
-        }
-        _ => Ok(Input::None),
+            installables, files, ..
+        } if installables.is_empty() && files.is_empty() => bail!("give installables and/or --file"),
+        _ => {}
     }
+    Ok(())
 }
 
-async fn exec(cmd: Cmd, input: &Input, json: bool, cfg: &Config, client: Client) -> Result<ExitCode> {
+async fn exec(cmd: Cmd, json: bool, cfg: &Config, client: &Client, creds: &Credentials) -> Result<ExitCode> {
     match cmd {
         Cmd::Login { .. } | Cmd::Logout | Cmd::Whoami => unreachable!("handled in run"),
         Cmd::Search {
@@ -287,7 +259,7 @@ async fn exec(cmd: Cmd, input: &Input, json: bool, cfg: &Config, client: Client)
                 limit: Some(limit),
                 offset: Some(offset),
             };
-            let r = client.search(&q).await?;
+            let r = retry(creds, true, |t| async { client.with_token(t).search(&q).await }).await?;
             if json {
                 print_json(&r)?;
             } else {
@@ -312,7 +284,10 @@ async fn exec(cmd: Cmd, input: &Input, json: bool, cfg: &Config, client: Client)
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Releases { channel, errors } => {
-            let rels = client.releases(channel.as_deref(), errors).await?;
+            let rels = retry(creds, true, |t| async {
+                client.with_token(t).releases(channel.as_deref(), errors).await
+            })
+            .await?;
             if json {
                 print_json(&rels)?;
             } else {
@@ -322,7 +297,13 @@ async fn exec(cmd: Cmd, input: &Input, json: bool, cfg: &Config, client: Client)
         }
         Cmd::Show { attr, commit, system } => {
             let system = system.or(cfg.system.clone());
-            let p = client.package(&attr, &commit, system.as_deref()).await?;
+            let p = retry(creds, true, |t| async {
+                client
+                    .with_token(t)
+                    .package(&attr, &commit, system.as_deref())
+                    .await
+            })
+            .await?;
             if json {
                 print_json(&p)?;
             } else {
@@ -359,12 +340,28 @@ async fn exec(cmd: Cmd, input: &Input, json: bool, cfg: &Config, client: Client)
             }
             Ok(ExitCode::SUCCESS)
         }
-        Cmd::Bulk { strict, hook, .. } => {
-            let Input::Bulk(req) = input else {
-                unreachable!("gathered in run")
-            };
+        Cmd::Bulk {
+            items,
+            file,
+            system,
+            outputs,
+            strict,
+            hook,
+        } => {
+            let system = system.or(cfg.system.clone());
+            let mut all = Vec::new();
+            for i in &items {
+                all.push(parse_item(i, system.as_deref(), &outputs)?);
+            }
+            if let Some(f) = file {
+                all.extend(read_items(&f, system.as_deref(), &outputs)?);
+            }
+            if all.is_empty() {
+                bail!("no items given");
+            }
+            let req = BulkRequest { items: all };
             let hook = hook_cmd(&hook, cfg);
-            let r = client.bulk(req).await?;
+            let r = retry(creds, true, |t| async { client.with_token(t).bulk(&req).await }).await?;
             let failed: Vec<_> = r.items.iter().filter(|i| i.status != ItemStatus::Ok).collect();
             for i in &failed {
                 eprintln!("warning: {}@{} ({}): {:?}", i.attr, i.commit, i.system, i.status);
@@ -395,16 +392,26 @@ async fn exec(cmd: Cmd, input: &Input, json: bool, cfg: &Config, client: Client)
             })
         }
         Cmd::Minimise {
+            installables,
+            files,
+            nix,
             roots_only,
             close_miss_threshold,
             hook,
-            ..
         } => {
-            let Input::Graph(graph) = input else {
-                unreachable!("gathered in run")
-            };
+            let mut graph = ReducedGraph::default();
+            if !installables.is_empty() {
+                let nix = nix.or(cfg.nix.clone()).unwrap_or_else(|| "nix".into());
+                nfi_drv::merge(&mut graph, derivation_graph(&nix, &installables)?);
+            }
+            for f in &files {
+                nfi_drv::merge(&mut graph, read_graph(f)?);
+            }
             let hook = hook_cmd(&hook, cfg);
-            let r = client.minimise(graph, close_miss_threshold).await?;
+            let r = retry(creds, true, |t| async {
+                client.with_token(t).minimise(&graph, close_miss_threshold).await
+            })
+            .await?;
             let paths = if roots_only { &r.roots } else { &r.closure };
             if json {
                 print_json(&r)?;

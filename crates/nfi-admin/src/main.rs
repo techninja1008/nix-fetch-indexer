@@ -1,10 +1,13 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use nfi::client::Client;
-use nfi::print_json;
+use nfi::http::retry;
+use nfi::{print_json, whoami};
 use nfi_api::{JobInfo, JobStatus, PruneRequest};
+use nfi_auth_client::Credentials;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(
@@ -21,10 +24,12 @@ struct Cli {
         global = true
     )]
     url: String,
-    /// Admin bearer token.
-    #[arg(long, env = "NFI_ADMIN_TOKEN", hide_env_values = true, global = true)]
+    /// Admin bearer token (the static admin token or an ID token); takes
+    /// precedence over --token-file and $NFI_ADMIN_TOKEN.
+    #[arg(long, global = true)]
     token: Option<String>,
-    /// Read the admin token from a file.
+    /// Read the admin token from a file; takes precedence over
+    /// $NFI_ADMIN_TOKEN, which holds the token itself.
     #[arg(long, env = "NFI_ADMIN_TOKEN_FILE", global = true)]
     token_file: Option<PathBuf>,
     /// Print raw JSON.
@@ -34,7 +39,7 @@ struct Cli {
     cmd: Cmd,
 }
 
-#[derive(Subcommand, Clone)]
+#[derive(Subcommand)]
 enum Cmd {
     /// Log in to the admin listener with OIDC (device code flow).
     Login {
@@ -42,9 +47,11 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
-    /// Forget the cached login for the admin listener.
+    /// Forget the cached login for the admin listener (and every service
+    /// sharing its OpenID provider and client).
     Logout,
-    /// Show who the admin listener thinks you are.
+    /// Show who the admin listener sees you as, without logging in (exit 1
+    /// when not authenticated).
     Whoami,
     /// Ingest interchange bundles (local files are uploaded; http(s) URLs are fetched by the service).
     Ingest {
@@ -145,14 +152,29 @@ fn print_check(r: &nfi_api::CheckReport) {
     }
 }
 
-async fn check_cmd(client: &Client, do_wait: bool, json: bool) -> Result<Outcome> {
-    let created = client.check().await?;
-    if !do_wait {
-        return submitted(client, created.id, false, json)
-            .await
-            .map(Outcome::from);
+/// The admin API, logging in again when a request gets a 401.
+struct Api {
+    client: Client,
+    creds: Credentials,
+}
+
+impl Api {
+    /// Make one request with the current token (see [`retry`]).
+    async fn call<T, F, Fut>(&self, f: F) -> Result<T>
+    where
+        F: Fn(Client) -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        retry(&self.creds, true, |t| f(self.client.with_token(t))).await
     }
-    let j = wait_job(client, created.id).await?;
+}
+
+async fn check_cmd(api: &Api, do_wait: bool, json: bool) -> Result<Outcome> {
+    let created = api.call(|c| async move { c.check().await }).await?;
+    if !do_wait {
+        return submitted(api, created.id, false, json).await.map(Outcome::from);
+    }
+    let j = wait_job(api, created.id).await?;
     if j.status != JobStatus::Succeeded {
         print_job(&j, json)?;
         return Ok(Outcome::Failed);
@@ -200,26 +222,35 @@ fn print_job(j: &JobInfo, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Wait for a job, printing its progress.
-async fn wait_job(client: &Client, id: i64) -> Result<JobInfo> {
-    client
-        .wait_job(id, |j| {
+/// Poll a job until it finishes, printing its progress.
+async fn wait_job(api: &Api, id: i64) -> Result<JobInfo> {
+    let mut last: Option<String> = None;
+    let mut delay = Duration::from_millis(100);
+    loop {
+        let j = api.call(|c| async move { c.job(id).await }).await?;
+        if j.progress != last {
             if let Some(p) = &j.progress {
                 eprintln!("job {}: {p}", j.id);
             }
-        })
-        .await
+            last = j.progress.clone();
+        }
+        if j.status.is_finished() {
+            return Ok(j);
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(2));
+    }
 }
 
-async fn wait(client: &Client, id: i64, json: bool) -> Result<bool> {
-    let j = wait_job(client, id).await?;
+async fn wait(api: &Api, id: i64, json: bool) -> Result<bool> {
+    let j = wait_job(api, id).await?;
     print_job(&j, json)?;
     Ok(j.status == JobStatus::Succeeded)
 }
 
-async fn submitted(client: &Client, id: i64, do_wait: bool, json: bool) -> Result<bool> {
+async fn submitted(api: &Api, id: i64, do_wait: bool, json: bool) -> Result<bool> {
     if do_wait {
-        wait(client, id, json).await
+        wait(api, id, json).await
     } else {
         if json {
             println!("{}", serde_json::json!({"id": id}));
@@ -230,50 +261,55 @@ async fn submitted(client: &Client, id: i64, do_wait: bool, json: bool) -> Resul
     }
 }
 
+const TOKEN_HINT: &str = "pass --token or --token-file (NFI_ADMIN_TOKEN, NFI_ADMIN_TOKEN_FILE)";
+
 async fn run(cli: Cli) -> Result<Outcome> {
     let token = match cli.token.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
         Some(t) => Some(t.to_string()),
-        None => cli
-            .token_file
-            .as_deref()
-            .map(nfi_auth_client::read_token_file)
-            .transpose()?,
+        None => nfi_auth_client::explicit(cli.token_file.as_deref(), "NFI_ADMIN_TOKEN")?,
     };
-    let login = nfi::auth::Login::new(
-        "nfi-admin",
-        "pass --token or --token-file (NFI_ADMIN_TOKEN, NFI_ADMIN_TOKEN_FILE)",
-        &cli.url,
-        token,
-    )?;
-    match &cli.cmd {
+    let url = &cli.url;
+    let creds = Credentials::new("nfi-admin", url, token, TOKEN_HINT);
+    let ok = match cli.cmd {
         Cmd::Login { force } => {
-            let w = login.login(*force).await?;
-            eprintln!("logged in to {} as {}", cli.url, nfi::auth::describe(&w));
-            return Ok(Outcome::Ok);
+            let w = creds.login(force).await?;
+            eprintln!("logged in to {url} as {}", nfi_auth_client::describe(&w));
+            true
         }
         Cmd::Logout => {
-            if login.logout().await? {
-                eprintln!("logged out of {}", cli.url);
+            if creds.logout().await? {
+                eprintln!("logged out of {url}");
             } else {
-                eprintln!("not logged in to {}", cli.url);
+                eprintln!("not logged in to {url}");
             }
-            return Ok(Outcome::Ok);
+            true
         }
-        Cmd::Whoami => {
-            let w = login.whoami().await?;
-            if cli.json {
-                print_json(&w)?;
-            } else {
-                println!("{}", nfi::auth::describe(&w));
+        Cmd::Whoami => whoami(&creds, url, cli.json).await?,
+        cmd => {
+            if let Cmd::Prune {
+                releases,
+                commits,
+                channels,
+                ..
+            } = &cmd
+                && releases.is_empty()
+                && commits.is_empty()
+                && channels.is_empty()
+            {
+                bail!("specify --release, --commit and/or --channel");
             }
-            return Ok(Outcome::Ok);
+            creds.token(true).await?;
+            let api = Api {
+                client: Client::new(url, None)?,
+                creds,
+            };
+            return exec(cmd, cli.json, &api).await;
         }
-        _ => {}
-    }
-    login.run(|client| exec(cli.cmd.clone(), cli.json, client)).await
+    };
+    Ok(ok.into())
 }
 
-async fn exec(cmd: Cmd, json: bool, client: Client) -> Result<Outcome> {
+async fn exec(cmd: Cmd, json: bool, api: &Api) -> Result<Outcome> {
     let ok = match cmd {
         Cmd::Login { .. } | Cmd::Logout | Cmd::Whoami => unreachable!("handled in run"),
         Cmd::Ingest {
@@ -285,12 +321,13 @@ async fn exec(cmd: Cmd, json: bool, client: Client) -> Result<Outcome> {
             let v2 = v2_closure_type.as_deref();
             for s in &sources {
                 let created = if s.starts_with("http://") || s.starts_with("https://") {
-                    client.ingest_url(s, v2).await?
+                    api.call(|c| async move { c.ingest_url(s, v2).await }).await?
                 } else {
-                    client.ingest_file(Path::new(s), v2).await?
+                    api.call(|c| async move { c.ingest_file(Path::new(s), v2).await })
+                        .await?
                 };
                 eprintln!("{s}: job {}", created.id);
-                ok &= submitted(&client, created.id, wait, json).await?;
+                ok &= submitted(api, created.id, wait, json).await?;
             }
             Ok(ok)
         }
@@ -298,13 +335,13 @@ async fn exec(cmd: Cmd, json: bool, client: Client) -> Result<Outcome> {
             id: Some(id),
             wait: true,
             ..
-        } => wait(&client, id, json).await,
+        } => wait(api, id, json).await,
         Cmd::Jobs { id: Some(id), .. } => {
-            print_job(&client.job(id).await?, json)?;
+            print_job(&api.call(|c| async move { c.job(id).await }).await?, json)?;
             Ok(true)
         }
         Cmd::Jobs { id: None, limit, .. } => {
-            let jobs = client.jobs(limit).await?;
+            let jobs = api.call(|c| async move { c.jobs(limit).await }).await?;
             if json {
                 print_json(&jobs)?;
             } else {
@@ -315,7 +352,10 @@ async fn exec(cmd: Cmd, json: bool, client: Client) -> Result<Outcome> {
             Ok(true)
         }
         Cmd::Releases { channel, errors } => {
-            let rels = client.admin_releases(channel.as_deref(), errors).await?;
+            let channel = channel.as_deref();
+            let rels = api
+                .call(|c| async move { c.admin_releases(channel, errors).await })
+                .await?;
             if json {
                 print_json(&rels)?;
             } else {
@@ -330,23 +370,20 @@ async fn exec(cmd: Cmd, json: bool, client: Client) -> Result<Outcome> {
             closure_types,
             wait,
         } => {
-            let req = PruneRequest {
+            let req = &PruneRequest {
                 releases,
                 commits,
                 channels,
                 closure_types,
             };
-            if req.is_empty() {
-                bail!("specify --release, --commit and/or --channel");
-            }
-            let created = client.prune(&req).await?;
-            submitted(&client, created.id, wait, json).await
+            let created = api.call(|c| async move { c.prune(req).await }).await?;
+            submitted(api, created.id, wait, json).await
         }
         Cmd::Reindex { wait } => {
-            let created = client.reindex().await?;
-            submitted(&client, created.id, wait, json).await
+            let created = api.call(|c| async move { c.reindex().await }).await?;
+            submitted(api, created.id, wait, json).await
         }
-        Cmd::Check { wait } => return check_cmd(&client, wait, json).await,
+        Cmd::Check { wait } => return check_cmd(api, wait, json).await,
     }?;
     Ok(ok.into())
 }

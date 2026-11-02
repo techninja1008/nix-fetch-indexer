@@ -9,6 +9,7 @@ readme.workspace = true
 publish = false
 
 [dependencies]
+nfi-auth.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 axum.workspace = true

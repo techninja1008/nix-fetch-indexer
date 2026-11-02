@@ -47,8 +47,14 @@ async fn serve(script: impl Fn(usize, &[String]) -> Vec<Event> + Send + Sync + '
         requests: Default::default(),
         script: Arc::new(script),
     };
+    let config = || async {
+        axum::Json(
+            serde_json::json!({"issuer": "http://127.0.0.1:1", "client_id": "yoink", "scopes": ["openid"]}),
+        )
+    };
     let app = Router::new()
         .route("/v1/mirror", post(mirror))
+        .route(nfi_auth::CONFIG_PATH, axum::routing::get(config))
         .with_state(f.clone());
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", l.local_addr().unwrap());
@@ -182,12 +188,15 @@ async fn authentication() {
     let (code, err) = yoink(&url, None, std::slice::from_ref(&a)).await;
     assert_eq!(code, 1);
     assert!(
-        err.contains("requires authentication") && err.contains("yoink login"),
+        err.contains("authentication required: run `yoink login`"),
         "{err}"
     );
     let (code, err) = yoink(&url, Some("wrong"), std::slice::from_ref(&a)).await;
     assert_eq!(code, 1);
-    assert!(err.contains("401") && err.contains("yoink login"), "{err}");
+    assert!(
+        err.contains("401") && err.contains("the token was rejected"),
+        "{err}"
+    );
     assert!(fake.requests.lock().unwrap().is_empty());
 
     let (code, err) = yoink(&url, Some("tok"), &["hello@1.0".into()]).await;

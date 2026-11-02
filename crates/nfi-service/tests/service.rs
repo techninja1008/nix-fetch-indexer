@@ -1028,15 +1028,23 @@ async fn reclaimed_job_is_cancelled() {
     let run = tokio::spawn(async move {
         jobs::execute(&p2, job, |_, progress| async move {
             let _guard = guard;
-            progress.set("step 1".into());
-            reached_tx.send(()).unwrap();
-            std::future::pending::<anyhow::Result<Value>>().await
+            let mut reached_tx = Some(reached_tx);
+            // Keep reporting progress so a write after the reclaim notices it
+            // (the first step may already be written before the reclaim).
+            for i in 1.. {
+                progress.set(format!("step {i}"));
+                if let Some(tx) = reached_tx.take() {
+                    tx.send(()).unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            unreachable!()
         })
         .await
     });
     reached.await.unwrap();
     reclaim(&pool, id).await;
-    // The next progress write (within a second) finds the claim gone.
+    // The next progress write (within about a second) finds the claim gone.
     let recorded = tokio::time::timeout(Duration::from_secs(10), run)
         .await
         .expect("job was not cancelled")

@@ -2,16 +2,18 @@
 //!
 //! Tokens are cached per (issuer, client id) in
 //! `$XDG_CACHE_HOME/nfi/tokens/` (mode 0600), so every CLI talking to
-//! services that share an OpenID provider and client shares one login. The
-//! cache also remembers which [`AuthConfig`] each service URL advertised, so
-//! a cached token is sent without asking the service first.
+//! services that share an OpenID provider and client shares one login. A
+//! service's [`AuthConfig`] is fetched once per process, never cached.
 
 use anyhow::{Context, Result, bail};
-use nfi_auth::AuthConfig;
+use nfi_auth::{AuthConfig, Whoami};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use tokio::sync::OnceCell;
 
 /// Tokens expiring within this many seconds are refreshed before use.
 const EXPIRY_MARGIN_SECS: i64 = 60;
@@ -26,11 +28,9 @@ pub struct StoredToken {
     pub refresh_token: Option<String>,
 }
 
-impl StoredToken {
-    /// Whether the ID token is still usable (unknown expiry counts as usable).
-    pub fn is_fresh(&self) -> bool {
-        jwt_expiry(&self.id_token).is_none_or(|exp| exp > now() + EXPIRY_MARGIN_SECS)
-    }
+/// Whether an ID token is still usable (unknown expiry counts as usable).
+fn fresh(token: &str) -> bool {
+    jwt_expiry(token).is_none_or(|exp| exp > now() + EXPIRY_MARGIN_SECS)
 }
 
 fn now() -> i64 {
@@ -47,11 +47,6 @@ fn digest(parts: &[&str]) -> String {
         h.update([0]);
     }
     hex::encode(&h.finalize()[..16])
-}
-
-/// Normalise a service URL for use as a cache key.
-fn service_key(url: &str) -> String {
-    url.trim_end_matches('/').to_string()
 }
 
 /// The on-disk token cache.
@@ -82,14 +77,9 @@ impl TokenStore {
         self.dir.join(format!("{}.json", digest(&[issuer, client_id])))
     }
 
-    fn service_path(&self, url: &str) -> PathBuf {
-        self.dir
-            .join("services")
-            .join(format!("{}.json", digest(&[&service_key(url)])))
-    }
-
-    fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
-        match std::fs::read(path) {
+    pub fn token(&self, issuer: &str, client_id: &str) -> Result<Option<StoredToken>> {
+        let path = self.token_path(issuer, client_id);
+        match std::fs::read(&path) {
             Ok(b) => Ok(Some(
                 serde_json::from_slice(&b).with_context(|| format!("parsing {}", path.display()))?,
             )),
@@ -98,56 +88,40 @@ impl TokenStore {
         }
     }
 
-    /// Write atomically, readable by the owner only.
-    fn write<T: Serialize>(path: &Path, v: &T) -> Result<()> {
-        let dir = path.parent().expect("has a parent");
-        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        let tmp = dir.join(format!(".{}.tmp", std::process::id()));
-        {
-            use std::io::Write;
-            let mut o = std::fs::OpenOptions::new();
-            o.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
-            let mut f = o
-                .open(&tmp)
-                .with_context(|| format!("writing {}", tmp.display()))?;
-            f.write_all(&serde_json::to_vec_pretty(v)?)?;
-        }
-        std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
+    /// Write atomically; the temporary file is created with mode 0600.
+    pub fn save_token(&self, t: &StoredToken) -> Result<()> {
+        use std::io::Write;
+        let path = self.token_path(&t.issuer, &t.client_id);
+        std::fs::create_dir_all(&self.dir).with_context(|| format!("creating {}", self.dir.display()))?;
+        let mut f = tempfile::NamedTempFile::new_in(&self.dir)?;
+        f.write_all(&serde_json::to_vec_pretty(t)?)?;
+        f.persist(&path)
+            .with_context(|| format!("writing {}", path.display()))?;
+        Ok(())
     }
 
-    fn remove(path: &Path) -> Result<bool> {
-        match std::fs::remove_file(path) {
+    pub fn remove_token(&self, issuer: &str, client_id: &str) -> Result<bool> {
+        let path = self.token_path(issuer, client_id);
+        match std::fs::remove_file(&path) {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
         }
     }
 
-    pub fn token(&self, issuer: &str, client_id: &str) -> Result<Option<StoredToken>> {
-        Self::read(&self.token_path(issuer, client_id))
-    }
-
-    pub fn save_token(&self, t: &StoredToken) -> Result<()> {
-        Self::write(&self.token_path(&t.issuer, &t.client_id), t)
-    }
-
-    pub fn remove_token(&self, issuer: &str, client_id: &str) -> Result<bool> {
-        Self::remove(&self.token_path(issuer, client_id))
-    }
-
-    /// The auth settings `url` advertised when last logged in to.
-    pub fn service(&self, url: &str) -> Result<Option<AuthConfig>> {
-        Self::read(&self.service_path(url))
-    }
-
-    pub fn save_service(&self, url: &str, c: &AuthConfig) -> Result<()> {
-        Self::write(&self.service_path(url), c)
-    }
-
-    pub fn remove_service(&self, url: &str) -> Result<bool> {
-        Self::remove(&self.service_path(url))
+    /// Block until this process holds the refresh lock for a login; it is
+    /// released when the file is dropped.
+    fn lock(&self, issuer: &str, client_id: &str) -> Result<std::fs::File> {
+        let path = self.token_path(issuer, client_id).with_extension("lock");
+        std::fs::create_dir_all(&self.dir).with_context(|| format!("creating {}", self.dir.display()))?;
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        f.lock().with_context(|| format!("locking {}", path.display()))?;
+        Ok(f)
     }
 }
 
@@ -205,40 +179,260 @@ struct TokenError {
     error_description: Option<String>,
 }
 
-/// Talks to services and OpenID providers on behalf of a CLI.
-#[derive(Clone)]
-pub struct Session {
-    http: reqwest::Client,
-    store: TokenStore,
+/// What the token cache holds for a service.
+enum Login {
+    Usable(String),
+    Missing,
+    /// A login that expired and could not be refreshed.
+    Expired,
 }
 
-impl Session {
-    pub fn new(store: TokenStore) -> Result<Self> {
-        Ok(Session {
+/// The credentials a CLI sends to one service: an explicit token, or a
+/// login (cached, refreshed, or made on demand).
+pub struct Credentials {
+    tool: &'static str,
+    url: String,
+    explicit: Option<String>,
+    /// How to pass a token explicitly, e.g. "set NFI_TOKEN".
+    token_hint: &'static str,
+    /// `None` when there is nowhere to cache tokens (no HOME).
+    store: Option<TokenStore>,
+    http: reqwest::Client,
+    discovered: OnceCell<Option<AuthConfig>>,
+    current: Mutex<Option<String>>,
+    noted_expiry: AtomicBool,
+}
+
+impl Credentials {
+    /// `tool` is the command to suggest (`{tool} login`).
+    pub fn new(tool: &'static str, url: &str, explicit: Option<String>, token_hint: &'static str) -> Self {
+        Credentials {
+            tool,
+            url: url.trim_end_matches('/').to_string(),
+            explicit,
+            token_hint,
+            store: TokenStore::default_location().ok(),
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(60))
                 .user_agent(concat!("nfi-auth/", env!("CARGO_PKG_VERSION")))
-                .build()?,
-            store,
+                .build()
+                .expect("building the HTTP client"),
+            discovered: OnceCell::new(),
+            current: Mutex::new(None),
+            noted_expiry: AtomicBool::new(false),
+        }
+    }
+
+    /// Use `store` instead of the default token cache.
+    pub fn with_store(mut self, store: TokenStore) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    /// The service's auth settings (fetched once); `None` if it has no OIDC.
+    pub async fn config(&self) -> Result<Option<&AuthConfig>> {
+        let c = self
+            .discovered
+            .get_or_try_init(|| async {
+                let u = format!("{}{}", self.url, nfi_auth::CONFIG_PATH);
+                let r = self
+                    .http
+                    .get(&u)
+                    .send()
+                    .await
+                    .with_context(|| format!("connecting to {}", self.url))?;
+                match r.status() {
+                    s if s.is_success() => Ok(Some(r.json().await.with_context(|| format!("decoding {u}"))?)),
+                    reqwest::StatusCode::NOT_FOUND => Ok(None),
+                    s => bail!("fetching {u}: HTTP {s}"),
+                }
+            })
+            .await?;
+        Ok(c.as_ref())
+    }
+
+    /// The token for a command; logs in (if `prompt` and stderr is a
+    /// terminal) or fails with the hint when one is needed.
+    pub async fn token(&self, prompt: bool) -> Result<Option<String>> {
+        if let Some(t) = &self.explicit {
+            return Ok(Some(t.clone()));
+        }
+        let Some(cfg) = self.config().await? else {
+            return Ok(None);
+        };
+        let expired = match self.stored(cfg).await? {
+            Login::Usable(t) => return Ok(Some(t)),
+            Login::Missing => false,
+            Login::Expired => true,
+        };
+        if cfg.anonymous {
+            if expired && !self.noted_expiry.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "note: the login for {} expired; continuing without it (run `{} login`)",
+                    self.url, self.tool
+                );
+            }
+            return Ok(None);
+        }
+        if self.store.is_none() {
+            bail!(
+                "authentication required: set HOME or NFI_TOKEN_CACHE to log in, or {}",
+                self.token_hint
+            );
+        }
+        if prompt && interactive() {
+            return self.device(cfg).await.map(Some);
+        }
+        bail!("{}", self.hint())
+    }
+
+    /// A usable login if there is one (refreshing it), never prompting or
+    /// failing for lack of one (for `whoami`).
+    pub async fn current(&self) -> Result<Option<String>> {
+        if let Some(t) = &self.explicit {
+            return Ok(Some(t.clone()));
+        }
+        let Some(cfg) = self.config().await? else {
+            return Ok(None);
+        };
+        Ok(match self.stored(cfg).await? {
+            Login::Usable(t) => Some(t),
+            Login::Missing | Login::Expired => None,
         })
     }
 
-    pub fn store(&self) -> &TokenStore {
-        &self.store
+    /// Log in: unless `force`, keep a cached login the service accepts;
+    /// otherwise run the device flow. Returns who the service sees.
+    pub async fn login(&self, force: bool) -> Result<Whoami> {
+        let cfg = self
+            .config()
+            .await?
+            .with_context(|| format!("{} does not use OIDC login", self.url))?;
+        if !force
+            && let Login::Usable(t) = self.stored(cfg).await?
+            && let Some(w) = self.whoami(&t).await?
+        {
+            return Ok(w);
+        }
+        let t = self.device(cfg).await?;
+        self.whoami(&t)
+            .await?
+            .with_context(|| format!("{} rejected the new login", self.url))
     }
 
-    /// The auth settings a service advertises; `None` if it has no OIDC.
-    pub async fn discover(&self, url: &str) -> Result<Option<AuthConfig>> {
-        let u = format!("{}{}", service_key(url), nfi_auth::CONFIG_PATH);
+    /// Forget the provider login the service uses (and so the login of
+    /// every service sharing it). Returns whether there was one.
+    pub async fn logout(&self) -> Result<bool> {
+        *self.current.lock().unwrap() = None;
+        match (self.config().await?, &self.store) {
+            (Some(cfg), Some(store)) => store.remove_token(&cfg.issuer, &cfg.client_id),
+            _ => Ok(false),
+        }
+    }
+
+    /// After a 401: forget the token in use and log in again, if that is
+    /// possible (no explicit token, OIDC, stderr a terminal).
+    pub async fn relogin(&self) -> Result<Option<String>> {
+        *self.current.lock().unwrap() = None;
+        if self.explicit.is_some() || !interactive() {
+            return Ok(None);
+        }
+        match self.config().await? {
+            Some(cfg) => self.device(cfg).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// What to do about a 401.
+    pub fn hint(&self) -> String {
+        if self.explicit.is_some() {
+            return "the token was rejected".into();
+        }
+        match self.discovered.get() {
+            Some(Some(_)) => format!(
+                "authentication required: run `{} login` or {}",
+                self.tool, self.token_hint
+            ),
+            _ => format!("authentication required: {}", self.token_hint),
+        }
+    }
+
+    fn remember(&self, t: String) -> String {
+        *self.current.lock().unwrap() = Some(t.clone());
+        t
+    }
+
+    /// The token held in memory or the cache, refreshing it if needed.
+    async fn stored(&self, cfg: &AuthConfig) -> Result<Login> {
+        if let Some(t) = self.current.lock().unwrap().clone()
+            && fresh(&t)
+        {
+            return Ok(Login::Usable(t));
+        }
+        let Some(store) = &self.store else {
+            return Ok(Login::Missing);
+        };
+        match store.token(&cfg.issuer, &cfg.client_id)? {
+            None => return Ok(Login::Missing),
+            Some(t) if fresh(&t.id_token) => return Ok(Login::Usable(self.remember(t.id_token))),
+            Some(StoredToken {
+                refresh_token: None, ..
+            }) => return Ok(Login::Expired),
+            Some(_) => {}
+        }
+        let (s, i, c) = (store.clone(), cfg.issuer.clone(), cfg.client_id.clone());
+        let _lock = tokio::task::spawn_blocking(move || s.lock(&i, &c)).await??;
+        // Another process may have refreshed it meanwhile.
+        let Some(t) = store.token(&cfg.issuer, &cfg.client_id)? else {
+            return Ok(Login::Missing);
+        };
+        if fresh(&t.id_token) {
+            return Ok(Login::Usable(self.remember(t.id_token)));
+        }
+        let Some(rt) = &t.refresh_token else {
+            return Ok(Login::Expired);
+        };
+        match self.refresh(cfg, rt).await {
+            Ok(Some(t)) => {
+                store.save_token(&t)?;
+                Ok(Login::Usable(self.remember(t.id_token)))
+            }
+            Ok(None) => {
+                store.remove_token(&cfg.issuer, &cfg.client_id)?;
+                Ok(Login::Expired)
+            }
+            Err(e) if cfg.anonymous => {
+                eprintln!("warning: not using the login for {}: {e:#}", self.url);
+                Ok(Login::Missing)
+            }
+            Err(e) => Err(e.context(format!("refreshing the login for {}", self.url))),
+        }
+    }
+
+    /// Run the device flow (prompting on stderr) and cache the login.
+    async fn device(&self, cfg: &AuthConfig) -> Result<String> {
+        let store = self
+            .store
+            .as_ref()
+            .context("no token cache: set HOME, XDG_CACHE_HOME or NFI_TOKEN_CACHE")?;
+        let t = self.device_login(cfg).await?;
+        store.save_token(&t)?;
+        Ok(self.remember(t.id_token))
+    }
+
+    /// Who the service sees with `token`; `None` on a 401.
+    async fn whoami(&self, token: &str) -> Result<Option<Whoami>> {
+        let u = format!("{}{}", self.url, nfi_auth::WHOAMI_PATH);
         let r = self
             .http
             .get(&u)
+            .bearer_auth(token)
             .send()
             .await
-            .with_context(|| format!("connecting to {url}"))?;
+            .with_context(|| format!("connecting to {}", self.url))?;
         match r.status() {
+            reqwest::StatusCode::UNAUTHORIZED => Ok(None),
             s if s.is_success() => Ok(Some(r.json().await.with_context(|| format!("decoding {u}"))?)),
-            reqwest::StatusCode::NOT_FOUND => Ok(None),
             s => bail!("fetching {u}: HTTP {s}"),
         }
     }
@@ -258,38 +452,6 @@ impl Session {
             bail!("fetching {u}: HTTP {}", r.status());
         }
         r.json().await.with_context(|| format!("decoding {u}"))
-    }
-
-    /// A cached, fresh ID token for a service, refreshing it if needed.
-    /// `None` if the service was never logged in to or the login expired.
-    pub async fn cached_token(&self, url: &str) -> Result<Option<String>> {
-        let Some(cfg) = self.store.service(url)? else {
-            return Ok(None);
-        };
-        self.cached_token_for(&cfg).await
-    }
-
-    /// [`Session::cached_token`] for known auth settings.
-    pub async fn cached_token_for(&self, cfg: &AuthConfig) -> Result<Option<String>> {
-        let Some(t) = self.store.token(&cfg.issuer, &cfg.client_id)? else {
-            return Ok(None);
-        };
-        if t.is_fresh() {
-            return Ok(Some(t.id_token));
-        }
-        let Some(rt) = &t.refresh_token else {
-            return Ok(None);
-        };
-        match self.refresh(cfg, rt).await {
-            Ok(Some(t)) => {
-                self.store.save_token(&t)?;
-                Ok(Some(t.id_token))
-            }
-            Ok(None) => Ok(None),
-            // A rejected refresh token means logging in again; keep going
-            // without a token rather than failing the command.
-            Err(_) => Ok(None),
-        }
     }
 
     async fn token_request(
@@ -321,7 +483,8 @@ impl Session {
         }
     }
 
-    /// Use a refresh token. `None` if the provider issued no new ID token.
+    /// Use a refresh token. `None` if the provider rejects it or issues no
+    /// new ID token.
     async fn refresh(&self, cfg: &AuthConfig, refresh_token: &str) -> Result<Option<StoredToken>> {
         let md = self.metadata(&cfg.issuer).await?;
         let scope = cfg.scopes.join(" ");
@@ -336,25 +499,18 @@ impl Session {
                 ],
             )
             .await?;
-        let t = match r {
-            Ok(t) => t,
-            Err(e) => bail!("refreshing token: {}", e.error),
-        };
-        Ok(t.id_token.map(|id| StoredToken {
-            issuer: cfg.issuer.clone(),
-            client_id: cfg.client_id.clone(),
-            id_token: id,
-            refresh_token: t.refresh_token.or_else(|| Some(refresh_token.to_string())),
+        Ok(r.ok().and_then(|t| {
+            Some(StoredToken {
+                issuer: cfg.issuer.clone(),
+                client_id: cfg.client_id.clone(),
+                id_token: t.id_token?,
+                refresh_token: t.refresh_token.or_else(|| Some(refresh_token.to_string())),
+            })
         }))
     }
 
-    /// Run the device authorization grant, calling `prompt` once the user
-    /// has something to do, and cache the result.
-    pub async fn device_login(
-        &self,
-        cfg: &AuthConfig,
-        prompt: impl FnOnce(&DevicePrompt),
-    ) -> Result<StoredToken> {
+    /// The device authorization grant, prompting on stderr.
+    async fn device_login(&self, cfg: &AuthConfig) -> Result<StoredToken> {
         let md = self.metadata(&cfg.issuer).await?;
         let Some(dev_ep) = &md.device_authorization_endpoint else {
             bail!("{} does not support the device authorization grant", cfg.issuer);
@@ -376,11 +532,14 @@ impl Session {
             );
         }
         let d: DeviceAuthorization = r.json().await.context("decoding device authorization")?;
-        prompt(&DevicePrompt {
-            verification_uri: d.verification_uri.clone(),
-            verification_uri_complete: d.verification_uri_complete.clone(),
-            user_code: d.user_code.clone(),
-        });
+        eprintln!(
+            "{}",
+            DevicePrompt {
+                verification_uri: d.verification_uri.clone(),
+                verification_uri_complete: d.verification_uri_complete.clone(),
+                user_code: d.user_code.clone(),
+            }
+        );
         let deadline = std::time::Instant::now() + Duration::from_secs(d.expires_in.unwrap_or(600));
         let mut interval = Duration::from_secs(d.interval.unwrap_or(5));
         loop {
@@ -403,14 +562,12 @@ impl Session {
                     let Some(id) = t.id_token else {
                         bail!("{} issued no ID token (is the openid scope allowed?)", cfg.issuer);
                     };
-                    let t = StoredToken {
+                    return Ok(StoredToken {
                         issuer: cfg.issuer.clone(),
                         client_id: cfg.client_id.clone(),
                         id_token: id,
                         refresh_token: t.refresh_token,
-                    };
-                    self.store.save_token(&t)?;
-                    return Ok(t);
+                    });
                 }
                 Err(e) if e.error == "authorization_pending" => {}
                 Err(e) if e.error == "slow_down" => interval += Duration::from_secs(5),
@@ -422,74 +579,13 @@ impl Session {
             }
         }
     }
+}
 
-    /// Log in to a service: discover its settings, reuse a cached login for
-    /// the same provider and client if there is one (unless `force`), and
-    /// otherwise run the device grant. Remembers the service's settings.
-    pub async fn login(
-        &self,
-        url: &str,
-        force: bool,
-        prompt: impl FnOnce(&DevicePrompt),
-    ) -> Result<(AuthConfig, String)> {
-        let Some(cfg) = self.discover(url).await? else {
-            bail!("{url} does not use OIDC login");
-        };
-        let t = self.login_with(url, &cfg, force, prompt).await?;
-        Ok((cfg, t))
-    }
-
-    /// [`Session::login`] with already discovered settings.
-    async fn login_with(
-        &self,
-        url: &str,
-        cfg: &AuthConfig,
-        force: bool,
-        prompt: impl FnOnce(&DevicePrompt),
-    ) -> Result<String> {
-        self.store.save_service(url, cfg)?;
-        if !force && let Some(t) = self.cached_token_for(cfg).await? {
-            return Ok(t);
-        }
-        Ok(self.device_login(cfg, prompt).await?.id_token)
-    }
-
-    /// The token to send to a service: `explicit` (e.g. from `--token-file`
-    /// or the environment) if given, else a cached login.
-    pub async fn bearer(&self, url: &str, explicit: Option<String>) -> Result<Option<String>> {
-        match explicit {
-            Some(t) => Ok(Some(t)),
-            None => self.cached_token(url).await,
-        }
-    }
-
-    /// After a 401 from a service: log in interactively (prompting on
-    /// stderr) if this is a terminal and the service uses OIDC. `rejected`
-    /// says whether a token was sent and refused, in which case a cached
-    /// login for the same provider is not reused. `None` if no login is
-    /// possible.
-    pub async fn relogin(&self, url: &str, rejected: bool) -> Result<Option<String>> {
-        if !interactive() {
-            return Ok(None);
-        }
-        let Some(cfg) = self.discover(url).await? else {
-            return Ok(None);
-        };
-        let t = self.login_with(url, &cfg, rejected, |p| eprintln!("{p}")).await?;
-        Ok(Some(t))
-    }
-
-    /// Forget a service's login. Returns whether there was one.
-    pub async fn logout(&self, url: &str) -> Result<bool> {
-        let cfg = match self.store.service(url)? {
-            Some(c) => Some(c),
-            None => self.discover(url).await.ok().flatten(),
-        };
-        let mut removed = self.store.remove_service(url)?;
-        if let Some(c) = cfg {
-            removed |= self.store.remove_token(&c.issuer, &c.client_id)?;
-        }
-        Ok(removed)
+/// `alice` or `alice (session s1)`.
+pub fn describe(w: &Whoami) -> String {
+    match &w.session {
+        Some(s) => format!("{} (session {s})", w.username),
+        None => w.username.clone(),
     }
 }
 
@@ -551,14 +647,6 @@ mod tests {
         s.save_token(&t).unwrap();
         assert_eq!(s.token("i", "c").unwrap().unwrap().id_token, "x.e30.y");
         assert!(s.token("i", "other").unwrap().is_none());
-        let c = AuthConfig {
-            issuer: "i".into(),
-            client_id: "c".into(),
-            scopes: vec!["openid".into()],
-            anonymous: false,
-        };
-        s.save_service("http://svc/", &c).unwrap();
-        assert_eq!(s.service("http://svc").unwrap(), Some(c));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

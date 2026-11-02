@@ -1984,6 +1984,7 @@ name = "nfi-admin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "nfi",
  "nfi-api",
@@ -2027,6 +2028,7 @@ dependencies = [
  "base64 0.22.1",
  "hex",
  "nfi-auth",
+ "nfi-test-support",
  "reqwest",
  "serde",
  "serde_json",
@@ -2173,6 +2175,7 @@ dependencies = [
  "axum",
  "jsonwebtoken",
  "libc",
+ "nfi-auth",
  "serde_json",
  "tokio",
 ]

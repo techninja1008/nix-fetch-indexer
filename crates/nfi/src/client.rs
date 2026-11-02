@@ -18,9 +18,12 @@ impl Client {
         &self.base
     }
 
-    /// Whether requests carry a bearer token.
-    pub fn has_token(&self) -> bool {
-        self.token.is_some()
+    /// The same client (sharing its connections) sending `token`.
+    pub fn with_token(&self, token: Option<String>) -> Self {
+        Self {
+            token,
+            ..self.clone()
+        }
     }
 
     pub fn new(base: &str, token: Option<String>) -> Result<Self> {
@@ -177,23 +180,5 @@ impl Client {
     pub async fn check(&self) -> Result<JobCreated> {
         self.send(self.req(reqwest::Method::POST, "/admin/v1/check"))
             .await
-    }
-
-    /// Poll a job until it finishes, calling `on_progress` when its progress changes.
-    pub async fn wait_job(&self, id: i64, mut on_progress: impl FnMut(&JobInfo)) -> Result<JobInfo> {
-        let mut last: Option<String> = None;
-        let mut delay = Duration::from_millis(100);
-        loop {
-            let j = self.job(id).await?;
-            if j.progress != last {
-                on_progress(&j);
-                last = j.progress.clone();
-            }
-            if j.status.is_finished() {
-                return Ok(j);
-            }
-            tokio::time::sleep(delay).await;
-            delay = (delay * 2).min(Duration::from_secs(2));
-        }
     }
 }

@@ -429,15 +429,16 @@ nix derivation show --recursive .#foo | nfi minimise -f -
 
 ```sh
 nfi login            # device code flow; prints a URL and code to approve
-nfi whoami           # alice (session ...)
+nfi whoami           # http://...: alice (session ...), then the service's additional_info
 nfi logout
 NFI_TOKEN=$CI_ID_TOKEN nfi releases     # or --token-file / NFI_TOKEN_FILE
 ```
 
-- Tokens: an explicit token (`NFI_TOKEN`, `--token-file`) is sent as is, e.g. an ID token issued to CI with the service's client id as its audience. Otherwise a cached login is used, and refreshed when it expires.
-- Cache: `$XDG_CACHE_HOME/nfi/tokens` (or `$NFI_TOKEN_CACHE`), keyed by provider and client, so `nfi`, `nfi-admin` and `yoink` share a login when their services use the same provider and client. `login` reuses a valid cached login for the same provider unless `--force` is given.
-- On a 401, an interactive CLI (stdin and stderr are terminals) without an explicit token logs in and retries the command once; otherwise it fails and suggests `nfi login`.
-- `nfi-admin` has the same `login`, `logout` and `whoami` commands for the admin listener, and keeps `--token`/`NFI_ADMIN_TOKEN` and `--token-file`/`NFI_ADMIN_TOKEN_FILE` for an explicit token (the static admin token or an ID token).
+- Tokens: an explicit token is sent as is, e.g. an ID token issued to CI with the service's client id as its audience. Precedence: a token on the command line (`nfi-admin --token`), then a token file (`--token-file` or its `*_TOKEN_FILE` variable), then the token variable (`NFI_TOKEN`, `NFI_ADMIN_TOKEN`, `YOINK_TOKEN`); values are trimmed and an empty variable counts as unset. Otherwise the CLI asks the service for its login settings (once per run) and uses a cached login, refreshing it when it has less than a minute left.
+- Cache: `$XDG_CACHE_HOME/nfi/tokens` (or `$NFI_TOKEN_CACHE`), keyed by provider and client, so `nfi`, `nfi-admin` and `yoink` share a login when their services use the same provider and client (even for a service never logged in to by name). `login` keeps a cached login the service still accepts unless `--force` is given. `logout` removes the provider login, so it logs out of every service sharing that provider and client.
+- Prompting: when a command needs a login and there is none, a CLI whose stderr is a terminal runs the device flow up front, before reading stdin, evaluating anything or uploading (stdin may be a pipe); otherwise it fails and suggests `nfi login`. If the service rejects a cached login with a 401, the CLI logs in again once and repeats that one request (never the whole command); an explicit token that is rejected fails with no prompt.
+- `whoami` never logs in: it prints `<url>: <username>` (and the session, if any), then the service's `additional_info` as indented JSON (`--json`: the whole response); `<url>: not authenticated` with exit status 1 without a valid login; `<url>: does not use login` for a listener without OIDC.
+- `nfi-admin` has the same `login`, `logout` and `whoami` commands for the admin listener, and keeps `--token`, `--token-file`/`NFI_ADMIN_TOKEN_FILE` and `NFI_ADMIN_TOKEN` for an explicit token (the static admin token or an ID token).
 
 **Admin CLI**
 
@@ -458,7 +459,7 @@ yoink pulls the dependencies of a flake into a binary cache you control, so that
 
 ```sh
 export YOINK_URL=https://yoink.example NFI_URL=https://nfi.example
-yoink login                       # OIDC device flow (also logs in to NFI if it uses another provider/client)
+yoink login [--force]             # OIDC device flow for the yoink service and NFI (once per provider/client)
 yoink nixpkgs#hello .#devShells.x86_64-linux.default
 yoink .                           # the current flake's default package
 yoink 'pkg:nix/%2Fnix%2Fstore%2F0xy6xjvbl4bm3pq4w6p2b6vfffw4vi9b-hello-2.12.3'

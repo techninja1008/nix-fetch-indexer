@@ -1,5 +1,10 @@
 //! The admin CLI against an OIDC-protected admin listener.
 
+use axum::Router;
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
 use nfi_auth_client::{StoredToken, TokenStore};
 use nfi_auth_server::{Authenticator, Expr, OidcSettings};
 use nfi_service::auth::{AdminAuth, ServiceAuth};
@@ -7,6 +12,7 @@ use nfi_test_support::MockIdp;
 use serde_json::json;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 struct Out {
     code: i32,
@@ -47,26 +53,17 @@ async fn tokens() {
         return;
     };
     let d = tempfile::tempdir().unwrap();
-    let store = TokenStore::at(d.path().join("tokens"));
-    let cfg: nfi_auth::AuthConfig = reqwest::get(format!("{}{}", svc.admin_url, nfi_auth::CONFIG_PATH))
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    // A login made with `nfi login` for the public listener.
-    store.save_service(&svc.public_url, &cfg).unwrap();
-    store
+    // A login made with `nfi login` for the public listener: the admin CLI
+    // shares it (same provider and client), even without a terminal; bob
+    // fails the admin policy.
+    TokenStore::at(d.path().join("tokens"))
         .save_token(&StoredToken {
-            issuer: cfg.issuer.clone(),
-            client_id: cfg.client_id.clone(),
+            issuer: idp.issuer().into(),
+            client_id: idp.client_id().into(),
             id_token: idp.token(json!({"sub": "2", "preferred_username": "bob"})),
             refresh_token: None,
         })
         .unwrap();
-
-    // The admin CLI shares the login (same provider and client) once it
-    // knows the admin listener uses it; bob fails the admin policy.
     let admin = |env: &[(&str, &str)], args: &[&str]| {
         let mut a = vec!["--url", svc.admin_url.as_str()];
         a.extend_from_slice(args);
@@ -74,14 +71,103 @@ async fn tokens() {
     };
     let o = admin(&[], &["jobs"]);
     assert_eq!(o.code, 1);
-    assert!(o.stderr.contains("run `nfi-admin login`"), "{}", o.stderr);
-    store.save_service(&svc.admin_url, &cfg).unwrap();
-    let o = admin(&[], &["jobs"]);
-    assert_eq!(o.code, 1);
     assert!(o.stderr.contains("403"), "{}", o.stderr);
     let root = idp.token(json!({"sub": "0", "preferred_username": "root"}));
     let o = admin(&[("NFI_ADMIN_TOKEN", &root)], &["jobs"]);
     assert_eq!(o.code, 0, "{}", o.stderr);
     let o = admin(&[("NFI_ADMIN_TOKEN", &root)], &["whoami"]);
-    assert_eq!(o.stdout.trim(), "root");
+    assert!(
+        o.stdout.starts_with(&format!("{}: root\n", svc.admin_url)),
+        "{}",
+        o.stdout
+    );
+    // --token takes precedence over the environment.
+    let o = admin(&[("NFI_ADMIN_TOKEN", "garbage")], &["--token", &root, "jobs"]);
+    assert_eq!(o.code, 0, "{}", o.stderr);
+}
+
+/// A fake admin listener: ingesting URLs gives job ids; once a token has
+/// been used to ingest, it is rejected (as if it had been revoked).
+#[derive(Clone, Default)]
+struct Fake {
+    idp: Option<MockIdp>,
+    ingested: Arc<Mutex<Vec<String>>>,
+    revoked: Arc<Mutex<Vec<String>>>,
+}
+
+async fn fake_config(State(f): State<Fake>) -> Response {
+    let idp = f.idp.unwrap();
+    axum::Json(json!({"issuer": idp.issuer(), "client_id": idp.client_id(), "scopes": ["openid"]}))
+        .into_response()
+}
+
+async fn fake_ingest(
+    State(f): State<Fake>,
+    h: HeaderMap,
+    axum::Json(r): axum::Json<serde_json::Value>,
+) -> Response {
+    let token = h
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or_default()
+        .to_string();
+    if token.is_empty() || f.revoked.lock().unwrap().contains(&token) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"error": "invalid token"})),
+        )
+            .into_response();
+    }
+    f.revoked.lock().unwrap().push(token);
+    let mut i = f.ingested.lock().unwrap();
+    i.push(r["url"].as_str().unwrap().to_string());
+    axum::Json(json!({"id": i.len()})).into_response()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rejected_login_mid_command() {
+    let idp = MockIdp::start("nfi").await;
+    let fake = Fake {
+        idp: Some(idp.clone()),
+        ..Default::default()
+    };
+    let app = Router::new()
+        .route(nfi_auth::CONFIG_PATH, get(fake_config))
+        .route("/admin/v1/ingest", post(fake_ingest))
+        .with_state(fake.clone());
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+
+    let d = tempfile::tempdir().unwrap();
+    TokenStore::at(d.path().join("tokens"))
+        .save_token(&StoredToken {
+            issuer: idp.issuer().into(),
+            client_id: idp.client_id().into(),
+            id_token: idp.token(json!({"sub": "2", "preferred_username": "bob"})),
+            refresh_token: None,
+        })
+        .unwrap();
+    let mut c = Command::new(env!("CARGO_BIN_EXE_nfi-admin"));
+    c.args(["--url", &url, "ingest", "https://x/a.nfib", "https://x/b.nfib"])
+        .env("XDG_CONFIG_HOME", d.path())
+        .env("NFI_TOKEN_CACHE", d.path().join("tokens"))
+        .env_remove("NFI_ADMIN_TOKEN")
+        .env_remove("NFI_ADMIN_TOKEN_FILE");
+    let o = tokio::task::spawn_blocking(move || {
+        nfi_test_support::pty::run(c, 100, 30, std::time::Duration::from_secs(60))
+    })
+    .await
+    .unwrap();
+
+    // The second ingest got a 401: one login, then only it was retried.
+    assert_eq!(o.code, Some(0), "{}", o.text);
+    assert_eq!(o.text.matches("To log in, open").count(), 1, "{}", o.text);
+    assert_eq!(idp.device_logins(), 1);
+    assert_eq!(
+        *fake.ingested.lock().unwrap(),
+        ["https://x/a.nfib", "https://x/b.nfib"]
+    );
+    assert!(o.text.contains("https://x/b.nfib: job 2"), "{}", o.text);
 }
