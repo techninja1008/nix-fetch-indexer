@@ -351,7 +351,7 @@ Both listeners are open by default. Optionally, callers log in with OIDC (the de
 **Bulk lookup details**
 
 - Output selection: the default is `out`, or all outputs when there is no `out`. `["*"]` selects all outputs.
-- Item statuses: `ok`, `unknown_commit`, `unknown_attr`, `no_outpaths`, `not_cached`. Every item's commit must be a full 40-character hex hash (`attr@commit` is lockfile-style, so it must be unambiguous); a request with any other commit, prefixes included, is rejected with a 400 naming the offending items.
+- Item statuses: `ok`, `unknown_commit`, `unknown_attr`, `no_outpaths`, `not_cached`, `unknown_output` (a requested output doesn't exist; the item lists `missing_outputs` and `available_outputs` and adds nothing to the closure). Every item's commit must be a full 40-character hex hash (`attr@commit` is lockfile-style, so it must be unambiguous); a request with any other commit, prefixes included, is rejected with a 400 naming the offending items.
 
 **Minimise algorithm**
 

@@ -450,6 +450,8 @@ pub async fn bulk(pool: &PgPool, req: &BulkRequest) -> Result<std::result::Resul
             status: ItemStatus::Ok,
             release: None,
             outputs: BTreeMap::new(),
+            missing_outputs: vec![],
+            available_outputs: vec![],
         };
         let Some(release) = commits[&commit].clone() else {
             res.status = ItemStatus::UnknownCommit;
@@ -465,6 +467,20 @@ pub async fn bulk(pool: &PgPool, req: &BulkRequest) -> Result<std::result::Resul
             } else {
                 ItemStatus::UnknownAttr
             };
+            items.push(res);
+            continue;
+        }
+        let missing: Vec<String> = it
+            .outputs
+            .iter()
+            .flatten()
+            .filter(|o| *o != "*" && !outs.contains_key(*o))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            res.status = ItemStatus::UnknownOutput;
+            res.missing_outputs = missing;
+            res.available_outputs = outs.into_keys().collect();
             items.push(res);
             continue;
         }

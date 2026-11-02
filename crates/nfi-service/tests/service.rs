@@ -181,6 +181,8 @@ async fn ingest_lookup_bulk_minimise_prune() {
                 {"attr": "nooutpaths", "commit": A},
                 {"attr": "hello", "commit": "d".repeat(40)},
                 {"attr": "hello", "commit": A.to_uppercase()},
+                {"attr": "curl", "commit": A, "outputs": ["lib"]},
+                {"attr": "curl", "commit": A, "outputs": ["out", "lib", "man"]},
             ]}),
         )
         .await;
@@ -196,8 +198,18 @@ async fn ingest_lookup_bulk_minimise_prune() {
             ItemStatus::NoOutpaths,
             ItemStatus::UnknownCommit,
             ItemStatus::Ok,
+            ItemStatus::UnknownOutput,
+            ItemStatus::UnknownOutput,
         ]
     );
+    // A requested output that doesn't exist fails the item, which names the
+    // missing outputs and the existing ones, and selects nothing.
+    for (i, missing) in [(7, vec!["lib"]), (8, vec!["lib", "man"])] {
+        let it = &bulk.items[i];
+        assert_eq!(it.missing_outputs, missing, "item {i}");
+        assert_eq!(it.available_outputs, ["dev", "out"], "item {i}");
+        assert!(it.outputs.is_empty(), "item {i}");
+    }
     // Items echo the release's (lowercase) commit once resolved.
     assert_eq!(bulk.items[6].commit, A);
     assert_eq!(bulk.items[6].release, bulk.items[0].release);

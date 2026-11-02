@@ -84,9 +84,8 @@ impl Client {
                     Ok(b) => parser
                         .feed(&b)
                         .into_iter()
-                        .filter_map(|(name, data)| {
-                            from_sse(&name, &data)
-                                .map(|r| r.with_context(|| format!("decoding {name} event")))
+                        .map(|(name, data)| {
+                            serde_json::from_str(&data).with_context(|| format!("decoding {name} event"))
                         })
                         .collect(),
                 }
@@ -94,21 +93,6 @@ impl Client {
             .flat_map(futures::stream::iter);
         Ok(s.boxed())
     }
-}
-
-/// Parse an SSE event; `None` for event names this version doesn't know.
-pub fn from_sse(name: &str, data: &str) -> Option<serde_json::Result<Event>> {
-    if !matches!(name, "phases" | "status" | "log" | "result") {
-        return None;
-    }
-    let mut v: serde_json::Value = match serde_json::from_str(data) {
-        Ok(v) => v,
-        Err(e) => return Some(Err(e)),
-    };
-    if let Some(o) = v.as_object_mut() {
-        o.insert("event".into(), name.into());
-    }
-    Some(serde_json::from_value(v))
 }
 
 /// Incremental Server-Sent Events parser.

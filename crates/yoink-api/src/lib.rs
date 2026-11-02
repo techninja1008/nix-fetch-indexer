@@ -92,7 +92,7 @@ pub enum Outcome {
 }
 
 /// An event of the mirror stream. The SSE event name is [`Event::name`];
-/// its data is the JSON of the variant's fields.
+/// its data is the event's JSON, tag included.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {

@@ -367,7 +367,19 @@ async fn exec(cmd: Cmd, json: bool, cfg: &Config, client: &Client, creds: &Crede
             let r = retry(creds, |t| async { client.with_token(t).bulk(&req).await }).await?;
             let failed: Vec<_> = r.items.iter().filter(|i| i.status != ItemStatus::Ok).collect();
             for i in &failed {
-                eprintln!("warning: {}@{} ({}): {:?}", i.attr, i.commit, i.system, i.status);
+                let outputs = if i.status == ItemStatus::UnknownOutput {
+                    format!(
+                        ": no output {} (has {})",
+                        i.missing_outputs.join(", "),
+                        i.available_outputs.join(", ")
+                    )
+                } else {
+                    String::new()
+                };
+                eprintln!(
+                    "warning: {}@{} ({}): {:?}{outputs}",
+                    i.attr, i.commit, i.system, i.status
+                );
             }
             if json {
                 print_json(&r)?;

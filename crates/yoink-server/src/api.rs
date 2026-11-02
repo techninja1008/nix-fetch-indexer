@@ -134,19 +134,11 @@ fn fatal(purl: &str, message: String) -> Vec<Event> {
     ]
 }
 
-/// The SSE `data:` payload of `e` (the fields without the tag).
-pub fn event_data(e: &Event) -> String {
-    let mut v = serde_json::to_value(e).expect("serialisable");
-    if let Some(o) = v.as_object_mut() {
-        o.remove("event");
-    }
-    v.to_string()
-}
-
 fn sse(e: &Event) -> axum::response::sse::Event {
     axum::response::sse::Event::default()
         .event(e.name())
-        .data(event_data(e))
+        .json_data(e)
+        .expect("serialisable")
 }
 
 /// `p` for CEL policies: `{type, namespace, name, version, qualifiers, subpath}`.

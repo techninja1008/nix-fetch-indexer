@@ -177,6 +177,8 @@ pub enum ItemStatus {
     NoOutpaths,
     /// Out paths are known but (some of) them are not in the cache.
     NotCached,
+    /// Some requested outputs don't exist (see `missing_outputs`).
+    UnknownOutput,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -189,6 +191,12 @@ pub struct BulkItemResult {
     pub release: Option<String>,
     /// Selected outputs to full store paths.
     pub outputs: BTreeMap<String, OutputInfo>,
+    /// With `unknown_output`: the requested outputs that don't exist, and
+    /// the outputs that do.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_outputs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_outputs: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

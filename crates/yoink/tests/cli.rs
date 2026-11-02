@@ -8,7 +8,6 @@ use axum::routing::post;
 use std::sync::{Arc, Mutex};
 use yoink_api::{Event, LogLevel, MirrorRequest, Outcome, PhaseDef, Progress, Unit};
 use yoink_purl::Purl;
-use yoink_server::api::event_data;
 
 type Script = dyn Fn(usize, &[String]) -> Vec<Event> + Send + Sync;
 
@@ -37,7 +36,13 @@ async fn mirror(
     };
     let body: String = (f.script)(n, &r.purls)
         .iter()
-        .map(|e| format!("event: {}\ndata: {}\n\n", e.name(), event_data(e)))
+        .map(|e| {
+            format!(
+                "event: {}\ndata: {}\n\n",
+                e.name(),
+                serde_json::to_string(e).unwrap()
+            )
+        })
         .collect();
     ([(header::CONTENT_TYPE, "text/event-stream")], body).into_response()
 }

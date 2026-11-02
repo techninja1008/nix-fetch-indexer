@@ -23,7 +23,6 @@ use std::time::{Duration, Instant};
 pub struct Services {
     pub pg_admin_url: Option<String>,
     pub meili_url: Option<String>,
-    _dir: Option<tempfile::TempDir>,
 }
 
 static SERVICES: OnceLock<Services> = OnceLock::new();
@@ -56,6 +55,44 @@ fn watchdog(pid: u32, signal: &str) {
         .arg(format!(
             "while kill -0 {me} 2>/dev/null; do sleep 1; done; kill -{signal} {pid} 2>/dev/null; sleep 5; kill -9 {pid} 2>/dev/null"
         ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
+/// Stop the postmaster of the cluster in `data` once this test process
+/// exits. Its pid comes from `postmaster.pid`: as root it runs under
+/// `runuser`, whose pid is not the postmaster's.
+fn stop_postgres_on_exit(data: &Path) {
+    let me = std::process::id();
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg(
+            r#"while kill -0 "$1" 2>/dev/null; do sleep 1; done
+pid=$(head -n1 "$2/postmaster.pid" 2>/dev/null) || exit 0
+kill -INT "$pid" 2>/dev/null; sleep 5; kill -9 "$pid" 2>/dev/null"#,
+        )
+        .arg("sh")
+        .arg(me.to_string())
+        .arg(data)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
+/// Remove `dir` once this test process exits and the watchdogs have stopped
+/// its servers. (The services live in a static, which is never dropped, so a
+/// `TempDir` there would never be removed.)
+fn remove_on_exit(dir: &Path) {
+    let me = std::process::id();
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg(r#"while kill -0 "$1" 2>/dev/null; do sleep 1; done; sleep 7; rm -rf "$2""#)
+        .arg("sh")
+        .arg(me.to_string())
+        .arg(dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -124,7 +161,7 @@ fn start_postgres(dir: &Path) -> Result<String> {
         bail!("initdb failed: {}", String::from_utf8_lossy(&out.stderr));
     }
     let port = free_port();
-    let child = cmd("postgres")
+    cmd("postgres")
         .arg("-D")
         .arg(&data)
         .args([
@@ -149,7 +186,7 @@ fn start_postgres(dir: &Path) -> Result<String> {
         .stderr(Stdio::null())
         .spawn()
         .context("spawning postgres")?;
-    watchdog(child.id(), "INT");
+    stop_postgres_on_exit(&data);
     if !wait_port(port, Duration::from_secs(30)) {
         bail!("postgres did not start");
     }
@@ -203,10 +240,12 @@ pub fn services() -> &'static Services {
         let dir = tempfile::Builder::new()
             .prefix("nfi-testenv")
             .tempdir()
-            .expect("tempdir");
+            .expect("tempdir")
+            .keep();
+        remove_on_exit(&dir);
         let pg = match std::env::var("NFI_TEST_DATABASE_URL") {
             Ok(u) => Some(u),
-            Err(_) => match start_postgres(dir.path()) {
+            Err(_) => match start_postgres(&dir) {
                 Ok(u) => Some(u),
                 Err(e) => {
                     if require() {
@@ -219,7 +258,7 @@ pub fn services() -> &'static Services {
         };
         let meili = match std::env::var("NFI_TEST_MEILI_URL") {
             Ok(u) => Some(u),
-            Err(_) => match start_meili(dir.path()) {
+            Err(_) => match start_meili(&dir) {
                 Ok(u) => Some(u),
                 Err(e) => {
                     if require() {
@@ -233,7 +272,6 @@ pub fn services() -> &'static Services {
         Services {
             pg_admin_url: pg,
             meili_url: meili,
-            _dir: Some(dir),
         }
     })
 }
