@@ -19,14 +19,10 @@
       systems = [
         "x86_64-linux"
         "aarch64-linux"
-        "x86_64-darwin"
-        "aarch64-darwin"
       ];
       forAll = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
-      linuxOnly = pkgs: pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux;
       # Git hooks, installed by `nix develop` and run on every file in CI
-      # (.github/workflows/checks.yml). git-hooks.nix doesn't support
-      # x86_64-darwin, so there is no dev shell hook there.
+      # (.github/workflows/checks.yml).
       preCommit =
         pkgs:
         let
@@ -86,7 +82,7 @@
           generate-cargo-nix = pkgs.callPackage ./nix/generate-cargo-nix.nix { };
         }
         // bins
-        // linuxOnly pkgs {
+        // {
           # OCI images (load with `docker load < result`).
           nfi-service-image = image "nfi-service";
           yoink-service-image = image "yoink-service";
@@ -109,9 +105,7 @@
       devShells = forAll (
         pkgs:
         let
-          hooks = pkgs.lib.optionalAttrs (git-hooks.lib ? ${pkgs.stdenv.hostPlatform.system}) (
-            preCommit pkgs
-          );
+          hooks = preCommit pkgs;
         in
         {
           default = pkgs.mkShell {
@@ -125,8 +119,8 @@
               pkgs.meilisearch
               pkgs.nix-eval-jobs
             ]
-            ++ hooks.enabledPackages or [ ];
-            shellHook = hooks.shellHook or "";
+            ++ hooks.enabledPackages;
+            inherit (hooks) shellHook;
           };
         }
       );

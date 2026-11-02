@@ -220,8 +220,6 @@ let
         cacert
       ];
       env.NFI_TEST_REQUIRE_SERVICES = "1";
-      # Tests bind localhost ports.
-      __darwinAllowLocalNetworking = true;
       dontConfigure = true;
       buildPhase = ''
         runHook preBuild
