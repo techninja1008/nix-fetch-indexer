@@ -110,12 +110,12 @@ fn eval_errors(name: &str, commit: &str, errors: &[(&str, &str)]) -> Bundle {
     r.datasets = vec![Dataset::EvalErrors];
     let r = b.ensure_release(r);
     let e = b.ensure_eval(r as u32, "helpers");
-    let mut s = EvalErrorsSection::default();
-    s.evals.set(e);
+    let mut s = EvalErrorsBuilder::default();
+    s.cover(e);
     for (attr, system) in errors {
-        s.add_error(attr, system, e);
+        s.add(attr, system, e);
     }
-    b.eval_errors = Some(s);
+    b.eval_errors = Some(s.finish());
     b.validate().unwrap();
     b
 }
@@ -182,7 +182,7 @@ fn closure_builder_sorted_and_indexed() {
 fn merge_and_split() {
     let a = sample("r1", &"a".repeat(40), false);
     let b = sample("r2", &"b".repeat(40), true);
-    let m = ops::merge([a.clone(), b.clone()]);
+    let m = ops::merge([a.clone(), b.clone()]).unwrap();
     m.validate().unwrap();
     assert_eq!(m.releases.len(), 2);
     let c = m.closure.as_ref().unwrap();
@@ -196,20 +196,20 @@ fn merge_and_split() {
     assert_eq!(m.packages.as_ref().unwrap().entries[0].releases.count(), 2);
 
     // Merge is idempotent.
-    let mm = ops::merge([m.clone(), a.clone()]);
+    let mm = ops::merge([m.clone(), a.clone()]).unwrap();
     assert_eq!(mm, m);
 
     let parts = ops::split(&m);
     assert_eq!(parts.len(), 2);
-    assert_eq!(parts[0], ops::merge([a]));
-    assert_eq!(parts[1], ops::merge([b]));
+    assert_eq!(parts[0], ops::merge([a]).unwrap());
+    assert_eq!(parts[1], ops::merge([b]).unwrap());
 }
 
 #[test]
 fn filter_sections_and_keeps_referenced_paths() {
     let a = sample("r1", &"a".repeat(40), false);
     let b = sample("r2", &"b".repeat(40), true);
-    let m = ops::merge([a, b]);
+    let m = ops::merge([a, b]).unwrap();
     let only_pk = ops::filter(&m, |r| r.name == "r1", Some(&[Dataset::Packages]), None, None);
     assert!(only_pk.closure.is_none() && only_pk.programs.is_none());
     assert_eq!(only_pk.releases[0].datasets, vec![Dataset::Packages]);
@@ -333,7 +333,7 @@ fn v2_bundles_upgrade_with_the_given_closure_type() {
 fn closure_types_merge_and_filter() {
     let rt = sample("r1", &"a".repeat(40), false);
     let helpers = sample_typed("r1", &"a".repeat(40), true, "helpers:direct");
-    let m = ops::merge([rt.clone(), helpers, eval_errors("r1", &"a".repeat(40), &[])]);
+    let m = ops::merge([rt.clone(), helpers, eval_errors("r1", &"a".repeat(40), &[])]).unwrap();
     m.validate().unwrap();
     assert_eq!(m.releases.len(), 1);
     // The helpers closure and eval errors share one evaluation.
@@ -370,7 +370,7 @@ fn closure_types_merge_and_filter() {
     );
     only_rt.validate().unwrap();
     assert_eq!(only_rt.evals.len(), 1);
-    assert_eq!(only_rt.closure, ops::merge([rt]).closure);
+    assert_eq!(only_rt.closure, ops::merge([rt]).unwrap().closure);
     let direct = ops::filter(
         &m,
         |_| true,
@@ -431,7 +431,7 @@ fn eval_errors_merge_filter_and_validate() {
         &c,
         &[("fetchhg", "x86_64-linux"), ("fetchhg", "aarch64-linux")],
     );
-    let m = ops::merge([r1, r2, r3, sample("r1", &a, false)]);
+    let m = ops::merge([r1, r2, r3, sample("r1", &a, false)]).unwrap();
     m.validate().unwrap();
     let e = m.eval_errors.as_ref().unwrap();
     // Covered evaluations without errors stay covered: they had none. The
@@ -471,7 +471,7 @@ fn eval_errors_merge_filter_and_validate() {
     let parts = ops::split(&m);
     assert!(parts[1].eval_errors.as_ref().unwrap().errors.is_empty());
     assert_eq!(parts[1].eval_errors.as_ref().unwrap().evals.count(), 1);
-    assert_eq!(ops::merge(parts), m);
+    assert_eq!(ops::merge(parts).unwrap(), m);
 
     // Filtering the section out drops it, and evaluations left with nothing.
     let no = ops::filter(&m, |_| true, Some(&[Dataset::Closure]), None, None);
@@ -494,4 +494,28 @@ fn eval_errors_merge_filter_and_validate() {
     let mut bad = m;
     bad.eval_errors.as_mut().unwrap().errors[0].evals.set(1);
     assert!(bad.validate().unwrap_err().contains("does not cover"));
+}
+
+#[test]
+fn merge_rejects_invalid_inputs() {
+    let a = "a".repeat(40);
+    let good = sample("r1", &a, false);
+    // An evaluation of a release that is not in the table.
+    let mut bad = eval_errors("r2", &a, &[("x", "x86_64-linux")]);
+    bad.evals[0].release = 7;
+    let err = ops::merge([good.clone(), bad]).unwrap_err();
+    assert!(err.starts_with("merge input 2: "), "{err}");
+    assert!(err.contains("release index out of range"), "{err}");
+    // A path reference past the path table.
+    let mut bad = good.clone();
+    bad.closure.as_mut().unwrap().paths[0].references.push(99);
+    assert!(
+        ops::merge([bad])
+            .unwrap_err()
+            .contains("reference index 99 out of range")
+    );
+    // An eval errors bit past the evaluation table.
+    let mut bad = eval_errors("r2", &a, &[]);
+    bad.eval_errors.as_mut().unwrap().evals.set(5);
+    assert!(ops::merge([bad]).unwrap_err().contains("out of range"));
 }

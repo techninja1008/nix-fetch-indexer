@@ -1,6 +1,6 @@
 [package]
 name = "yoink-api"
-description = "API types, PURL handling and client for the yoink mirroring service"
+description = "API types for the yoink mirroring service"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,18 +8,5 @@ repository.workspace = true
 readme.workspace = true
 
 [dependencies]
-nfi-interchange.workspace = true
-anyhow.workspace = true
-thiserror.workspace = true
+nfi-auth.workspace = true
 serde.workspace = true
-serde_json.workspace = true
-percent-encoding.workspace = true
-reqwest = { workspace = true, optional = true }
-futures = { workspace = true, optional = true }
-bytes = { workspace = true, optional = true }
-
-[features]
-client = ["dep:reqwest", "dep:futures", "dep:bytes"]
-
-[dev-dependencies]
-tokio.workspace = true

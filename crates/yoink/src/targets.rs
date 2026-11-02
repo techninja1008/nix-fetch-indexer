@@ -2,7 +2,7 @@
 
 use anyhow::{Result, bail};
 use std::collections::HashSet;
-use yoink_api::Purl;
+use yoink_purl::Purl;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {

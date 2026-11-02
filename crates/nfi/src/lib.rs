@@ -1,11 +1,13 @@
-//! Support code for the `nfi` query CLI.
+//! Support code for the `nfi` query CLI, and its API client.
 
-pub mod auth;
+pub mod client;
 
 use anyhow::{Context, Result, bail};
-use nfi_api::BulkItem;
 use nfi_api::drv::ReducedGraph;
+use nfi_api::{BulkItem, EvalInfo, ReleaseInfo};
+use nfi_auth_client::{Credentials, Identity};
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -20,26 +22,82 @@ pub struct Config {
     pub nix: Option<String>,
 }
 
-pub fn default_config_path() -> Option<PathBuf> {
+/// `$XDG_CONFIG_HOME/<app>/config.toml` (or under `~/.config`).
+pub fn config_path(app: &str) -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("nfi").join("config.toml"))
+    Some(base.join(app).join("config.toml"))
 }
 
-pub fn load_config(path: Option<&Path>) -> Result<Config> {
+pub fn default_config_path() -> Option<PathBuf> {
+    config_path("nfi")
+}
+
+/// Load the TOML config `path`, or `app`'s default file if it exists.
+pub fn load_toml<T: DeserializeOwned + Default>(app: &str, path: Option<&Path>) -> Result<T> {
     let (path, explicit) = match path {
         Some(p) => (p.to_path_buf(), true),
-        None => match default_config_path() {
+        None => match config_path(app) {
             Some(p) => (p, false),
-            None => return Ok(Config::default()),
+            None => return Ok(T::default()),
         },
     };
     match std::fs::read_to_string(&path) {
         Ok(s) => toml::from_str(&s).with_context(|| format!("parsing {}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !explicit => Ok(Config::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !explicit => Ok(T::default()),
         Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
     }
+}
+
+pub fn load_config(path: Option<&Path>) -> Result<Config> {
+    load_toml("nfi", path)
+}
+
+pub fn print_json<T: serde::Serialize>(v: &T) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(v)?);
+    Ok(())
+}
+
+/// `whoami` for the service at `url`, without logging in: prints who it
+/// sees (`json`: the whole response). False if not authenticated.
+pub async fn whoami(creds: &Credentials, url: &str, json: bool) -> Result<bool> {
+    let w = match creds.whoami().await? {
+        Identity::User(w) => w,
+        Identity::NotAuthenticated => {
+            println!("{url}: not authenticated");
+            return Ok(false);
+        }
+        Identity::NoLogin => {
+            println!("{url}: does not use login");
+            return Ok(true);
+        }
+    };
+    if json {
+        return print_json(&w).map(|()| true);
+    }
+    println!("{url}: {}", nfi_auth_client::describe(&w));
+    if !w.additional_info.is_empty() {
+        for l in serde_json::to_string_pretty(&w.additional_info)?.lines() {
+            println!("  {l}");
+        }
+    }
+    Ok(true)
+}
+
+/// `logout` for the service at `url`, printing what was logged out (with
+/// the provider login, every other URL logged in with it). Returns those
+/// other URLs.
+pub async fn logout(creds: &Credentials, url: &str) -> Result<Vec<String>> {
+    let Some(others) = creds.logout().await? else {
+        eprintln!("not logged in to {url}");
+        return Ok(vec![]);
+    };
+    eprintln!("logged out of {url}");
+    if !others.is_empty() {
+        eprintln!("also logged out of {} (same login)", others.join(", "));
+    }
+    Ok(others)
 }
 
 /// Build the fetch hook command line: `{}` in any argument is replaced by
@@ -112,7 +170,7 @@ pub fn derivation_graph(nix: &str, installables: &[String]) -> Result<ReducedGra
     }
     let v: serde_json::Value =
         serde_json::from_slice(&out.stdout).context("parsing nix derivation show output")?;
-    ReducedGraph::from_json(&v)
+    nfi_drv::reduce(&v)
 }
 
 /// Read a derivation graph (raw `nix derivation show` JSON or reduced) from
@@ -124,7 +182,7 @@ pub fn read_graph(path: &str) -> Result<ReducedGraph> {
         std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?
     };
     let v: serde_json::Value = serde_json::from_str(&text).with_context(|| format!("parsing {path}"))?;
-    ReducedGraph::from_json(&v)
+    nfi_drv::reduce(&v)
 }
 
 /// Parse a bulk item: `attr@commit[@system]` or whitespace-separated
@@ -167,6 +225,54 @@ pub fn read_items(path: &str, system: Option<&str>, outputs: &Option<Vec<String>
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .map(|l| parse_item(l, system, outputs))
         .collect()
+}
+
+/// The error count of `e`, falling back to the listed errors (services
+/// that predate `error_count`).
+pub fn error_count(e: &EvalInfo) -> Option<u64> {
+    e.error_count
+        .or_else(|| e.errors.as_ref().map(|e| e.len() as u64))
+}
+
+/// A human-readable table of releases, one per line after a header; listed
+/// errors follow their release, one evaluation per line.
+pub fn releases_table(rels: &[ReleaseInfo]) -> String {
+    let mut out = format!(
+        "{:<40} {:<18} {:<12} {:<42} {:<28} EVALS\n",
+        "RELEASE", "CHANNEL", "SERIES", "COMMIT", "DATASETS"
+    );
+    for r in rels {
+        // e.g. `helpers[direct,full] (2 errors)`, `store-paths`.
+        let evals: Vec<String> = r
+            .evals
+            .iter()
+            .map(|e| {
+                let mut s = e.eval_type.clone();
+                if e.closures.iter().any(|c| !c.is_empty()) {
+                    s += &format!("[{}]", e.closures.join(","));
+                }
+                if let Some(n) = error_count(e) {
+                    s += &format!(" ({n} errors)");
+                }
+                s
+            })
+            .collect();
+        out += &format!(
+            "{:<40} {:<18} {:<12} {:<42} {:<28} {}\n",
+            r.name,
+            r.channel,
+            r.series,
+            r.commit,
+            r.datasets.join(","),
+            evals.join(", ")
+        );
+        for e in &r.evals {
+            if let Some(errors) = e.errors.as_ref().filter(|e| !e.is_empty()) {
+                out += &format!("    {} errors: {}\n", e.eval_type, errors.join(" "));
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -213,5 +319,34 @@ mod tests {
         assert!(load_config(Some(&d.path().join("missing.toml"))).is_err());
         std::fs::write(&p, "bogus = 1\n").unwrap();
         assert!(load_config(Some(&p)).is_err());
+    }
+
+    #[test]
+    fn releases_table_counts_and_lists_errors() {
+        let eval = |errors: Option<Vec<&str>>| EvalInfo {
+            eval_type: "helpers".into(),
+            closures: vec!["direct".into()],
+            error_count: Some(2),
+            errors: errors.map(|e| e.into_iter().map(String::from).collect()),
+        };
+        let mut r = ReleaseInfo {
+            name: "nixos-25.05.1.aaaa".into(),
+            commit: "a".repeat(40),
+            channel: "nixos-25.05".into(),
+            series: "25.05".into(),
+            url: None,
+            datasets: vec!["closure".into()],
+            evals: vec![eval(None)],
+            indexed_at: chrono::DateTime::UNIX_EPOCH,
+        };
+        let t = releases_table(std::slice::from_ref(&r));
+        assert_eq!(t.lines().count(), 2, "{t}");
+        assert!(t.contains("helpers[direct] (2 errors)"), "{t}");
+        r.evals = vec![eval(Some(vec!["a@x86_64-linux", "b@aarch64-linux"]))];
+        let t = releases_table(&[r]);
+        assert!(
+            t.ends_with("    helpers errors: a@x86_64-linux b@aarch64-linux\n"),
+            "{t}"
+        );
     }
 }

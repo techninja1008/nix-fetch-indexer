@@ -10,6 +10,7 @@ readme.workspace = true
 [dependencies]
 yoink-server.workspace = true
 yoink-api.workspace = true
+yoink-purl.workspace = true
 nfi-interchange.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
@@ -24,8 +25,9 @@ base64.workspace = true
 aws-lc-rs = "1"
 
 [dev-dependencies]
-yoink-api = { workspace = true, features = ["client"] }
-nfi-auth = { workspace = true, features = ["testing"] }
+yoink = { path = "../yoink" }
+nfi-auth-server.workspace = true
+nfi-test-support.workspace = true
 axum.workspace = true
 serde_json.workspace = true
 xz2.workspace = true

@@ -4,7 +4,7 @@
 use crate::targets::display_name;
 use std::collections::HashMap;
 use std::time::Instant;
-use yoink_api::{Event, LogLevel, Outcome, PhaseDef, Progress, Unit};
+use yoink_api::{Event, LogLevel, Outcome, PhaseDef, Progress};
 
 /// One requested PURL.
 #[derive(Clone, Debug)]
@@ -19,8 +19,6 @@ pub struct Item {
     pub logs: Vec<usize>,
     /// The most severe log level seen.
     pub worst: Option<LogLevel>,
-    /// The largest byte total reported, for the overall size.
-    pub size: Option<u64>,
 }
 
 impl Item {
@@ -94,7 +92,6 @@ impl State {
                     outcome: None,
                     logs: vec![],
                     worst: None,
-                    size: None,
                 })
                 .collect(),
             index: purls.iter().enumerate().map(|(i, p)| (p.clone(), i)).collect(),
@@ -109,9 +106,11 @@ impl State {
         self.phases.iter().find(|p| p.id == id)
     }
 
-    /// Full phase name of an item, `?` for unknown phases.
+    /// Full phase name of an item, `?` for unknown phases; empty once the
+    /// item has a result (its last phase is no longer what it is doing).
     pub fn phase_name(&self, item: &Item) -> String {
         match &item.phase {
+            _ if item.is_done() => String::new(),
             None => String::new(),
             Some(id) => self
                 .phase(id)
@@ -142,11 +141,6 @@ impl State {
         match ev {
             Event::Phases { .. } => unreachable!(),
             Event::Status { phase, progress, .. } => {
-                if let Some(p) = &progress
-                    && p.unit == Some(Unit::Bytes)
-                {
-                    item.size = Some(item.size.unwrap_or(0).max(p.max));
-                }
                 item.progress = progress;
                 if item.phase.as_deref() != Some(&phase) {
                     item.phase = Some(phase);
@@ -196,14 +190,6 @@ impl State {
                 Some(Outcome::Fatal) => c.failed += 1,
                 None => {}
             }
-            if let Some(max) = i.size {
-                c.bytes_total += max;
-                c.bytes_done += match (i.outcome, i.progress) {
-                    (Some(Outcome::Success), _) => max,
-                    (None, Some(p)) if p.unit == Some(Unit::Bytes) => p.current.min(p.max),
-                    _ => 0,
-                };
-            }
         }
         c
     }
@@ -214,8 +200,6 @@ pub struct Counts {
     pub total: usize,
     pub succeeded: usize,
     pub failed: usize,
-    pub bytes_done: u64,
-    pub bytes_total: u64,
 }
 
 impl Counts {
@@ -227,7 +211,8 @@ impl Counts {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use yoink_api::Purl;
+    use yoink_api::Unit;
+    use yoink_purl::Purl;
 
     pub fn purl(n: u8, name: &str) -> String {
         let h = format!("{n}xy6xjvbl4bm3pq4w6p2b6vfffw4vi9b");
@@ -263,8 +248,7 @@ pub(crate) mod tests {
         assert_eq!(s.apply(status(&b, "zz", None)), Change::Phase(1));
         assert_eq!(s.phase_name(&s.items[1]), "?");
         assert_eq!(s.phase_abbrev(&s.items[1]), '?');
-        let c = s.counts();
-        assert_eq!((c.bytes_done, c.bytes_total, c.done()), (50, 100, 0));
+        assert_eq!(s.counts().done(), 0);
         let log = |p: &str, level| Event::Log {
             purl: p.into(),
             level,
@@ -282,6 +266,7 @@ pub(crate) mod tests {
             }),
             Change::Result(0)
         );
+        assert_eq!(s.phase_name(&s.items[0]), "");
         assert_eq!(s.pending(), vec![b.clone()]);
         assert!(!s.finished());
         // Events after a result, and for unknown PURLs, are ignored.
@@ -293,9 +278,6 @@ pub(crate) mod tests {
         });
         assert!(s.finished());
         let c = s.counts();
-        assert_eq!(
-            (c.succeeded, c.failed, c.bytes_done, c.bytes_total),
-            (1, 1, 100, 100)
-        );
+        assert_eq!((c.succeeded, c.failed), (1, 1));
     }
 }

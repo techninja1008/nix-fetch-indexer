@@ -1,13 +1,15 @@
 use futures::StreamExt;
-use nfi_auth::server::Expr;
-use nfi_auth::testing::MockIdp;
+use nfi_auth_client::http::HttpError;
+use nfi_auth_server::{Expr, OidcSettings};
+use nfi_test_support::MockIdp;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use yoink_api::client::{Client, HttpError};
-use yoink_api::{Event, LogLevel, Outcome, PhaseDef, Purl, Unit};
+use yoink::client::Client;
+use yoink_api::{Event, LogLevel, Outcome, PhaseDef, Unit};
+use yoink_purl::Purl;
 use yoink_server::{Auth, Job, JobTable, Mirror, api};
 
 /// A backend whose jobs wait for a release, then succeed unless their name
@@ -69,11 +71,13 @@ struct Env {
 async fn start(request: &str, purl: &str) -> Env {
     let idp = MockIdp::start("yoink").await;
     let fake = Arc::new(Fake::default());
-    let auth = Auth {
-        authenticator: nfi_auth::server::Authenticator::new(idp.settings()).unwrap(),
-        request: Expr::new(request).unwrap(),
-        purl: Expr::new(purl).unwrap(),
-    };
+    let auth = Auth::new(
+        Arc::new(
+            nfi_auth_server::Authenticator::new(OidcSettings::new(idp.issuer(), idp.client_id())).unwrap(),
+        ),
+        Expr::new(request).unwrap(),
+        Expr::new(purl).unwrap(),
+    );
     let state = api::State::new(fake.clone(), auth, 10);
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", l.local_addr().unwrap());
@@ -144,6 +148,7 @@ async fn mirror_stream() {
         Event::Log { purl, level: LogLevel::Warning, message } if purl == "pkg:fake/bad" && message == "halfway")));
     let who: nfi_auth::Whoami = c.get_json(nfi_auth::WHOAMI_PATH).await.unwrap();
     assert_eq!(who.username, "alice");
+    assert_eq!(who.additional_info["groups"], json!(["dev"]));
     let cfg: nfi_auth::AuthConfig = Client::new(&e.url, None)
         .unwrap()
         .get_json(nfi_auth::CONFIG_PATH)

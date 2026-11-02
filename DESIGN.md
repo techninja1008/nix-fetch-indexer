@@ -12,17 +12,23 @@ A single Cargo workspace:
 | `nfi-interchange` | lib | Interchange bundle data model, CBOR + compression codec, JSON codec, merge/split/filter |
 | `nfi-indexer` | bin | Indexers (`index --targets`: closure types `store-paths`, `helpers:direct` and `helpers:full`, `packages`, `outpaths`, `programs`), plus offline bundle tooling (`merge`, `split`, `filter`, `convert`, `inspect`) |
 | `nfi-service` | bin | Query service (axum HTTP/JSON, Postgres, Meilisearch) |
-| `nfi` | bin | Query CLI (non-administrative endpoints, release list, fetch hook, flake-ref resolution) |
+| `nfi` | bin | Query CLI (non-administrative endpoints, release list, fetch hook, flake-ref resolution); its library has the service's API client |
 | `nfi-admin` | bin | Admin CLI (ingest, list releases, prune, reindex, job status) |
 | `nfi-embedded-postgres` | lib | Supervised child-process PostgreSQL for single-node mode (`--embedded-postgres`) |
 | `nfi-embedded-meilisearch` | lib | Supervised child-process Meilisearch for single-node mode (`--embedded-meilisearch`) |
-| `nfi-api` | lib | Shared request/response types for the service and CLIs |
-| `nfi-auth` | lib | OIDC ID token validation, CEL claim extraction and authorisation (services); device code login and the token cache (CLIs) |
-| `yoink-api` | lib | yoink API types: PURLs, mirror stream events, SSE client |
+| `nfi-api` | lib | Shared routes, request/response, query-parameter and job-result types for the service and CLIs (types only) |
+| `nfi-drv` | lib | Derivation graph reduction (`nix derivation show` to the reduced graph minimise takes) |
+| `nfi-auth` | lib | Authentication protocol types: the advertised OIDC settings, whoami, error bodies, and the OpenID provider's discovery, device authorization and token responses (types only) |
+| `nfi-service-common` | lib | Shared by nfi-service and yoink-service: tracing set-up, the shutdown signal, and the OIDC flags (environment variables prefixed per service) |
+| `nfi-auth-server` | lib | OIDC ID token validation, CEL claim extraction and authorisation (services) |
+| `nfi-auth-client` | lib | Device code login, the token cache, and HTTP errors and the 401 retry shared by the CLIs' API clients |
+| `nfi-test-support` | lib | Test helpers: a mock OpenID provider, a pseudo-terminal runner |
+| `yoink-api` | lib | yoink API types: mirror requests and stream events (types only) |
+| `yoink-purl` | lib | Package URLs and the store paths they name |
 | `yoink-server` | lib | Core of the yoink service: arguments, tracing, auth, the mirror API, jobs and the `Mirror` trait |
 | `yoink-mirror-http` | lib | `Mirror` backend copying from one HTTP binary cache to another |
 | `yoink-service` | bin | The yoink service: `yoink-server` with the HTTP backend wired in |
-| `yoink` | bin | yoink CLI: resolve flakes through `nfi`, mirror their closures, show progress |
+| `yoink` | bin | yoink CLI: resolve flakes through `nfi`, mirror their closures, show progress; its library has the yoink API client |
 
 Packaging uses Nix flake packages for all binaries, plus a dev shell.
 OCI images for the service are built with Nix `dockerTools`. There is no Dockerfile.
@@ -53,7 +59,7 @@ OCI images for the service are built with Nix `dockerTools`. There is no Dockerf
   - `series`: e.g. `25.05` or `unstable`
   - `url`
   - `indexed_at`
-- **Commit lookups:** lookups by commit resolve to the release with that commit. Unique hash prefixes are accepted.
+- **Commit lookups:** there are two kinds of commit input. Lockfile-style `attr@commit` (bulk items) must be entirely unambiguous, so it takes only full 40-character commit hashes (any case, normalised to lowercase) and matches exactly; anything else is a request error (400). Commits a user selects a release with (`GET /v1/packages/{attr}?commit=`, i.e. `nfi show --commit`, and prune's `commits`) share one prefix rule: at least 8 hex digits (any case), matching exactly one release. A malformed or ambiguous prefix is a 400 (the latter naming the prefix and its match count); one matching none is an unknown commit (404) for package lookups and selects nothing for prune.
 - **Store path keys:** store paths are keyed by their 32-char nix-base32 hash. The hash is unique across systems, so the closure graph is system-agnostic.
 - **System tags:** package, out-path and program entries are tagged with `system`.
 
@@ -261,7 +267,7 @@ A store path's references never change, so they are written only once, when the 
 - `POST /admin/v1/ingest` is either a streaming body (binary or JSON bundle) or `{url}`. It returns a job id.
 - `GET /admin/v1/jobs/{id}` and `GET /admin/v1/jobs` show job status.
 - `GET /admin/v1/releases` lists releases with their datasets and evaluations (closure types, and errors when indexed).
-- `POST /admin/v1/prune` takes `{releases?:[name], commits?:[hash], channels?:[name]}` and returns a job id.
+- `POST /admin/v1/prune` takes `{releases?:[name], commits?:[hash], channels?:[name]}` and returns a job id. A commit is a prefix of at least 8 hex digits that may match at most one release (checked when the request is made, with a 400 naming the prefix and its match count, and again by the job); one matching no release selects nothing, like an unknown release or channel.
 - `POST /admin/v1/reindex` returns a job id.
 - `POST /admin/v1/check` returns a job id. The job's result is a consistency report: `ok`, totals, and per issue kind a count and examples.
 
@@ -301,16 +307,19 @@ A store path's references never change, so they are written only once, when the 
 
 Commands: `ingest <file|url>...`, `jobs [id]`, `releases`, `prune --release/--commit/--channel`, `reindex`, all with `--wait` support.
 
-## Authentication (`nfi-auth`)
+## Authentication (`nfi-auth`, `nfi-auth-server`, `nfi-auth-client`)
 
 OIDC is optional on `nfi-service` and required on `yoink-service`.
 
-- **Tokens:** clients send an OIDC **ID token** as `Authorization: Bearer`. Services validate it against the issuer's JWKS (fetched via discovery, refetched at most every 30 s for an unknown `kid`): signature (asymmetric algorithms only), `iss`, `aud` (the client id unless configured), `exp`/`nbf` with 60 s leeway.
+- **Tokens:** clients send an OIDC **ID token** as `Authorization: Bearer`. Services validate it against the issuer's JWKS: signature (asymmetric algorithms only; a JWK that declares an `alg` must match the token's, `use: enc` keys are ignored), `iss`, `aud` (the client id unless configured), `exp`/`nbf` with 60 s leeway.
+- **Keys:** discovery and the JWKS are fetched at startup (an unreachable provider is only a warning; a discovery document for another issuer stops the service). A known `kid` never causes a fetch. An unknown `kid` refetches the set, one fetch at a time and at most every 30 s (failed attempts count); a set older than 1 h is refreshed in the background while still in use, so revoked keys drop out within about an hour. Without any key set, or for an unknown `kid` while the last fetch failed (a key rotation during a provider outage), requests get 503, not 401, so CLIs don't log in again for nothing.
 - **Principal:** CEL expressions over `claims` give the `username` (default `preferred_username`, else `sub`) and an optional credential/session id (e.g. `claims.sid`). Both go into every request's log span. An empty username rejects the token.
 - **Authorisation:** CEL expressions that must evaluate to `true`. Variables: `claims`, `user` (`{username, session}`), `request` (`{method, path}`), and on yoink's per-PURL policy `purl` (`{type, namespace, name, version, qualifiers, subpath, raw}`). A non-bool result or evaluation error denies (and is logged).
 - **Configuration:** values (issuer, client id) are flags/env; CEL expressions and secrets are always read from files named by flags/env.
-- **Discovery:** each OIDC-enabled listener serves `GET /auth/v1/config` (`{issuer, client_id, scopes}`, unauthenticated) and `GET /auth/v1/whoami`.
-- **CLIs:** device authorization grant (RFC 8628) with a public client, then refresh tokens. Tokens are cached per (issuer, client id) under `$XDG_CACHE_HOME/nfi/tokens` (0600), shared by `nfi`, `nfi-admin` and `yoink`; each service URL remembers the settings it advertised, so a cached token is sent without a discovery round trip. On a 401 an interactive CLI logs in and retries once. Non-interactive use (CI) passes a pre-obtained ID token by env or file, e.g. a CI platform's OIDC token with the right audience.
+- **Guards:** each listener has a guard (`nfi_auth_server::Guard`): open, a fixed token, or OIDC with a policy and optionally anonymous access; one middleware applies it. Rejections are JSON `{error}` bodies, 401s with `WWW-Authenticate: Bearer`.
+- **Discovery:** each listener serves `GET /auth/v1/config` (`{issuer, client_id, scopes, anonymous}`, unauthenticated; 404 unless the listener uses OIDC) and `GET /auth/v1/whoami` (outside the middleware: it authenticates the token itself, without the policy or anonymous access, so a user the policy denies still learns who they are; 401 without a valid token, 404 unless the listener uses OIDC, with or without a token): `{username, session, additional_info}`, where `additional_info` is the map a CEL expression over `claims` and `user` gives (default `claims`; a non-map result is logged and answered with 500). Clients treat a missing `additional_info` (older services) as empty.
+- **Logs:** both services log accepted requests (and whoami requests) in a `request{method, path, user, session}` span (`-` for none, `(token)` for a fixed token) ending with `request status=...`; rejected ones as `request rejected` with `method`, `path`, `status` and `error` (at `error` level for a 5xx, else `info`).
+- **CLIs:** device authorization grant (RFC 8628) with a public client, then refresh tokens. `nfi_auth_client::Credentials` holds one service's credentials: an explicit token, else a login cached per (issuer, client id) under `$XDG_CACHE_HOME/nfi/tokens` (directories 0700, files 0600, written via a temporary file and rename), shared by `nfi`, `nfi-admin` and `yoink`. A cached token is bound to URLs: `urls/<digest(url)>.json` records `{url, issuer, client_id, scopes, anonymous}`, the settings the URL advertised at `/auth/v1/config`, for each URL logged in to (by `login`, by a device login a command made for that URL, or by one after a 401), and a token is only sent to a URL with a record, for the (issuer, client id) recorded. Otherwise a service could announce someone else's provider and client and collect their token. Commands use the recorded settings; for a URL without a record, `settings/<digest(url)>.json` caches `{url, config}` (`config` null for a 404: no OIDC), fetched on the URL's first use. That cache only says whether a login is needed: it never makes a URL receive a token, which only a record does. The settings are fetched again only by `login` and after a 401 (at most once per process), and every fetch updates the cache, so a cached "no OIDC" is corrected by the service's first 401. After a 401 a device login with the new settings replaces the record (also when the issuer or client changed). `login` without `--force` may check the provider login against the URL's whoami (the user chose that URL) and records it; `logout` reads the record (no network) and, under the refresh lock (so a concurrent refresh cannot save the login back), removes the provider token and every URL recorded for it; a URL without a record is not logged in, and nothing is removed. If reusing the provider login fails, `login` warns and falls back to the device flow; if the service rejects the new login, its URL record is removed. A token with less than 60 s left is refreshed under an exclusive lock on `<token>.lock`, re-reading the cache after acquiring it, so concurrent CLIs use a rotating refresh token once; a device login saves under the same lock. Only `invalid_grant` removes the refresh token; other OAuth or transport errors keep it. Corrupt cache files, and files in any other format, count as missing (one warning), as does an unreadable settings entry. A command gets its token up front (cheap argument checks first, then the login prompt if stderr is a terminal, then stdin, nix evaluation and uploads), so prompts never interleave with work or yoink's monitor; only a token rejected despite that (a 401) prompts later, for the one request. No token is sent, and no device login or refresh made, over plain `http://` to a host other than loopback (the service URL, the issuer, the device authorization and token endpoints) unless `--allow-insecure` or `NFI_ALLOW_INSECURE=1` allows it. Provider requests (discovery, device authorization, token) use a client that does not follow redirects, since a 307/308 would replay a refresh token or device code to another host; service requests use a separate client that does (reqwest drops the bearer token on a cross-host redirect). Every API request goes through `nfi_auth_client::http::retry`: on a 401 when no explicit token was used it logs in again (when it may prompt) and repeats that single request, which is safe because the auth middleware answers 401 before any handler runs; an explicit token is never replaced. `whoami` fetches no settings and uses no cached ones: it sends the URL's usable login if any, else no token, never prompts, and the service's answer decides (200 a user, 401 not authenticated, 404 no login). Non-interactive use (CI) passes a pre-obtained ID token by env or file, e.g. a CI platform's OIDC token with the right audience.
 
 ## yoink
 

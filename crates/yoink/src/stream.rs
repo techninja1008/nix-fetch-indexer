@@ -1,12 +1,14 @@
 //! Drives the mirror request: streams events, and re-posts the PURLs still
 //! without a result whenever the stream ends early.
 
+use crate::client::{Client, EventStream};
 use crate::state::Conn;
+use nfi_auth_client::Credentials;
+use nfi_auth_client::http::{HttpError, is_unauthorized};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 use yoink_api::Event;
-use yoink_api::client::{Client, EventStream, HttpError};
 
 /// Reconnect delays: exponential from [`Backoff::FIRST`], capped at
 /// [`Backoff::MAX`]; give up after [`Backoff::GIVE_UP`] without progress.
@@ -51,28 +53,16 @@ pub fn is_fatal(e: &anyhow::Error) -> bool {
         .is_some_and(|h| (400..500).contains(&h.status) && !matches!(h.status, 408 | 429))
 }
 
-fn describe(e: &anyhow::Error) -> String {
-    match e.downcast_ref::<HttpError>() {
-        Some(h) if h.status == 401 => format!("{e}; run `yoink login` or set YOINK_TOKEN"),
-        _ => format!("{e:#}"),
-    }
-}
-
-/// Where to get a fresh token before reconnecting, when the token came from
-/// the login cache (ID tokens can expire during a long pull).
-pub struct Refresh {
-    pub session: nfi_auth::client::Session,
-    pub url: String,
-}
-
 /// Mirror `purls`, sending events and connection changes to `tx` until every
 /// PURL has a result, the failure is fatal, or `tx` is closed. `first` is the
-/// result of an initial request already made.
+/// result of an initial request already made. Each reconnect gets a token
+/// from `creds` without prompting (a login may have been refreshed meanwhile),
+/// keeping the previous one if that fails.
 pub async fn drive(
     mut client: Client,
     purls: Vec<String>,
     first: Option<anyhow::Result<EventStream>>,
-    refresh: Option<Refresh>,
+    creds: Credentials,
     tx: UnboundedSender<Msg>,
 ) {
     use futures::StreamExt;
@@ -89,20 +79,24 @@ pub async fn drive(
         let r = match next.take() {
             Some(r) => r,
             None => {
-                if let Some(rf) = &refresh
-                    && let Ok(Some(t)) = rf.session.cached_token(&rf.url).await
-                {
-                    client.set_token(Some(t));
+                if let Ok(t) = creds.token(false).await {
+                    client = client.with_token(t);
                 }
-                client.mirror(&remaining).await
+                client
+                    .mirror(&remaining)
+                    .await
+                    .map_err(|e| match is_unauthorized(&e) {
+                        true => e.context(creds.hint()),
+                        false => e,
+                    })
             }
         };
         let error = match r {
             Err(e) if is_fatal(&e) => {
-                let _ = tx.send(Msg::Conn(Conn::Failed(describe(&e))));
+                let _ = tx.send(Msg::Conn(Conn::Failed(format!("{e:#}"))));
                 return;
             }
-            Err(e) => describe(&e),
+            Err(e) => format!("{e:#}"),
             Ok(mut s) => {
                 if tx.send(Msg::Conn(Conn::Connected)).is_err() {
                     return;
@@ -194,6 +188,5 @@ mod tests {
         assert!(!is_fatal(&e(429)));
         assert!(!is_fatal(&e(503)));
         assert!(!is_fatal(&anyhow::anyhow!("connection refused")));
-        assert!(describe(&e(401)).contains("yoink login"));
     }
 }

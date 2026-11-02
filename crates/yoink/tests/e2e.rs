@@ -7,15 +7,15 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use nfi_auth::server::{Authenticator, Expr};
-use nfi_auth::testing::MockIdp;
+use nfi_auth_server::{Authenticator, Expr, OidcSettings};
 use nfi_interchange::nixbase32;
+use nfi_test_support::MockIdp;
 use sha2::Digest;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use yoink_api::Purl;
 use yoink_mirror_http::{Config, Credential, Endpoint, HttpMirror, NarLayout};
+use yoink_purl::Purl;
 use yoink_server::{Auth, api};
 
 type Files = Arc<Mutex<BTreeMap<String, Bytes>>>;
@@ -89,11 +89,11 @@ async fn stack(n: u8) -> Stack {
     .await
     .unwrap();
     let idp = MockIdp::start("yoink").await;
-    let auth = Auth {
-        authenticator: Authenticator::new(idp.settings()).unwrap(),
-        request: Expr::new("true").unwrap(),
-        purl: Expr::new("true").unwrap(),
-    };
+    let auth = Auth::new(
+        Arc::new(Authenticator::new(OidcSettings::new(idp.issuer(), idp.client_id())).unwrap()),
+        Expr::new("true").unwrap(),
+        Expr::new("true").unwrap(),
+    );
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", l.local_addr().unwrap());
     let state = api::State::new(Arc::new(mirror), auth, 1000);
@@ -160,7 +160,7 @@ async fn pulls_into_the_target_cache() {
 }
 
 /// `yoink` on a pseudo-terminal with an empty token cache.
-async fn yoink_tty(url: &str, dir: &std::path::Path, args: &[String]) -> nfi_auth::testing::pty::PtyOutput {
+async fn yoink_tty(url: &str, dir: &std::path::Path, args: &[String]) -> nfi_test_support::pty::PtyOutput {
     let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_yoink"));
     c.args(args)
         .env("YOINK_URL", url)
@@ -171,7 +171,7 @@ async fn yoink_tty(url: &str, dir: &std::path::Path, args: &[String]) -> nfi_aut
         .env_remove("YOINK_TOKEN")
         .env_remove("YOINK_TOKEN_FILE")
         .env_remove("NFI_URL");
-    tokio::task::spawn_blocking(move || nfi_auth::testing::pty::run(c, 120, 40, Duration::from_secs(60)))
+    tokio::task::spawn_blocking(move || nfi_test_support::pty::run(c, 120, 40, Duration::from_secs(60)))
         .await
         .unwrap()
 }
@@ -213,12 +213,39 @@ async fn interactive_login_and_monitor() {
     assert!(o.text.contains("60 of 60 paths mirrored, 0 failed"), "{}", o.text);
     assert_eq!((s.idp.device_logins(), narinfo_count(&s.target)), (1, 60));
 
-    // `whoami` and `logout` from the terminal.
+    // `whoami`, `login` and `logout` from the terminal.
     let o = yoink_tty(&s.url, d.path(), &["whoami".into()]).await;
     assert_eq!(o.code, Some(0), "{}", o.text);
-    assert!(o.text.contains("alice"), "{}", o.text);
-    let o = yoink_tty(&s.url, d.path(), &["logout".into()]).await;
+    assert!(o.text.contains(&format!("{}: alice", s.url)), "{}", o.text);
+    let o = yoink_tty(&s.url, d.path(), &["login".into()]).await;
     assert_eq!(o.code, Some(0), "{}", o.text);
+    assert!(
+        o.text.contains(&format!("logged in to {} as alice", s.url)),
+        "{}",
+        o.text
+    );
+    assert_eq!(s.idp.device_logins(), 1);
+    // The NFI URL is the same service: logged out once, not reported twice.
+    let o = yoink_tty(
+        &s.url,
+        d.path(),
+        &["logout".into(), "--nfi-url".into(), format!("{}/", s.url)],
+    )
+    .await;
+    assert_eq!(o.code, Some(0), "{}", o.text);
+    assert!(o.text.contains("logged out of"), "{}", o.text);
+    assert!(!o.text.contains("not logged in"), "{}", o.text);
+    // Logged out, `whoami` reports it rather than logging in.
     let o = yoink_tty(&s.url, d.path(), &["whoami".into()]).await;
-    assert_ne!(o.code, Some(0), "{}", o.text);
+    assert_eq!(o.code, Some(1), "{}", o.text);
+    assert!(
+        o.text.contains(&format!("{}: not authenticated", s.url)),
+        "{}",
+        o.text
+    );
+    assert!(!o.text.contains("To log in"), "{}", o.text);
+    let o = yoink_tty(&s.url, d.path(), &["login".into()]).await;
+    assert_eq!(o.code, Some(0), "{}", o.text);
+    assert!(o.text.contains("CODE-1"), "{}", o.text);
+    assert_eq!(s.idp.device_logins(), 2);
 }

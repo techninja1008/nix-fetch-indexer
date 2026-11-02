@@ -16,8 +16,8 @@
 //! lives as long as the process (e.g. the main thread).
 
 use anyhow::{Context, Result, bail};
+use nfi_embedded_postgres::{supervise, which};
 use std::io::{Read, Write};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -52,14 +52,6 @@ pub struct EmbeddedMeilisearch {
     /// because of a version change); the caller should rebuild it.
     pub reset: bool,
     pub version: String,
-}
-
-fn which(name: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH")?
-        .to_str()?
-        .split(':')
-        .map(|d| Path::new(d).join(name))
-        .find(|p| p.is_file())
 }
 
 /// Version reported by `meilisearch --version` (e.g. `meilisearch 1.54.3` -> `1.54.3`).
@@ -101,22 +93,6 @@ fn healthy(port: u16) -> bool {
     let mut buf = [0u8; 64];
     let n = s.read(&mut buf).unwrap_or(0);
     std::str::from_utf8(&buf[..n]).is_ok_and(|r| r.starts_with("HTTP/1.1 200"))
-}
-
-fn supervise(cmd: &mut Command, signal: libc::c_int) {
-    cmd.process_group(0);
-    #[cfg(target_os = "linux")]
-    unsafe {
-        cmd.pre_exec(move || {
-            // SAFETY: prctl is async-signal-safe.
-            if libc::prctl(libc::PR_SET_PDEATHSIG, signal) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = signal;
 }
 
 impl EmbeddedMeilisearch {
@@ -188,6 +164,13 @@ impl EmbeddedMeilisearch {
                 bail!("meilisearch exited during startup ({status}); see its log output above");
             }
             if healthy(port) {
+                // Another process may answer on the port (it was free when
+                // picked, but could be taken since): only count it while
+                // our child is still running.
+                if let Some(status) = m.child.as_mut().map(Child::try_wait).transpose()?.flatten() {
+                    m.child = None;
+                    bail!("meilisearch exited during startup ({status}); see its log output above");
+                }
                 break;
             }
             if Instant::now() > deadline {

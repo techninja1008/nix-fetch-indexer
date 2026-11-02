@@ -1,11 +1,9 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::{ArgAction, Args, Parser, Subcommand};
-use nfi_auth::Whoami;
-use nfi_auth::client::{Session, TokenStore};
+use nfi_auth_client::{Credentials, describe, explicit};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use yoink::auth::explicit;
-use yoink::pull::{PullOptions, pull};
+use yoink::pull::{NFI_HINT, PullOptions, YOINK_HINT, pull};
 
 #[derive(Parser)]
 #[command(
@@ -56,33 +54,36 @@ struct Common {
     #[arg(long, env = "NFI_NIX", global = true)]
     nix: Option<String>,
     /// Read the yoink service token (an ID token) from a file instead of
-    /// using the login cache [env: YOINK_TOKEN holds the token itself]
+    /// using the login; takes precedence over $YOINK_TOKEN, which holds the
+    /// token itself
     #[arg(long, env = "YOINK_TOKEN_FILE", global = true)]
     token_file: Option<PathBuf>,
-    /// Read the NFI token from a file [env: NFI_TOKEN holds the token itself]
+    /// Read the NFI token from a file; takes precedence over $NFI_TOKEN,
+    /// which holds the token itself
     #[arg(long, env = "NFI_TOKEN_FILE", global = true)]
     nfi_token_file: Option<PathBuf>,
+    /// Allow sending tokens and logging in over plain http:// to hosts
+    /// other than loopback
+    #[arg(long, env = "NFI_ALLOW_INSECURE", global = true, value_parser = clap::builder::BoolishValueParser::new())]
+    allow_insecure: bool,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Log in to the yoink service (and the NFI service, if configured and
-    /// using another provider or client) with the OIDC device flow.
-    Login,
-    /// Forget the cached logins for the yoink and NFI services.
+    /// Log in to the yoink service and the NFI service (if configured) with
+    /// the OIDC device flow, unless already logged in.
+    Login {
+        /// Log in again even if a cached login is still valid (once per
+        /// OpenID provider and client).
+        #[arg(long)]
+        force: bool,
+    },
+    /// Forget the cached logins for the yoink and NFI services (and so for
+    /// every other URL logged in with the same OpenID providers and clients).
     Logout,
-    /// Show who the services see you as.
+    /// Show who the services see you as, without logging in (exit 1 when
+    /// not authenticated).
     Whoami,
-}
-
-fn prompt(p: &nfi_auth::client::DevicePrompt) {
-    eprintln!("{p}");
-}
-
-async fn whoami(url: &str, token: Option<String>) -> Result<Whoami> {
-    yoink_api::client::Client::new(url, token)?
-        .get_json(nfi_auth::WHOAMI_PATH)
-        .await
 }
 
 async fn run(cli: Cli) -> Result<ExitCode> {
@@ -91,25 +92,31 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     let nfi_url = cli.common.nfi_url.clone().or(cfg.nfi_url.clone());
     let token = explicit(cli.common.token_file.as_deref(), "YOINK_TOKEN")?;
     let nfi_token = explicit(cli.common.nfi_token_file.as_deref(), "NFI_TOKEN")?;
+    let insecure = cli.common.allow_insecure;
+    let creds =
+        |u: &str, t: Option<String>, hint| Credentials::new("yoink", u, t, hint).allow_insecure(insecure);
     let need_url = || {
         url.clone()
             .context("no yoink service URL: set --url, YOINK_URL or `url` in the config file")
     };
-    let session = || -> Result<Session> { Session::new(TokenStore::default_location()?) };
     match cli.cmd {
-        Some(Cmd::Login) => {
+        Some(Cmd::Login { force }) => {
             let url = need_url()?;
-            let s = session()?;
-            let (cfg_y, _) = s.login(&url, true, prompt).await?;
-            eprintln!("logged in to {url}");
+            let y = creds(&url, None, YOINK_HINT);
+            eprintln!("logged in to {url} as {}", describe(&y.login(force).await?));
             if let Some(n) = &nfi_url {
-                match s.discover(n).await {
-                    Ok(Some(cfg_n)) => {
-                        // The same provider and client share the login just made.
-                        let same = cfg_n == cfg_y
-                            || (cfg_n.issuer == cfg_y.issuer && cfg_n.client_id == cfg_y.client_id);
-                        s.login(n, !same, prompt).await?;
-                        eprintln!("logged in to {n}");
+                let c = creds(n, None, NFI_HINT);
+                match c.config().await {
+                    Ok(Some(cn)) => {
+                        // A forced login already renewed a shared provider login.
+                        let same = y
+                            .config()
+                            .await?
+                            .is_some_and(|cy| (&cy.issuer, &cy.client_id) == (&cn.issuer, &cn.client_id));
+                        eprintln!(
+                            "logged in to {n} as {}",
+                            describe(&c.login(force && !same).await?)
+                        );
                     }
                     Ok(None) => {}
                     Err(e) => eprintln!("warning: not logging in to {n}: {e:#}"),
@@ -118,30 +125,32 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Some(Cmd::Logout) => {
-            let s = session()?;
+            let (mut done, mut ok) = (Vec::new(), true);
             for u in [url.clone(), nfi_url.clone()].into_iter().flatten() {
-                if s.logout(&u).await? {
-                    eprintln!("logged out of {u}");
+                // The first URL, or logged out with its provider login.
+                if done.iter().any(|d: &String| d == u.trim_end_matches('/')) {
+                    continue;
+                }
+                done.push(u.trim_end_matches('/').to_string());
+                match nfi::logout(&creds(&u, None, ""), &u).await {
+                    Ok(others) => done.extend(others),
+                    Err(e) => {
+                        ok = false;
+                        eprintln!("error: logging out of {u}: {e:#}");
+                    }
                 }
             }
-            Ok(ExitCode::SUCCESS)
+            Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE })
         }
         Some(Cmd::Whoami) => {
-            let s = session()?;
-            let url = need_url()?;
-            let mut targets = vec![(url, token)];
+            let mut targets = vec![(need_url()?, token, YOINK_HINT)];
             if let Some(n) = nfi_url {
-                targets.push((n, nfi_token));
+                targets.push((n, nfi_token, NFI_HINT));
             }
             let mut ok = true;
-            for (u, t) in targets {
-                let t = s.bearer(&u, t).await?;
-                match whoami(&u, t).await {
-                    Ok(w) => println!(
-                        "{u}: {}{}",
-                        w.username,
-                        w.session.map(|s| format!(" (session {s})")).unwrap_or_default()
-                    ),
+            for (u, t, hint) in targets {
+                match nfi::whoami(&creds(&u, t, hint), &u, false).await {
+                    Ok(b) => ok &= b,
                     Err(e) => {
                         ok = false;
                         println!("{u}: {e:#}");
@@ -151,9 +160,6 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE })
         }
         None => {
-            if cli.targets.is_empty() {
-                bail!("no targets given");
-            }
             pull(PullOptions {
                 targets: cli.targets,
                 url: need_url()?,
@@ -164,6 +170,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 plain: cli.plain,
                 verbosity: if cli.quiet { -1 } else { cli.verbose.min(2) as i8 },
                 close_miss_threshold: cli.close_miss_threshold,
+                allow_insecure: insecure,
             })
             .await
         }

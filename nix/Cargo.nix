@@ -83,6 +83,36 @@ rec {
       # File a bug if you depend on any for non-debug work!
       debug = internal.debugCrate { inherit packageId; };
     };
+    "nfi-auth-client" = rec {
+      packageId = "nfi-auth-client";
+      build = internal.buildRustCrateWithFeatures {
+        packageId = "nfi-auth-client";
+      };
+
+      # Debug support which might change between releases.
+      # File a bug if you depend on any for non-debug work!
+      debug = internal.debugCrate { inherit packageId; };
+    };
+    "nfi-auth-server" = rec {
+      packageId = "nfi-auth-server";
+      build = internal.buildRustCrateWithFeatures {
+        packageId = "nfi-auth-server";
+      };
+
+      # Debug support which might change between releases.
+      # File a bug if you depend on any for non-debug work!
+      debug = internal.debugCrate { inherit packageId; };
+    };
+    "nfi-drv" = rec {
+      packageId = "nfi-drv";
+      build = internal.buildRustCrateWithFeatures {
+        packageId = "nfi-drv";
+      };
+
+      # Debug support which might change between releases.
+      # File a bug if you depend on any for non-debug work!
+      debug = internal.debugCrate { inherit packageId; };
+    };
     "nfi-embedded-meilisearch" = rec {
       packageId = "nfi-embedded-meilisearch";
       build = internal.buildRustCrateWithFeatures {
@@ -133,6 +163,26 @@ rec {
       # File a bug if you depend on any for non-debug work!
       debug = internal.debugCrate { inherit packageId; };
     };
+    "nfi-service-common" = rec {
+      packageId = "nfi-service-common";
+      build = internal.buildRustCrateWithFeatures {
+        packageId = "nfi-service-common";
+      };
+
+      # Debug support which might change between releases.
+      # File a bug if you depend on any for non-debug work!
+      debug = internal.debugCrate { inherit packageId; };
+    };
+    "nfi-test-support" = rec {
+      packageId = "nfi-test-support";
+      build = internal.buildRustCrateWithFeatures {
+        packageId = "nfi-test-support";
+      };
+
+      # Debug support which might change between releases.
+      # File a bug if you depend on any for non-debug work!
+      debug = internal.debugCrate { inherit packageId; };
+    };
     "nfi-testenv" = rec {
       packageId = "nfi-testenv";
       build = internal.buildRustCrateWithFeatures {
@@ -167,6 +217,16 @@ rec {
       packageId = "yoink-mirror-http";
       build = internal.buildRustCrateWithFeatures {
         packageId = "yoink-mirror-http";
+      };
+
+      # Debug support which might change between releases.
+      # File a bug if you depend on any for non-debug work!
+      debug = internal.debugCrate { inherit packageId; };
+    };
+    "yoink-purl" = rec {
+      packageId = "yoink-purl";
+      build = internal.buildRustCrateWithFeatures {
+        packageId = "yoink-purl";
       };
 
       # Debug support which might change between releases.
@@ -1790,7 +1850,7 @@ rec {
           "usage" = [ "clap_builder/usage" ];
           "wrap_help" = [ "clap_builder/wrap_help" ];
         };
-        resolvedDefaultFeatures = [ "color" "default" "derive" "env" "error-context" "help" "std" "suggestions" "usage" ];
+        resolvedDefaultFeatures = [ "color" "default" "derive" "env" "error-context" "help" "std" "string" "suggestions" "usage" ];
       };
       "clap_builder" = rec {
         crateName = "clap_builder";
@@ -1829,7 +1889,7 @@ rec {
           "unstable-v5" = [ "deprecated" ];
           "wrap_help" = [ "help" "dep:terminal_size" ];
         };
-        resolvedDefaultFeatures = [ "color" "env" "error-context" "help" "std" "suggestions" "usage" ];
+        resolvedDefaultFeatures = [ "color" "env" "error-context" "help" "std" "string" "suggestions" "usage" ];
       };
       "clap_derive" = rec {
         crateName = "clap_derive";
@@ -6188,12 +6248,20 @@ rec {
           {
             name = "nfi-api";
             packageId = "nfi-api";
-            features = [ "client" ];
           }
           {
-            name = "nfi-auth";
-            packageId = "nfi-auth";
-            features = [ "client" ];
+            name = "nfi-auth-client";
+            packageId = "nfi-auth-client";
+          }
+          {
+            name = "nfi-drv";
+            packageId = "nfi-drv";
+          }
+          {
+            name = "reqwest";
+            packageId = "reqwest";
+            usesDefaultFeatures = false;
+            features = [ "rustls" "http2" "json" "query" "stream" "gzip" "form" ];
           }
           {
             name = "serde";
@@ -6218,15 +6286,24 @@ rec {
             features = [ "full" ];
           }
           {
+            name = "tokio-util";
+            packageId = "tokio-util";
+            features = [ "io" ];
+          }
+          {
             name = "toml";
             packageId = "toml";
           }
         ];
         devDependencies = [
           {
-            name = "nfi-auth";
-            packageId = "nfi-auth";
-            features = [ "testing" ];
+            name = "chrono";
+            packageId = "chrono";
+            features = [ "serde" ];
+          }
+          {
+            name = "nfi-auth-server";
+            packageId = "nfi-auth-server";
           }
           {
             name = "nfi-indexer";
@@ -6241,14 +6318,12 @@ rec {
             packageId = "nfi-service";
           }
           {
-            name = "nfi-testenv";
-            packageId = "nfi-testenv";
+            name = "nfi-test-support";
+            packageId = "nfi-test-support";
           }
           {
-            name = "reqwest";
-            packageId = "reqwest";
-            usesDefaultFeatures = false;
-            features = [ "rustls" "http2" "json" "query" "stream" "gzip" "form" ];
+            name = "nfi-testenv";
+            packageId = "nfi-testenv";
           }
         ];
 
@@ -6282,12 +6357,10 @@ rec {
           {
             name = "nfi-api";
             packageId = "nfi-api";
-            features = [ "client" ];
           }
           {
-            name = "nfi-auth";
-            packageId = "nfi-auth";
-            features = [ "client" ];
+            name = "nfi-auth-client";
+            packageId = "nfi-auth-client";
           }
           {
             name = "serde_json";
@@ -6307,9 +6380,16 @@ rec {
         ];
         devDependencies = [
           {
+            name = "axum";
+            packageId = "axum";
+          }
+          {
             name = "nfi-auth";
             packageId = "nfi-auth";
-            features = [ "testing" ];
+          }
+          {
+            name = "nfi-auth-server";
+            packageId = "nfi-auth-server";
           }
           {
             name = "nfi-interchange";
@@ -6318,6 +6398,10 @@ rec {
           {
             name = "nfi-service";
             packageId = "nfi-service";
+          }
+          {
+            name = "nfi-test-support";
+            packageId = "nfi-test-support";
           }
           {
             name = "nfi-testenv";
@@ -6354,37 +6438,13 @@ rec {
         libName = "nfi_api";
         dependencies = [
           {
-            name = "anyhow";
-            packageId = "anyhow";
-          }
-          {
-            name = "base64";
-            packageId = "base64 0.22.1";
-          }
-          {
             name = "chrono";
             packageId = "chrono";
             features = [ "serde" ];
           }
           {
-            name = "futures";
-            packageId = "futures";
-            optional = true;
-          }
-          {
-            name = "hex";
-            packageId = "hex";
-          }
-          {
-            name = "nfi-interchange";
-            packageId = "nfi-interchange";
-          }
-          {
-            name = "reqwest";
-            packageId = "reqwest";
-            optional = true;
-            usesDefaultFeatures = false;
-            features = [ "rustls" "http2" "json" "query" "stream" "gzip" "form" ];
+            name = "nfi-auth";
+            packageId = "nfi-auth";
           }
           {
             name = "serde";
@@ -6395,27 +6455,8 @@ rec {
             name = "serde_json";
             packageId = "serde_json";
           }
-          {
-            name = "sha2";
-            packageId = "sha2";
-          }
-          {
-            name = "tokio";
-            packageId = "tokio";
-            optional = true;
-            features = [ "full" ];
-          }
-          {
-            name = "tokio-util";
-            packageId = "tokio-util";
-            optional = true;
-            features = [ "io" ];
-          }
         ];
-        features = {
-          "client" = [ "dep:reqwest" "dep:futures" "dep:tokio" "dep:tokio-util" ];
-        };
-        resolvedDefaultFeatures = [ "client" ];
+
       };
       "nfi-auth" = rec {
         crateName = "nfi-auth";
@@ -6425,50 +6466,43 @@ rec {
         libName = "nfi_auth";
         dependencies = [
           {
-            name = "anyhow";
-            packageId = "anyhow";
+            name = "serde";
+            packageId = "serde";
+            features = [ "derive" ];
           }
           {
-            name = "axum";
-            packageId = "axum";
-            optional = true;
+            name = "serde_json";
+            packageId = "serde_json";
+          }
+        ];
+
+      };
+      "nfi-auth-client" = rec {
+        crateName = "nfi-auth-client";
+        version = "0.1.0";
+        edition = "2024";
+        src = lib.cleanSourceWith { filter = sourceFilter;  src = ../crates/nfi-auth-client; };
+        libName = "nfi_auth_client";
+        dependencies = [
+          {
+            name = "anyhow";
+            packageId = "anyhow";
           }
           {
             name = "base64";
             packageId = "base64 0.22.1";
           }
           {
-            name = "cel";
-            packageId = "cel";
-            optional = true;
-            usesDefaultFeatures = false;
-            features = [ "json" "regex" ];
-          }
-          {
             name = "hex";
             packageId = "hex";
           }
           {
-            name = "http";
-            packageId = "http";
-            optional = true;
-          }
-          {
-            name = "jsonwebtoken";
-            packageId = "jsonwebtoken";
-            optional = true;
-            usesDefaultFeatures = false;
-            features = [ "use_pem" "aws_lc_rs" ];
-          }
-          {
-            name = "libc";
-            packageId = "libc";
-            optional = true;
+            name = "nfi-auth";
+            packageId = "nfi-auth";
           }
           {
             name = "reqwest";
             packageId = "reqwest";
-            optional = true;
             usesDefaultFeatures = false;
             features = [ "rustls" "http2" "json" "query" "stream" "gzip" "form" ];
           }
@@ -6484,32 +6518,6 @@ rec {
           {
             name = "sha2";
             packageId = "sha2";
-          }
-          {
-            name = "thiserror";
-            packageId = "thiserror 2.0.21";
-          }
-          {
-            name = "tokio";
-            packageId = "tokio";
-            optional = true;
-            features = [ "full" ];
-          }
-          {
-            name = "tracing";
-            packageId = "tracing";
-            optional = true;
-          }
-        ];
-        devDependencies = [
-          {
-            name = "axum";
-            packageId = "axum";
-          }
-          {
-            name = "nfi-auth";
-            packageId = "nfi-auth";
-            features = [ "server" "client" "testing" ];
           }
           {
             name = "tempfile";
@@ -6521,12 +6529,159 @@ rec {
             features = [ "full" ];
           }
         ];
-        features = {
-          "client" = [ "dep:reqwest" "dep:tokio" ];
-          "server" = [ "dep:reqwest" "dep:tokio" "dep:tracing" "dep:http" "dep:cel" "dep:jsonwebtoken" ];
-          "testing" = [ "server" "dep:axum" "dep:libc" ];
-        };
-        resolvedDefaultFeatures = [ "client" "server" "testing" ];
+        devDependencies = [
+          {
+            name = "nfi-test-support";
+            packageId = "nfi-test-support";
+          }
+        ];
+
+      };
+      "nfi-auth-server" = rec {
+        crateName = "nfi-auth-server";
+        version = "0.1.0";
+        edition = "2024";
+        src = lib.cleanSourceWith { filter = sourceFilter;  src = ../crates/nfi-auth-server; };
+        libName = "nfi_auth_server";
+        dependencies = [
+          {
+            name = "anyhow";
+            packageId = "anyhow";
+          }
+          {
+            name = "axum";
+            packageId = "axum";
+          }
+          {
+            name = "cel";
+            packageId = "cel";
+            usesDefaultFeatures = false;
+            features = [ "json" "regex" ];
+          }
+          {
+            name = "http";
+            packageId = "http";
+          }
+          {
+            name = "jsonwebtoken";
+            packageId = "jsonwebtoken";
+            usesDefaultFeatures = false;
+            features = [ "use_pem" "aws_lc_rs" ];
+          }
+          {
+            name = "nfi-auth";
+            packageId = "nfi-auth";
+          }
+          {
+            name = "reqwest";
+            packageId = "reqwest";
+            usesDefaultFeatures = false;
+            features = [ "rustls" "http2" "json" "query" "stream" "gzip" "form" ];
+          }
+          {
+            name = "serde";
+            packageId = "serde";
+            features = [ "derive" ];
+          }
+          {
+            name = "serde_json";
+            packageId = "serde_json";
+          }
+          {
+            name = "thiserror";
+            packageId = "thiserror 2.0.21";
+          }
+          {
+            name = "tokio";
+            packageId = "tokio";
+            features = [ "full" ];
+          }
+          {
+            name = "tracing";
+            packageId = "tracing";
+          }
+        ];
+        devDependencies = [
+          {
+            name = "axum";
+            packageId = "axum";
+          }
+          {
+            name = "nfi-auth-client";
+            packageId = "nfi-auth-client";
+          }
+          {
+            name = "nfi-test-support";
+            packageId = "nfi-test-support";
+          }
+          {
+            name = "reqwest";
+            packageId = "reqwest";
+            usesDefaultFeatures = false;
+            features = [ "rustls" "http2" "json" "query" "stream" "gzip" "form" ];
+          }
+          {
+            name = "serde_json";
+            packageId = "serde_json";
+          }
+          {
+            name = "tempfile";
+            packageId = "tempfile";
+          }
+          {
+            name = "tokio";
+            packageId = "tokio";
+            features = [ "full" ];
+          }
+          {
+            name = "tracing";
+            packageId = "tracing";
+          }
+          {
+            name = "tracing-subscriber";
+            packageId = "tracing-subscriber";
+            features = [ "env-filter" ];
+          }
+        ];
+
+      };
+      "nfi-drv" = rec {
+        crateName = "nfi-drv";
+        version = "0.1.0";
+        edition = "2024";
+        src = lib.cleanSourceWith { filter = sourceFilter;  src = ../crates/nfi-drv; };
+        libName = "nfi_drv";
+        dependencies = [
+          {
+            name = "anyhow";
+            packageId = "anyhow";
+          }
+          {
+            name = "base64";
+            packageId = "base64 0.22.1";
+          }
+          {
+            name = "hex";
+            packageId = "hex";
+          }
+          {
+            name = "nfi-api";
+            packageId = "nfi-api";
+          }
+          {
+            name = "nfi-interchange";
+            packageId = "nfi-interchange";
+          }
+          {
+            name = "serde_json";
+            packageId = "serde_json";
+          }
+          {
+            name = "sha2";
+            packageId = "sha2";
+          }
+        ];
+
       };
       "nfi-embedded-meilisearch" = rec {
         crateName = "nfi-embedded-meilisearch";
@@ -6542,6 +6697,10 @@ rec {
           {
             name = "libc";
             packageId = "libc";
+          }
+          {
+            name = "nfi-embedded-postgres";
+            packageId = "nfi-embedded-postgres";
           }
           {
             name = "tracing";
@@ -6622,6 +6781,10 @@ rec {
           {
             name = "nfi-api";
             packageId = "nfi-api";
+          }
+          {
+            name = "nfi-drv";
+            packageId = "nfi-drv";
           }
           {
             name = "nfi-interchange";
@@ -6790,9 +6953,12 @@ rec {
             packageId = "nfi-api";
           }
           {
-            name = "nfi-auth";
-            packageId = "nfi-auth";
-            features = [ "server" ];
+            name = "nfi-auth-server";
+            packageId = "nfi-auth-server";
+          }
+          {
+            name = "nfi-drv";
+            packageId = "nfi-drv";
           }
           {
             name = "nfi-embedded-meilisearch";
@@ -6809,15 +6975,14 @@ rec {
             packageId = "nfi-interchange";
           }
           {
+            name = "nfi-service-common";
+            packageId = "nfi-service-common";
+          }
+          {
             name = "reqwest";
             packageId = "reqwest";
             usesDefaultFeatures = false;
             features = [ "rustls" "http2" "json" "query" "stream" "gzip" "form" ];
-          }
-          {
-            name = "serde";
-            packageId = "serde";
-            features = [ "derive" ];
           }
           {
             name = "serde_json";
@@ -6851,21 +7016,24 @@ rec {
             name = "tracing";
             packageId = "tracing";
           }
-          {
-            name = "tracing-subscriber";
-            packageId = "tracing-subscriber";
-            features = [ "env-filter" ];
-          }
         ];
         devDependencies = [
           {
             name = "nfi-auth";
             packageId = "nfi-auth";
-            features = [ "testing" ];
+          }
+          {
+            name = "nfi-test-support";
+            packageId = "nfi-test-support";
           }
           {
             name = "nfi-testenv";
             packageId = "nfi-testenv";
+          }
+          {
+            name = "serde";
+            packageId = "serde";
+            features = [ "derive" ];
           }
           {
             name = "tempfile";
@@ -6879,6 +7047,80 @@ rec {
         };
         resolvedDefaultFeatures = [ "default" "embedded-meilisearch" "embedded-postgres" ];
       };
+      "nfi-service-common" = rec {
+        crateName = "nfi-service-common";
+        version = "0.1.0";
+        edition = "2024";
+        src = lib.cleanSourceWith { filter = sourceFilter;  src = ../crates/nfi-service-common; };
+        libName = "nfi_service_common";
+        dependencies = [
+          {
+            name = "anyhow";
+            packageId = "anyhow";
+          }
+          {
+            name = "clap";
+            packageId = "clap";
+            features = [ "derive" "env" "string" ];
+          }
+          {
+            name = "nfi-auth-server";
+            packageId = "nfi-auth-server";
+          }
+          {
+            name = "tokio";
+            packageId = "tokio";
+            features = [ "full" ];
+          }
+          {
+            name = "tracing";
+            packageId = "tracing";
+          }
+          {
+            name = "tracing-subscriber";
+            packageId = "tracing-subscriber";
+            features = [ "env-filter" ];
+          }
+        ];
+
+      };
+      "nfi-test-support" = rec {
+        crateName = "nfi-test-support";
+        version = "0.1.0";
+        edition = "2024";
+        src = lib.cleanSourceWith { filter = sourceFilter;  src = ../crates/nfi-test-support; };
+        libName = "nfi_test_support";
+        dependencies = [
+          {
+            name = "axum";
+            packageId = "axum";
+          }
+          {
+            name = "jsonwebtoken";
+            packageId = "jsonwebtoken";
+            usesDefaultFeatures = false;
+            features = [ "use_pem" "aws_lc_rs" ];
+          }
+          {
+            name = "libc";
+            packageId = "libc";
+          }
+          {
+            name = "nfi-auth";
+            packageId = "nfi-auth";
+          }
+          {
+            name = "serde_json";
+            packageId = "serde_json";
+          }
+          {
+            name = "tokio";
+            packageId = "tokio";
+            features = [ "full" ];
+          }
+        ];
+
+      };
       "nfi-testenv" = rec {
         crateName = "nfi-testenv";
         version = "0.1.0";
@@ -6889,6 +7131,10 @@ rec {
           {
             name = "anyhow";
             packageId = "anyhow";
+          }
+          {
+            name = "nfi-embedded-postgres";
+            packageId = "nfi-embedded-postgres";
           }
           {
             name = "nfi-interchange";
@@ -16813,18 +17059,18 @@ rec {
             packageId = "nfi";
           }
           {
-            name = "nfi-api";
-            packageId = "nfi-api";
-            features = [ "client" ];
-          }
-          {
-            name = "nfi-auth";
-            packageId = "nfi-auth";
-            features = [ "client" ];
+            name = "nfi-auth-client";
+            packageId = "nfi-auth-client";
           }
           {
             name = "ratatui";
             packageId = "ratatui";
+          }
+          {
+            name = "reqwest";
+            packageId = "reqwest";
+            usesDefaultFeatures = false;
+            features = [ "rustls" "http2" "json" "query" "stream" "gzip" "form" ];
           }
           {
             name = "serde";
@@ -16841,13 +17087,12 @@ rec {
             features = [ "full" ];
           }
           {
-            name = "toml";
-            packageId = "toml";
-          }
-          {
             name = "yoink-api";
             packageId = "yoink-api";
-            features = [ "client" ];
+          }
+          {
+            name = "yoink-purl";
+            packageId = "yoink-purl";
           }
         ];
         devDependencies = [
@@ -16858,11 +17103,18 @@ rec {
           {
             name = "nfi-auth";
             packageId = "nfi-auth";
-            features = [ "testing" ];
+          }
+          {
+            name = "nfi-auth-server";
+            packageId = "nfi-auth-server";
           }
           {
             name = "nfi-interchange";
             packageId = "nfi-interchange";
+          }
+          {
+            name = "nfi-test-support";
+            packageId = "nfi-test-support";
           }
           {
             name = "sha2";
@@ -16891,59 +17143,16 @@ rec {
         libName = "yoink_api";
         dependencies = [
           {
-            name = "anyhow";
-            packageId = "anyhow";
-          }
-          {
-            name = "bytes";
-            packageId = "bytes";
-            optional = true;
-          }
-          {
-            name = "futures";
-            packageId = "futures";
-            optional = true;
-          }
-          {
-            name = "nfi-interchange";
-            packageId = "nfi-interchange";
-          }
-          {
-            name = "percent-encoding";
-            packageId = "percent-encoding";
-          }
-          {
-            name = "reqwest";
-            packageId = "reqwest";
-            optional = true;
-            usesDefaultFeatures = false;
-            features = [ "rustls" "http2" "json" "query" "stream" "gzip" "form" ];
+            name = "nfi-auth";
+            packageId = "nfi-auth";
           }
           {
             name = "serde";
             packageId = "serde";
             features = [ "derive" ];
           }
-          {
-            name = "serde_json";
-            packageId = "serde_json";
-          }
-          {
-            name = "thiserror";
-            packageId = "thiserror 2.0.21";
-          }
         ];
-        devDependencies = [
-          {
-            name = "tokio";
-            packageId = "tokio";
-            features = [ "full" ];
-          }
-        ];
-        features = {
-          "client" = [ "dep:reqwest" "dep:futures" "dep:bytes" ];
-        };
-        resolvedDefaultFeatures = [ "client" ];
+
       };
       "yoink-mirror-http" = rec {
         crateName = "yoink-mirror-http";
@@ -17009,6 +17218,10 @@ rec {
             packageId = "yoink-api";
           }
           {
+            name = "yoink-purl";
+            packageId = "yoink-purl";
+          }
+          {
             name = "yoink-server";
             packageId = "yoink-server";
           }
@@ -17027,9 +17240,12 @@ rec {
             packageId = "base64 0.22.1";
           }
           {
-            name = "nfi-auth";
-            packageId = "nfi-auth";
-            features = [ "testing" ];
+            name = "nfi-auth-server";
+            packageId = "nfi-auth-server";
+          }
+          {
+            name = "nfi-test-support";
+            packageId = "nfi-test-support";
           }
           {
             name = "serde_json";
@@ -17044,9 +17260,30 @@ rec {
             packageId = "xz2";
           }
           {
-            name = "yoink-api";
-            packageId = "yoink-api";
-            features = [ "client" ];
+            name = "yoink";
+            packageId = "yoink";
+          }
+        ];
+
+      };
+      "yoink-purl" = rec {
+        crateName = "yoink-purl";
+        version = "0.1.0";
+        edition = "2024";
+        src = lib.cleanSourceWith { filter = sourceFilter;  src = ../crates/yoink-purl; };
+        libName = "yoink_purl";
+        dependencies = [
+          {
+            name = "nfi-interchange";
+            packageId = "nfi-interchange";
+          }
+          {
+            name = "percent-encoding";
+            packageId = "percent-encoding";
+          }
+          {
+            name = "thiserror";
+            packageId = "thiserror 2.0.21";
           }
         ];
 
@@ -17076,9 +17313,12 @@ rec {
             packageId = "futures";
           }
           {
-            name = "nfi-auth";
-            packageId = "nfi-auth";
-            features = [ "server" ];
+            name = "nfi-auth-server";
+            packageId = "nfi-auth-server";
+          }
+          {
+            name = "nfi-service-common";
+            packageId = "nfi-service-common";
           }
           {
             name = "serde";
@@ -17099,20 +17339,26 @@ rec {
             packageId = "tracing";
           }
           {
-            name = "tracing-subscriber";
-            packageId = "tracing-subscriber";
-            features = [ "env-filter" ];
-          }
-          {
             name = "yoink-api";
             packageId = "yoink-api";
+          }
+          {
+            name = "yoink-purl";
+            packageId = "yoink-purl";
           }
         ];
         devDependencies = [
           {
             name = "nfi-auth";
             packageId = "nfi-auth";
-            features = [ "testing" ];
+          }
+          {
+            name = "nfi-auth-client";
+            packageId = "nfi-auth-client";
+          }
+          {
+            name = "nfi-test-support";
+            packageId = "nfi-test-support";
           }
           {
             name = "reqwest";
@@ -17121,9 +17367,8 @@ rec {
             features = [ "rustls" "http2" "json" "query" "stream" "gzip" "form" ];
           }
           {
-            name = "yoink-api";
-            packageId = "yoink-api";
-            features = [ "client" ];
+            name = "yoink";
+            packageId = "yoink";
           }
         ];
 

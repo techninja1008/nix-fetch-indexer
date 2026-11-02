@@ -1,0 +1,17 @@
+[package]
+name = "nfi-drv"
+description = "Derivation graph reduction for nix-fetch-indexer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+nfi-api.workspace = true
+nfi-interchange.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+base64.workspace = true
+hex.workspace = true

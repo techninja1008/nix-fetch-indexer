@@ -1,21 +1,11 @@
 //! Pruning releases and garbage-collecting orphaned rows.
 
 use crate::ingest::WRITE_LOCK;
-use anyhow::Result;
-use nfi_api::PruneRequest;
+use crate::query::{PrefixMatch, commit_prefix, malformed_prefix_message, resolve_commit_prefix};
+use anyhow::{Result, bail};
+use nfi_api::{PruneReport, PruneRequest};
 use nfi_interchange::ClosureType;
-use serde::Serialize;
-use sqlx::{PgPool, Postgres, Transaction};
-
-#[derive(Debug, Default, Serialize)]
-pub struct PruneReport {
-    /// Releases removed entirely.
-    pub releases: Vec<String>,
-    /// `<release> <closure type>` for closures removed from kept releases.
-    pub closures: Vec<String>,
-    pub store_paths_removed: u64,
-    pub packages_removed: u64,
-}
+use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 
 /// Delete store paths and packages that no closure or release refers to
 /// any more.
@@ -35,6 +25,33 @@ pub async fn gc(tx: &mut Transaction<'_, Postgres>) -> Result<(u64, u64)> {
     Ok((paths, packages))
 }
 
+/// The first commit of `req` that is not a valid commit prefix (see
+/// [`commit_prefix`]), if any.
+pub fn invalid_commit(req: &PruneRequest) -> Option<&str> {
+    req.commits
+        .iter()
+        .map(String::as_str)
+        .find(|c| commit_prefix(c).is_none())
+}
+
+/// Why the commits of `req` can't be used, if they can't: one is not a
+/// valid prefix, or matches more than one release. A prefix matching none
+/// selects nothing, like an unknown release or channel.
+pub async fn commit_error(db: &mut PgConnection, req: &PruneRequest) -> Result<Option<String>> {
+    if let Some(c) = invalid_commit(req) {
+        return Ok(Some(malformed_prefix_message(c)));
+    }
+    for c in &req.commits {
+        let prefix = commit_prefix(c).expect("validated above");
+        if let PrefixMatch::Many(n) = resolve_commit_prefix(&mut *db, &prefix).await? {
+            return Ok(Some(format!(
+                "commit prefix {c:?} is ambiguous: it matches {n} releases"
+            )));
+        }
+    }
+    Ok(None)
+}
+
 pub async fn prune(pool: &PgPool, req: &PruneRequest) -> Result<PruneReport> {
     let types = req
         .closure_types
@@ -48,6 +65,12 @@ pub async fn prune(pool: &PgPool, req: &PruneRequest) -> Result<PruneReport> {
         .bind(WRITE_LOCK)
         .execute(&mut *tx)
         .await?;
+    // Commits become `LIKE` prefix patterns (`%`/`_` would act as
+    // wildcards). Checked under the lock: the request was checked when it
+    // was queued, but a release may have been ingested since.
+    if let Some(e) = commit_error(&mut tx, req).await? {
+        bail!(e);
+    }
     let commit_patterns: Vec<String> = req
         .commits
         .iter()
@@ -134,5 +157,31 @@ pub async fn prune(pool: &PgPool, req: &PruneRequest) -> Result<PruneReport> {
         closures,
         store_paths_removed: paths,
         packages_removed: packages,
+        search_documents: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prune_request_rejects_short_or_non_hex_commits() {
+        let req = |c: &str| PruneRequest {
+            commits: vec!["abcdef12".into(), c.into()],
+            ..Default::default()
+        };
+        assert_eq!(invalid_commit(&req("DEADbeef")), None);
+        for bad in [
+            "",
+            "%",
+            "abcdef1",
+            "abcdef1_",
+            "abcdef1%",
+            " abcdef12",
+            "xyzxyzxy",
+        ] {
+            assert_eq!(invalid_commit(&req(bad)), Some(bad));
+        }
+    }
 }

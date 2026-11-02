@@ -124,18 +124,6 @@ impl Purl {
         }
     }
 
-    /// For CEL policies: `{type, namespace, name, version, qualifiers, subpath}`.
-    pub fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": self.ty,
-            "namespace": self.namespace,
-            "name": self.name,
-            "version": self.version,
-            "qualifiers": self.qualifiers,
-            "subpath": self.subpath,
-        })
-    }
-
     /// The store path this `nix` PURL names.
     pub fn nix_target(&self) -> Result<NixTarget, PurlError> {
         if self.ty != "nix" {
@@ -279,6 +267,5 @@ mod tests {
         assert_eq!(p.version.as_deref(), Some("2.6"));
         assert_eq!(p.qualifiers.get("repo").map(String::as_str), Some("central"));
         assert_eq!(p.subpath.as_deref(), Some("src/main"));
-        assert_eq!(p.to_json()["type"], "maven");
     }
 }

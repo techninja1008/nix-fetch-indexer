@@ -1,19 +1,15 @@
 //! HTTP routes for the public and admin listeners.
 
-use crate::auth::{self, AdminAuth, Caller};
 use crate::query::{self, LookupError};
 use crate::{AppState, jobs};
-use axum::Json;
-use axum::Router;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use nfi_api::drv::ReducedGraph;
+use axum::{Json, Router};
 use nfi_api::*;
-use serde::Deserialize;
 
 pub struct AppError(StatusCode, String);
 
@@ -38,70 +34,41 @@ fn err(status: StatusCode, msg: impl Into<String>) -> AppError {
 type R<T> = Result<Json<T>, AppError>;
 
 pub fn public_router(state: AppState) -> Router {
+    let guard = state.auth.public.clone();
     Router::new()
-        .route("/healthz", get(|| async { "ok" }))
-        .route("/v1/search", get(search))
-        .route("/v1/packages/{*attr}", get(package))
-        .route("/v1/lookup/bulk", post(bulk))
-        .route("/v1/minimise", post(minimise))
-        .route("/v1/releases", get(releases))
-        .route(nfi_auth::CONFIG_PATH, get(public_auth_config))
-        .route(nfi_auth::WHOAMI_PATH, get(public_whoami))
+        .route(SEARCH_PATH, get(search))
+        .route(&format!("{PACKAGES_PATH}/{{*attr}}"), get(package))
+        .route(BULK_PATH, post(bulk))
+        .route(MINIMISE_PATH, post(minimise))
+        .route(RELEASES_PATH, get(releases))
         .layer(DefaultBodyLimit::max(512 << 20))
         .layer(middleware::from_fn_with_state(
-            state.auth.clone(),
-            auth::public_auth,
+            guard.clone(),
+            nfi_auth_server::middleware,
         ))
+        .route("/healthz", get(|| async { "ok" }))
+        .merge(guard.routes())
         .with_state(state)
 }
 
 pub fn admin_router(state: AppState) -> Router {
+    let guard = state.auth.admin.clone();
     Router::new()
-        .route("/admin/v1/ingest", post(ingest))
-        .route("/admin/v1/jobs", get(list_jobs))
-        .route("/admin/v1/jobs/{id}", get(get_job))
-        .route("/admin/v1/releases", get(releases))
-        .route("/admin/v1/prune", post(prune))
-        .route("/admin/v1/reindex", post(reindex))
-        .route("/admin/v1/check", post(check))
-        .route(nfi_auth::CONFIG_PATH, get(admin_auth_config))
-        .route(nfi_auth::WHOAMI_PATH, get(admin_whoami))
+        .route(ADMIN_INGEST_PATH, post(ingest))
+        .route(ADMIN_JOBS_PATH, get(list_jobs))
+        .route(&format!("{ADMIN_JOBS_PATH}/{{id}}"), get(get_job))
+        .route(ADMIN_RELEASES_PATH, get(releases))
+        .route(ADMIN_PRUNE_PATH, post(prune))
+        .route(ADMIN_REINDEX_PATH, post(reindex))
+        .route(ADMIN_CHECK_PATH, post(check))
         .layer(DefaultBodyLimit::disable())
         .layer(middleware::from_fn_with_state(
-            state.auth.clone(),
-            auth::admin_auth,
+            guard.clone(),
+            nfi_auth_server::middleware,
         ))
         .route("/healthz", get(|| async { "ok" }))
+        .merge(guard.routes())
         .with_state(state)
-}
-
-fn admin_oidc(s: &AppState) -> Option<&nfi_auth::server::Authenticator> {
-    match s.auth.admin {
-        AdminAuth::Oidc(_) => s.auth.oidc.as_ref(),
-        _ => None,
-    }
-}
-
-async fn public_auth_config(State(s): State<AppState>) -> Response {
-    auth::config_response(s.auth.oidc.as_ref())
-}
-
-async fn admin_auth_config(State(s): State<AppState>) -> Response {
-    auth::config_response(admin_oidc(&s))
-}
-
-async fn public_whoami(State(s): State<AppState>, caller: Option<axum::Extension<Caller>>) -> Response {
-    match s.auth.oidc {
-        Some(_) => auth::whoami_response(caller.as_ref().map(|c| &c.0)),
-        None => auth::config_response(None),
-    }
-}
-
-async fn admin_whoami(State(s): State<AppState>, caller: Option<axum::Extension<Caller>>) -> Response {
-    match admin_oidc(&s) {
-        Some(_) => auth::whoami_response(caller.as_ref().map(|c| &c.0)),
-        None => auth::config_response(None),
-    }
 }
 
 async fn search(State(s): State<AppState>, Query(q): Query<SearchQuery>) -> R<SearchResponse> {
@@ -109,12 +76,6 @@ async fn search(State(s): State<AppState>, Query(q): Query<SearchQuery>) -> R<Se
         return Err(err(StatusCode::SERVICE_UNAVAILABLE, "search is not configured"));
     };
     Ok(Json(m.search(&q).await?))
-}
-
-#[derive(Deserialize)]
-struct PackageParams {
-    commit: String,
-    system: Option<String>,
 }
 
 async fn package(
@@ -125,13 +86,17 @@ async fn package(
     let system = p.system.unwrap_or_else(|| DEFAULT_SYSTEM.to_string());
     match query::lookup(&s.pool, &attr, &p.commit, &system).await? {
         Ok(info) => Ok(Json(info)),
+        Err(LookupError::MalformedCommit(e)) => Err(err(StatusCode::BAD_REQUEST, e)),
+        Err(LookupError::AmbiguousCommit(n)) => Err(err(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "commit prefix {:?} is ambiguous: it matches {n} releases",
+                p.commit
+            ),
+        )),
         Err(LookupError::UnknownCommit) => {
             Err(err(StatusCode::NOT_FOUND, format!("unknown commit {}", p.commit)))
         }
-        Err(LookupError::AmbiguousCommit) => Err(err(
-            StatusCode::BAD_REQUEST,
-            format!("ambiguous commit prefix {}", p.commit),
-        )),
         Err(LookupError::NotFound) => Err(err(
             StatusCode::NOT_FOUND,
             format!("{attr} ({system}) not found at {}", p.commit),
@@ -140,13 +105,10 @@ async fn package(
 }
 
 async fn bulk(State(s): State<AppState>, Json(req): Json<BulkRequest>) -> R<BulkResponse> {
-    Ok(Json(query::bulk(&s.pool, &req).await?))
-}
-
-#[derive(Deserialize)]
-struct MinimiseParams {
-    /// See `nfi_api::minimise::close_miss_warnings`; 0 disables the check.
-    close_miss_threshold: Option<u64>,
+    match query::bulk(&s.pool, &req).await? {
+        Ok(r) => Ok(Json(r)),
+        Err(e) => Err(err(StatusCode::BAD_REQUEST, e)),
+    }
 }
 
 async fn minimise(
@@ -163,14 +125,13 @@ async fn minimise(
             "Expected request with `Content-Type: application/json`",
         ));
     }
-    let graph =
-        ReducedGraph::from_slice(&body).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let graph = nfi_drv::parse(&body).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     if graph.derivations.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "no derivations in request"));
     }
     let threshold = p
         .close_miss_threshold
-        .unwrap_or(nfi_api::minimise::DEFAULT_CLOSE_MISS_THRESHOLD);
+        .unwrap_or(crate::minimise::DEFAULT_CLOSE_MISS_THRESHOLD);
     Ok(Json(query::minimise(&s.pool, &graph, threshold).await?))
 }
 
@@ -181,11 +142,6 @@ fn is_json(headers: &HeaderMap) -> bool {
     };
     let essence = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
     essence == "application/json" || (essence.starts_with("application/") && essence.ends_with("+json"))
-}
-
-#[derive(Deserialize)]
-struct IngestParams {
-    v2_closure_type: Option<String>,
 }
 
 async fn ingest(
@@ -218,11 +174,6 @@ async fn ingest(
     Ok((StatusCode::ACCEPTED, Json(JobCreated { id })).into_response())
 }
 
-#[derive(Deserialize)]
-struct ListParams {
-    limit: Option<i64>,
-}
-
 async fn list_jobs(State(s): State<AppState>, Query(p): Query<ListParams>) -> R<Vec<JobInfo>> {
     Ok(Json(
         jobs::list(&s.pool, p.limit.unwrap_or(50).clamp(1, 1000)).await?,
@@ -234,14 +185,6 @@ async fn get_job(State(s): State<AppState>, Path(id): Path<i64>) -> R<JobInfo> {
         .await?
         .map(Json)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("no job {id}")))
-}
-
-#[derive(Deserialize)]
-struct ReleasesParams {
-    channel: Option<String>,
-    /// List each evaluation's errors, not only their count.
-    #[serde(default)]
-    errors: bool,
 }
 
 /// Served on both listeners: what is in the index is public.
@@ -320,6 +263,10 @@ async fn prune(State(s): State<AppState>, Json(req): Json<PruneRequest>) -> Resu
             StatusCode::BAD_REQUEST,
             "specify releases, commits or channels to prune",
         ));
+    }
+    // The job checks again, under the write lock.
+    if let Some(e) = crate::prune::commit_error(&mut *s.pool.acquire().await?, &req).await? {
+        return Err(err(StatusCode::BAD_REQUEST, e));
     }
     let id = jobs::enqueue(&s.pool, "prune", serde_json::to_value(&req)?).await?;
     Ok((StatusCode::ACCEPTED, Json(JobCreated { id })).into_response())

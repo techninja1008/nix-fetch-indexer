@@ -1,25 +1,22 @@
-//! OIDC device code authentication and CEL authorisation.
+//! Authentication protocol types shared by the nfi and yoink services and
+//! CLIs.
 //!
 //! Services validate OIDC ID tokens (JWTs) presented as bearer tokens,
 //! extract a principal from their claims with CEL expressions, and authorise
-//! requests with further CEL expressions ([`server`]). CLIs log in with the
-//! device authorization grant and cache tokens per issuer and client
-//! ([`client`]). Services advertise their OIDC settings at [`CONFIG_PATH`]
-//! so that a CLI only needs the service URL to log in.
+//! requests with further CEL expressions (`nfi-auth-server`). CLIs log in
+//! with the device authorization grant and cache tokens per issuer and
+//! client (`nfi-auth-client`). Services advertise their OIDC settings at
+//! [`CONFIG_PATH`] so that a CLI only needs the service URL to log in.
 
-#[cfg(feature = "client")]
-pub mod client;
-#[cfg(feature = "server")]
-pub mod server;
-#[cfg(feature = "testing")]
-pub mod testing;
+pub mod oidc;
 
 use serde::{Deserialize, Serialize};
 
 /// Where a service advertises its [`AuthConfig`] (unauthenticated GET; 404
 /// when OIDC is not configured on that listener).
 pub const CONFIG_PATH: &str = "/auth/v1/config";
-/// Where a service reports the caller's [`Whoami`] (401 without a valid token).
+/// Where a service reports the caller's [`Whoami`] (401 without a valid
+/// token; 404 when OIDC is not configured on that listener).
 pub const WHOAMI_PATH: &str = "/auth/v1/whoami";
 
 /// The OIDC settings a service advertises to its clients.
@@ -33,6 +30,9 @@ pub struct AuthConfig {
     pub client_id: String,
     /// Scopes to request.
     pub scopes: Vec<String>,
+    /// Whether the service also serves requests without a token.
+    #[serde(default)]
+    pub anonymous: bool,
 }
 
 /// The principal a service extracted from the caller's token.
@@ -41,27 +41,14 @@ pub struct Whoami {
     pub username: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// What the service's whoami expression made of the token (by default
+    /// its claims); empty from services that predate it.
+    #[serde(default)]
+    pub additional_info: serde_json::Map<String, serde_json::Value>,
 }
 
-/// Read the unverified `exp` claim of a JWT (seconds since the epoch).
-pub fn jwt_expiry(token: &str) -> Option<i64> {
-    use base64::Engine;
-    let payload = token.split('.').nth(1)?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload.trim_end_matches('='))
-        .ok()?;
-    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    v.get("exp")?.as_i64()
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn expiry() {
-        use base64::Engine;
-        let enc = |s: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s);
-        let t = format!("{}.{}.sig", enc("{}"), enc(r#"{"exp":1234,"sub":"x"}"#));
-        assert_eq!(super::jwt_expiry(&t), Some(1234));
-        assert_eq!(super::jwt_expiry("garbage"), None);
-    }
+/// The JSON body of an error response.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ErrorBody {
+    pub error: String,
 }

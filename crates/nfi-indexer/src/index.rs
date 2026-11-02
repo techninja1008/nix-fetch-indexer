@@ -148,6 +148,9 @@ pub async fn index_releases_with_report(
     let mut builder = ClosureBuilder::new();
     let mut seed_releases = Vec::new();
     if let Some(seed) = &seed {
+        seed.validate()
+            .map_err(anyhow::Error::msg)
+            .context("invalid seed bundle")?;
         for r in &seed.releases {
             seed_releases.push(r.name.clone());
         }
@@ -165,14 +168,14 @@ pub async fn index_releases_with_report(
             builder.extend_section(c, &|i| emap.get(i).copied());
         }
     }
-    let seed_sections = seed.clone();
+    let seed_sections = seed;
 
     // Deduplicated as each release is added: consecutive releases share most
     // entries, and a whole channel would otherwise hold ~100x the entries.
     let mut package_entries = ops::Dedup::packages();
     let mut outpath_entries = ops::Dedup::outpaths();
     let mut program_entries = ops::Dedup::programs();
-    let mut eval_errors = EvalErrorsSection::default();
+    let mut eval_errors = EvalErrorsBuilder::default();
     let mut new_releases = Vec::new();
 
     for loc in locations {
@@ -241,9 +244,9 @@ pub async fn index_releases_with_report(
         }
         if let Some(pr) = &probe_roots {
             let e = bundle.ensure_eval(idx as u32, HELPERS);
-            eval_errors.evals.set(e);
+            eval_errors.cover(e);
             for (attr, system) in &pr.errors {
-                eval_errors.add_error(attr, system, e);
+                eval_errors.add(attr, system, e);
             }
             rr.eval_errors = Some(pr.errors.len());
             bundle.releases[idx].add_dataset(Dataset::EvalErrors);
@@ -330,9 +333,7 @@ pub async fn index_releases_with_report(
         });
     }
     if run_probes {
-        let mut b = EvalErrorsBuilder::default();
-        b.extend_section(&eval_errors, &Some);
-        bundle.eval_errors = Some(b.finish());
+        bundle.eval_errors = Some(eval_errors.finish());
     }
 
     let bundle = if let (true, Some(seed)) = (opts.include_seed, seed_sections) {
@@ -341,7 +342,7 @@ pub async fn index_releases_with_report(
             closure: None,
             ..seed
         };
-        ops::merge([bundle, seed_rest])
+        ops::merge([bundle, seed_rest]).map_err(anyhow::Error::msg)?
     } else {
         // Merging a single bundle deduplicates package/program/outpath entries
         // across its releases. The closure is already deduplicated by the
@@ -355,7 +356,7 @@ pub async fn index_releases_with_report(
         };
         let mut closure = b.closure.take();
         let (releases, evals) = (b.releases.clone(), b.evals.clone());
-        let mut merged = ops::merge([b]);
+        let mut merged = ops::merge([b]).map_err(anyhow::Error::msg)?;
         for cl in closure.iter_mut().flat_map(|c| &mut c.closures) {
             let e = &evals[cl.eval as usize];
             let r = merged

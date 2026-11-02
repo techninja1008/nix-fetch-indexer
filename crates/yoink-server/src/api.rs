@@ -1,24 +1,25 @@
-//! HTTP routes: auth discovery, whoami and the mirror stream.
+//! HTTP routes: auth discovery, whoami and the mirror stream. Mirror
+//! requests are authenticated and logged by `nfi_auth_server::middleware`.
 
 use crate::job::Update;
 use crate::{Auth, Mirror};
-use axum::Json;
-use axum::Router;
 use axum::extract::{Request, State as AxState};
-use axum::http::{StatusCode, header};
-use axum::middleware::{self, Next};
+use axum::http::StatusCode;
+use axum::middleware;
 use axum::response::sse::{KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use axum::{Json, Router};
 use futures::{Stream, StreamExt};
-use nfi_auth::server::{AuthError, Principal, Vars, bearer, request_var};
+use nfi_auth_server::{AuthError, Caller, Vars};
 use std::collections::HashSet;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::Instrument;
-use yoink_api::{ErrorBody, Event, LogLevel, MIRROR_PATH, MirrorRequest, Outcome, Purl};
+use yoink_api::{ErrorBody, Event, LogLevel, MIRROR_PATH, MirrorRequest, Outcome};
+use yoink_purl::Purl;
 
 /// Minimum interval between updates forwarded for one job, so fast progress
 /// reports don't flood the stream.
@@ -41,80 +42,27 @@ impl State {
     }
 }
 
+/// A JSON error response for a bad mirror request.
 fn error(status: StatusCode, msg: impl Into<String>) -> Response {
-    let mut r = (status, Json(ErrorBody { error: msg.into() })).into_response();
-    if status == StatusCode::UNAUTHORIZED {
-        r.headers_mut().insert(
-            header::WWW_AUTHENTICATE,
-            header::HeaderValue::from_static("Bearer"),
-        );
-    }
-    r
-}
-
-fn auth_error(e: AuthError) -> Response {
-    error(e.status(), e.to_string())
+    (status, Json(ErrorBody { error: msg.into() })).into_response()
 }
 
 pub fn router(state: State) -> Router {
+    let guard = state.auth.guard.clone();
     Router::new()
         .route(MIRROR_PATH, post(mirror))
-        .route(nfi_auth::WHOAMI_PATH, get(whoami))
-        .layer(middleware::from_fn_with_state(state.clone(), authenticate))
+        .layer(middleware::from_fn_with_state(
+            guard.clone(),
+            nfi_auth_server::middleware,
+        ))
         .route("/healthz", get(|| async { "ok" }))
-        .route(nfi_auth::CONFIG_PATH, get(config))
+        .merge(guard.routes())
         .with_state(state)
 }
 
-/// The authenticated caller and the request-level policy variables.
-#[derive(Clone)]
-struct Caller {
-    principal: Principal,
-    vars: Vars,
-}
-
-async fn authenticate(AxState(s): AxState<State>, mut req: Request, next: Next) -> Response {
-    let Some(token) = bearer(req.headers()) else {
-        return auth_error(AuthError::Missing);
-    };
-    let principal = match s.auth.authenticator.authenticate(token).await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::info!(method = %req.method(), path = req.uri().path(), error = %e, "rejected request");
-            return auth_error(e);
-        }
-    };
-    let mut vars = principal.vars();
-    vars.insert("request".into(), request_var(req.method(), req.uri().path()));
-    let span = tracing::info_span!(
-        "request",
-        user = %principal.username,
-        session = principal.session.as_deref().unwrap_or(""),
-        method = %req.method(),
-        path = req.uri().path(),
-    );
-    if let Err(e) = s.auth.request.authorize(&vars) {
-        span.in_scope(|| tracing::info!(error = %e, "forbidden"));
-        return auth_error(e);
-    }
-    req.extensions_mut().insert(Caller { principal, vars });
-    next.run(req).instrument(span).await
-}
-
-async fn config(AxState(s): AxState<State>) -> Response {
-    Json(s.auth.authenticator.config()).into_response()
-}
-
-async fn whoami(req: Request) -> Response {
-    match req.extensions().get::<Caller>() {
-        Some(c) => Json(c.principal.whoami()).into_response(),
-        None => auth_error(AuthError::Missing),
-    }
-}
-
 async fn mirror(AxState(s): AxState<State>, req: Request) -> Response {
-    let Some(caller) = req.extensions().get::<Caller>().cloned() else {
-        return auth_error(AuthError::Missing);
+    let Some(Caller::User { vars, .. }) = req.extensions().get::<Caller>().cloned() else {
+        return AuthError::Missing.into_response();
     };
     let body = match axum::body::to_bytes(req.into_body(), 64 << 20).await {
         Ok(b) => b,
@@ -140,7 +88,7 @@ async fn mirror(AxState(s): AxState<State>, req: Request) -> Response {
         );
     }
     tracing::info!(purls = purls.len(), "mirror request");
-    let stream = events(s, caller, purls);
+    let stream = events(s, vars, purls);
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
         .into_response()
@@ -189,7 +137,20 @@ fn fatal(purl: &str, message: String) -> Vec<Event> {
 fn sse(e: &Event) -> axum::response::sse::Event {
     axum::response::sse::Event::default()
         .event(e.name())
-        .data(e.data())
+        .json_data(e)
+        .expect("serialisable")
+}
+
+/// `p` for CEL policies: `{type, namespace, name, version, qualifiers, subpath}`.
+pub fn purl_json(p: &Purl) -> serde_json::Value {
+    serde_json::json!({
+        "type": p.ty,
+        "namespace": p.namespace,
+        "name": p.name,
+        "version": p.version,
+        "qualifiers": p.qualifiers,
+        "subpath": p.subpath,
+    })
 }
 
 /// Dispatch each PURL to its job and merge the jobs' updates into one
@@ -197,7 +158,7 @@ fn sse(e: &Event) -> axum::response::sse::Event {
 /// (client gone) stops the forwarding, not the jobs.
 fn events(
     s: State,
-    caller: Caller,
+    mut vars: Vars,
     purls: Vec<String>,
 ) -> impl Stream<Item = Result<axum::response::sse::Event, Infallible>> {
     let (tx, rx) = mpsc::channel::<Vec<Event>>(1024);
@@ -207,6 +168,7 @@ fn events(
     let span = tracing::Span::current();
     tokio::spawn(
         async move {
+            // `purl` is replaced for each PURL.
             for raw in purls {
                 let purl = match Purl::parse(&raw) {
                     Ok(p) => p,
@@ -217,8 +179,7 @@ fn events(
                         continue;
                     }
                 };
-                let mut vars = caller.vars.clone();
-                let mut pj = purl.to_json();
+                let mut pj = purl_json(&purl);
                 pj["raw"] = raw.clone().into();
                 vars.insert("purl".into(), pj);
                 if let Err(e) = s.auth.purl.authorize(&vars) {
@@ -259,5 +220,16 @@ fn events(
     let rest = futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|e| (e, rx)) });
     futures::stream::once(async move { vec![phases] })
         .chain(rest)
-        .flat_map(|evs| futures::stream::iter(evs.iter().map(sse).map(Ok).collect::<Vec<_>>()))
+        .flat_map(|evs| futures::stream::iter(evs.into_iter().map(|e| Ok(sse(&e)))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn purl_vars() {
+        let p = Purl::parse("pkg:maven/org.apache%2Fx/commons-io@2.6?repo=central&a=b#src/main").unwrap();
+        assert_eq!(purl_json(&p)["type"], "maven");
+    }
 }

@@ -6,7 +6,8 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use std::sync::{Arc, Mutex};
-use yoink_api::{Event, LogLevel, MirrorRequest, Outcome, PhaseDef, Progress, Purl, Unit};
+use yoink_api::{Event, LogLevel, MirrorRequest, Outcome, PhaseDef, Progress, Unit};
+use yoink_purl::Purl;
 
 type Script = dyn Fn(usize, &[String]) -> Vec<Event> + Send + Sync;
 
@@ -35,7 +36,13 @@ async fn mirror(
     };
     let body: String = (f.script)(n, &r.purls)
         .iter()
-        .map(|e| format!("event: {}\ndata: {}\n\n", e.name(), e.data()))
+        .map(|e| {
+            format!(
+                "event: {}\ndata: {}\n\n",
+                e.name(),
+                serde_json::to_string(e).unwrap()
+            )
+        })
         .collect();
     ([(header::CONTENT_TYPE, "text/event-stream")], body).into_response()
 }
@@ -45,8 +52,14 @@ async fn serve(script: impl Fn(usize, &[String]) -> Vec<Event> + Send + Sync + '
         requests: Default::default(),
         script: Arc::new(script),
     };
+    let config = || async {
+        axum::Json(
+            serde_json::json!({"issuer": "http://127.0.0.1:1", "client_id": "yoink", "scopes": ["openid"]}),
+        )
+    };
     let app = Router::new()
         .route("/v1/mirror", post(mirror))
+        .route(nfi_auth::CONFIG_PATH, axum::routing::get(config))
         .with_state(f.clone());
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", l.local_addr().unwrap());
@@ -98,6 +111,7 @@ async fn yoink(url: &str, token: Option<&str>, args: &[String]) -> (i32, String)
         .env_remove("YOINK_TOKEN")
         .env_remove("YOINK_TOKEN_FILE")
         .env_remove("NFI_URL")
+        .env_remove("NFI_ALLOW_INSECURE")
         .stdin(std::process::Stdio::null());
     if let Some(t) = token {
         c.env("YOINK_TOKEN", t);
@@ -179,16 +193,64 @@ async fn authentication() {
     let (url, fake) = serve(|_, _| vec![]).await;
     let (code, err) = yoink(&url, None, std::slice::from_ref(&a)).await;
     assert_eq!(code, 1);
+    // Known before any request (none is sent: its 401 would show).
     assert!(
-        err.contains("requires authentication") && err.contains("yoink login"),
+        err.contains("authentication required: run `yoink login`") && !err.contains("401"),
         "{err}"
     );
     let (code, err) = yoink(&url, Some("wrong"), std::slice::from_ref(&a)).await;
     assert_eq!(code, 1);
-    assert!(err.contains("401") && err.contains("yoink login"), "{err}");
+    assert!(
+        err.contains("401") && err.contains("the token was rejected"),
+        "{err}"
+    );
     assert!(fake.requests.lock().unwrap().is_empty());
 
     let (code, err) = yoink(&url, Some("tok"), &["hello@1.0".into()]).await;
     assert_eq!(code, 1);
     assert!(err.contains("not yet supported"), "{err}");
+}
+
+/// A token is not sent over plain HTTP to a host other than loopback unless
+/// allowed: the command fails before any request (192.0.2.1 is unroutable).
+#[tokio::test]
+async fn insecure_url_is_refused() {
+    let (code, err) = yoink("http://192.0.2.1", Some("tok"), &[purl(0, "a")]).await;
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("refusing to use credentials with http://192.0.2.1")
+            && err.contains("--allow-insecure or set NFI_ALLOW_INSECURE=1"),
+        "{err}"
+    );
+}
+
+/// A login the NFI service needs is known before nix evaluates anything:
+/// without a terminal the command fails then, having sent NFI no request
+/// but for its settings.
+#[tokio::test(flavor = "multi_thread")]
+async fn nfi_login_needed_before_evaluating() {
+    use std::os::unix::fs::PermissionsExt;
+    let idp = nfi_test_support::MockIdp::start("nfi").await;
+    let nfi = nfi_test_support::Impostor::start(&idp).await;
+    let (url, fake) = serve(|_, _| vec![]).await;
+    let d = tempfile::tempdir().unwrap();
+    let (nix, ran) = (d.path().join("nix"), d.path().join("ran"));
+    std::fs::write(&nix, format!("#!/bin/sh\ntouch '{}'\nexit 1\n", ran.display())).unwrap();
+    std::fs::set_permissions(&nix, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let args = [
+        "--nix".to_string(),
+        nix.display().to_string(),
+        "--nfi-url".into(),
+        nfi.url().into(),
+        "nixpkgs#hello".into(),
+    ];
+    let (code, err) = yoink(&url, Some("tok"), &args).await;
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("authentication required: run `yoink login` or set NFI_TOKEN"),
+        "{err}"
+    );
+    assert!(!ran.exists());
+    assert_eq!((idp.config_fetches(), nfi.requests()), (1, 0));
+    assert!(fake.requests.lock().unwrap().is_empty());
 }

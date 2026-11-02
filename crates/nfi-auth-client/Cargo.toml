@@ -1,0 +1,23 @@
+[package]
+name = "nfi-auth-client"
+description = "OIDC device code login, token refresh and the token cache for the nfi and yoink CLIs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+nfi-auth.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+sha2.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+nfi-test-support.workspace = true

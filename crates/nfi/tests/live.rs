@@ -111,7 +111,7 @@ async fn live_end_to_end() {
         );
     }
     let (code, out, err) =
-        tokio::task::block_in_place(|| nfi(&["--json", "show", "hello", "--commit", &commit[..12]]));
+        tokio::task::block_in_place(|| nfi(&["--json", "show", "hello", "--commit", &commit]));
     assert_eq!(code, Some(0), "{err}");
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["pname"], "hello");

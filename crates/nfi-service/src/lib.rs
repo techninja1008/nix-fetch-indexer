@@ -7,6 +7,7 @@ pub mod check;
 pub mod copy;
 pub mod ingest;
 pub mod jobs;
+pub mod minimise;
 pub mod prune;
 pub mod query;
 pub mod search;

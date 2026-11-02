@@ -7,35 +7,15 @@
 
 use crate::copy::{CopyBuf, copy_in};
 use anyhow::{Context, Result};
+use nfi_api::IngestReport;
 use nfi_interchange::{Bundle, Dataset};
-use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 
 /// Advisory lock key serialising all writers (ingest, prune).
 pub const WRITE_LOCK: i64 = 0x6e66_6900;
-
-#[derive(Debug, Default, Serialize)]
-pub struct IngestReport {
-    pub releases: Vec<String>,
-    /// `<release> <closure type>` for each closure ingested.
-    pub closures: Vec<String>,
-    pub store_paths: usize,
-    /// Store paths not previously in the database.
-    pub new_store_paths: usize,
-    pub references: usize,
-    pub missing: usize,
-    pub packages: usize,
-    pub outpaths: usize,
-    pub programs: usize,
-    /// `<release> <eval type>` for each evaluation ingested.
-    pub evals: Vec<String>,
-    pub eval_errors: usize,
-    /// Attributes whose search documents need refreshing.
-    #[serde(skip)]
-    pub touched_attrs: BTreeSet<String>,
-}
 
 pub fn package_key(p: &nfi_interchange::Package) -> String {
     let mut p = p.clone();
@@ -52,16 +32,19 @@ async fn exec(tx: &mut Transaction<'_, Postgres>, sql: &str) -> Result<u64> {
         .rows_affected())
 }
 
+/// Ingest `bundle`; also returns the attributes whose search documents need
+/// refreshing.
 pub async fn ingest(
     pool: &PgPool,
     bundle: &Bundle,
     progress: &(dyn Fn(String) + Sync),
-) -> Result<IngestReport> {
+) -> Result<(IngestReport, BTreeSet<String>)> {
     bundle
         .validate()
         .map_err(anyhow::Error::msg)
         .context("invalid bundle")?;
     let mut report = IngestReport::default();
+    let mut touched_attrs = BTreeSet::new();
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(WRITE_LOCK)
@@ -250,7 +233,7 @@ pub async fn ingest(
                 if n > 0 {
                     closures_text.push(',');
                 }
-                closures_text.push_str(&id.to_string());
+                let _ = write!(closures_text, "{id}");
             }
             closures_text.push('}');
             paths
@@ -378,7 +361,7 @@ pub async fn ingest(
                 pr.field(&key).field(id);
                 pr.end_row();
             }
-            report.touched_attrs.insert(p.attr.clone());
+            touched_attrs.insert(p.attr.clone());
         }
         report.packages = pk.rows;
         copy_in(&mut tx, "t_pkgs", pk).await?;
@@ -451,7 +434,7 @@ pub async fn ingest(
                 buf.field(id).field(&e.name).field(&e.system).field(&e.attr);
                 buf.end_row();
             }
-            report.touched_attrs.insert(e.attr.clone());
+            touched_attrs.insert(e.attr.clone());
         }
         report.programs = buf.rows;
         copy_in(&mut tx, "t_prog", buf).await?;
@@ -493,5 +476,5 @@ pub async fn ingest(
 
     progress("committing".into());
     tx.commit().await?;
-    Ok(report)
+    Ok((report, touched_attrs))
 }

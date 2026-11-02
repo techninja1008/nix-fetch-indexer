@@ -77,21 +77,7 @@ impl ClosureBuilder {
     /// Index of the closure of `eval` (a bundle eval index) with the given
     /// closure type name, adding it if absent.
     pub fn ensure_closure(&mut self, eval: usize, closure_type: &str) -> usize {
-        let eval = eval as u32;
-        match self
-            .closures
-            .iter()
-            .position(|c| c.eval == eval && c.closure_type == closure_type)
-        {
-            Some(i) => i,
-            None => {
-                self.closures.push(Closure {
-                    eval,
-                    closure_type: closure_type.to_string(),
-                });
-                self.closures.len() - 1
-            }
-        }
+        crate::model::ensure_closure(&mut self.closures, eval as u32, closure_type)
     }
 
     pub fn closures(&self) -> &[Closure] {
@@ -231,6 +217,28 @@ pub struct EvalErrorsBuilder {
 }
 
 impl EvalErrorsBuilder {
+    /// Record that an evaluation's errors are known (it may have none).
+    pub fn cover(&mut self, eval: usize) {
+        self.section.evals.set(eval);
+    }
+
+    /// Record a failed attribute in an evaluation, covering it.
+    pub fn add(&mut self, attr: &str, system: &str, eval: usize) {
+        self.cover(eval);
+        let k = (attr.to_string(), system.to_string());
+        match self.index.get(&k) {
+            Some(&i) => self.section.errors[i].evals.set(eval),
+            None => {
+                self.index.insert(k, self.section.errors.len());
+                self.section.errors.push(EvalError {
+                    attr: attr.to_string(),
+                    system: system.to_string(),
+                    evals: Bitset::single(eval),
+                });
+            }
+        }
+    }
+
     /// Add a section, remapping eval indices (evaluations mapped to `None`
     /// are dropped).
     pub fn extend_section(&mut self, section: &EvalErrorsSection, remap: &dyn Fn(usize) -> Option<usize>) {
@@ -360,16 +368,21 @@ fn program_key(p: &Program) -> (String, String, String) {
 }
 
 /// Merge `inputs` into a single bundle: union of release tables (by name),
-/// union of entries (by key) with OR-ed release bits.
-pub fn merge(inputs: impl IntoIterator<Item = Bundle>) -> Bundle {
+/// union of entries (by key) with OR-ed release bits. Each input must pass
+/// [`Bundle::validate`]; the first that does not is reported (counting from
+/// 1) and nothing is merged.
+pub fn merge(inputs: impl IntoIterator<Item = Bundle>) -> Result<Bundle, String> {
     let mut out = Bundle::default();
     let mut closure: Option<ClosureBuilder> = None;
-    let mut packages: Option<(HashMap<Package, usize>, Vec<Package>)> = None;
-    let mut outpaths: Option<(HashMap<_, usize>, Vec<Outpaths>)> = None;
-    let mut programs: Option<(HashMap<_, usize>, Vec<Program>)> = None;
+    let mut packages: Option<Dedup<_, Package>> = None;
+    let mut outpaths: Option<Dedup<_, Outpaths>> = None;
+    let mut programs: Option<Dedup<_, Program>> = None;
     let mut eval_errors: Option<EvalErrorsBuilder> = None;
 
-    for input in inputs {
+    for (n, input) in inputs.into_iter().enumerate() {
+        input
+            .validate()
+            .map_err(|e| format!("merge input {}: {e}", n + 1))?;
         let map: Vec<usize> = input
             .releases
             .iter()
@@ -393,56 +406,44 @@ pub fn merge(inputs: impl IntoIterator<Item = Bundle>) -> Bundle {
                 .extend_section(e, &eremap);
         }
         if let Some(s) = input.packages {
-            let (idx, v) = packages.get_or_insert_with(Default::default);
-            for e in s.entries {
-                let bits = e.releases.remap(remap);
-                let k = package_key(&e);
-                match idx.get(&k) {
-                    Some(&i) => v[i].releases.union_with(&bits),
-                    None => {
-                        idx.insert(k, v.len());
-                        v.push(Package { releases: bits, ..e });
-                    }
-                }
-            }
+            packages
+                .get_or_insert_with(Dedup::packages)
+                .extend(s.entries.into_iter().map(|e| Package {
+                    releases: e.releases.remap(remap),
+                    ..e
+                }));
         }
         if let Some(s) = input.outpaths {
-            let (idx, v) = outpaths.get_or_insert_with(Default::default);
-            for e in s.entries {
-                let bits = e.releases.remap(remap);
-                let k = outpaths_key(&e);
-                match idx.get(&k) {
-                    Some(&i) => v[i].releases.union_with(&bits),
-                    None => {
-                        idx.insert(k, v.len());
-                        v.push(Outpaths { releases: bits, ..e });
-                    }
-                }
-            }
+            outpaths
+                .get_or_insert_with(Dedup::outpaths)
+                .extend(s.entries.into_iter().map(|e| Outpaths {
+                    releases: e.releases.remap(remap),
+                    ..e
+                }));
         }
         if let Some(s) = input.programs {
-            let (idx, v) = programs.get_or_insert_with(Default::default);
-            for e in s.entries {
-                let bits = e.releases.remap(remap);
-                let k = program_key(&e);
-                match idx.get(&k) {
-                    Some(&i) => v[i].releases.union_with(&bits),
-                    None => {
-                        idx.insert(k, v.len());
-                        v.push(Program { releases: bits, ..e });
-                    }
-                }
-            }
+            programs
+                .get_or_insert_with(Dedup::programs)
+                .extend(s.entries.into_iter().map(|e| Program {
+                    releases: e.releases.remap(remap),
+                    ..e
+                }));
         }
     }
     out.closure = closure.map(ClosureBuilder::finish);
-    out.packages = packages.map(|(_, entries)| PackagesSection { entries });
-    out.outpaths = outpaths.map(|(_, entries)| OutpathsSection { entries });
-    out.programs = programs.map(|(_, entries)| ProgramsSection { entries });
+    out.packages = packages.map(|d| PackagesSection {
+        entries: d.into_entries(),
+    });
+    out.outpaths = outpaths.map(|d| OutpathsSection {
+        entries: d.into_entries(),
+    });
+    out.programs = programs.map(|d| ProgramsSection {
+        entries: d.into_entries(),
+    });
     out.eval_errors = eval_errors.map(EvalErrorsBuilder::finish);
     sort_evals(&mut out);
     normalize(&mut out);
-    out
+    Ok(out)
 }
 
 /// Sort the evaluation table by release and eval type, so that merging is

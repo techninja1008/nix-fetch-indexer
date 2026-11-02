@@ -1,12 +1,12 @@
-use nfi_auth::client::{Session, TokenStore};
-use nfi_auth::server::{AuthError, Authenticator, Expr, OidcSettings};
-use nfi_auth::testing::MockIdp;
+use nfi_auth_client::{Credentials, StoredToken, TokenStore};
+use nfi_auth_server::{AuthError, Authenticator, Expr, OidcSettings};
+use nfi_test_support::MockIdp;
 use serde_json::json;
 
 #[tokio::test]
 async fn validates_tokens() {
     let idp = MockIdp::start("cli").await;
-    let mut s = idp.settings();
+    let mut s = OidcSettings::new(idp.issuer(), idp.client_id());
     s.session = Some(Expr::new("claims.sid").unwrap());
     let a = Authenticator::new(s).unwrap();
     let p = a
@@ -43,7 +43,7 @@ async fn validates_tokens() {
     ));
 
     // A username expression yielding nothing forbids the token.
-    let mut s = idp.settings();
+    let mut s = OidcSettings::new(idp.issuer(), idp.client_id());
     s.username = Some(Expr::new("has(claims.email) ? claims.email : null").unwrap());
     let a = Authenticator::new(s).unwrap();
     assert!(matches!(
@@ -54,50 +54,30 @@ async fn validates_tokens() {
 
 #[tokio::test]
 async fn unreachable_provider() {
-    let a = Authenticator::new(OidcSettings {
-        issuer: "http://127.0.0.1:1".into(),
-        client_id: "c".into(),
-        audience: None,
-        scopes: vec![],
-        username: None,
-        session: None,
-    })
-    .unwrap();
+    let a = Authenticator::new(OidcSettings::new("http://127.0.0.1:1", "c")).unwrap();
     let idp = MockIdp::start("c").await;
     let r = a.authenticate(&idp.token(json!({"sub": "1"}))).await;
     assert!(matches!(r, Err(AuthError::Unavailable(_))), "{r:?}");
 }
 
+/// A refreshed login (as the CLIs get it) validates.
 #[tokio::test]
-async fn device_login_and_refresh() {
+async fn refreshed_login_validates() {
     let idp = MockIdp::start("cli").await;
-    let a = Authenticator::new(idp.settings()).unwrap();
+    let a = Authenticator::new(OidcSettings::new(idp.issuer(), idp.client_id())).unwrap();
     let d = tempfile::tempdir().unwrap();
-    let session = Session::new(TokenStore::at(d.path())).unwrap();
-    let cfg = a.config();
-    assert_eq!(session.cached_token_for(&cfg).await.unwrap(), None);
-
-    let mut prompted = None;
-    let t = session
-        .device_login(&cfg, |p| prompted = Some(p.user_code.clone()))
-        .await
+    let store = TokenStore::at(d.path());
+    store
+        .save_token(&StoredToken {
+            issuer: idp.issuer().into(),
+            client_id: idp.client_id().into(),
+            id_token: idp.token(json!({"sub": "1", "exp": 1000})),
+            refresh_token: Some("rt-1".into()),
+        })
         .unwrap();
-    assert_eq!(prompted.as_deref(), Some("CODE-0"));
-    assert_eq!(a.authenticate(&t.id_token).await.unwrap().username, "alice");
-    assert_eq!(
-        session.cached_token_for(&cfg).await.unwrap(),
-        Some(t.id_token.clone())
-    );
-    assert_eq!(idp.refreshes(), 0);
-
-    // An expired cached token is refreshed transparently.
-    idp.set_token_lifetime(-10);
-    let t = session.device_login(&cfg, |_| {}).await.unwrap();
-    idp.set_token_lifetime(3600);
-    idp.set_login_claims(json!({"sub": "u1", "preferred_username": "alice2"}));
-    let fresh = session.cached_token_for(&cfg).await.unwrap().unwrap();
-    assert_ne!(fresh, t.id_token);
+    store.record_url(idp.issuer(), &idp.auth_config()).unwrap();
+    let creds = Credentials::new("t", idp.issuer(), None, "").with_store(store);
+    let t = creds.current().await.unwrap().unwrap();
     assert_eq!(idp.refreshes(), 1);
-    assert_eq!(a.authenticate(&fresh).await.unwrap().username, "alice2");
-    assert_eq!(idp.device_logins(), 2);
+    assert_eq!(a.authenticate(&t).await.unwrap().username, "alice");
 }

@@ -1,23 +1,29 @@
 //! Service side: ID token validation, principal extraction and CEL policies.
 //!
 //! An [`Authenticator`] validates an OIDC ID token against the issuer's JWKS
-//! (signature, `iss`, `aud`, `exp`) and turns its claims into a
-//! [`Principal`] with CEL expressions. Authorisation is a CEL expression
-//! ([`Expr`]) that must evaluate to `true`; it sees the variables
-//! [`Principal::vars`] provides plus any the service adds.
+//! (signature, `iss`, `aud`, `exp`; keys cached as described in [`keys`])
+//! and turns its claims into a [`Principal`] with CEL expressions.
+//! Authorisation is a CEL expression ([`Expr`]) that must evaluate to
+//! `true`; it sees the variables [`Principal::vars`] provides plus any the
+//! service adds. A [`Guard`] puts this (or a fixed token, or nothing) in
+//! front of a listener with [`middleware`].
 //!
 //! CEL variables:
 //! - `claims`: the token's claims, as a map.
 //! - `user`: `{"username": string, "session": string or null}`.
 //! - whatever else the service documents, e.g. `request`.
 
-use crate::AuthConfig;
+mod guard;
+pub mod keys;
+
+pub use guard::{Caller, Guard, middleware};
+
 use anyhow::{Context as _, Result, bail};
-use jsonwebtoken::jwk::JwkSet;
-use jsonwebtoken::{Algorithm, DecodingKey, Validation};
-use serde::Deserialize;
+use jsonwebtoken::{Algorithm, Validation};
+use nfi_auth::{AuthConfig, Whoami};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 /// CEL variables, by name.
 pub type Vars = serde_json::Map<String, serde_json::Value>;
@@ -26,8 +32,9 @@ pub type Vars = serde_json::Map<String, serde_json::Value>;
 pub const DEFAULT_USERNAME_EXPR: &str =
     "has(claims.preferred_username) ? claims.preferred_username : claims.sub";
 
-/// Refetch the JWKS for an unknown key id at most this often.
-const JWKS_MIN_REFRESH: Duration = Duration::from_secs(30);
+/// Used when no whoami expression is configured.
+pub const DEFAULT_WHOAMI_EXPR: &str = "claims";
+
 /// Clock skew allowed when checking `exp`/`nbf`.
 const LEEWAY_SECS: u64 = 60;
 
@@ -115,6 +122,14 @@ impl Expr {
         Self::new(&read_trimmed(path)?).with_context(|| format!("in {}", path.display()))
     }
 
+    /// The expression in `path` if given, else `default`.
+    pub fn from_file_or(path: Option<&Path>, default: &str) -> Result<Self> {
+        match path {
+            Some(p) => Self::from_file(p),
+            None => Self::new(default),
+        }
+    }
+
     pub fn source(&self) -> &str {
         &self.source
     }
@@ -179,13 +194,6 @@ impl Principal {
         );
         v
     }
-
-    pub fn whoami(&self) -> crate::Whoami {
-        crate::Whoami {
-            username: self.username.clone(),
-            session: self.session.clone(),
-        }
-    }
 }
 
 /// How a service validates tokens and identifies callers.
@@ -200,23 +208,51 @@ pub struct OidcSettings {
     pub username: Option<Expr>,
     /// Optional credential or session id of the principal, for logs.
     pub session: Option<Expr>,
+    /// The `additional_info` object of whoami responses, over `claims` and
+    /// `user` [default: [`DEFAULT_WHOAMI_EXPR`]].
+    pub whoami: Option<Expr>,
 }
 
-#[derive(Default)]
-struct Keys {
-    jwks_uri: Option<String>,
-    set: Option<JwkSet>,
-    fetched: Option<Instant>,
-}
+impl OidcSettings {
+    /// Settings for `issuer` and `client_id`, with every other field at its
+    /// default.
+    pub fn new(issuer: &str, client_id: &str) -> Self {
+        OidcSettings {
+            issuer: issuer.into(),
+            client_id: client_id.into(),
+            audience: None,
+            scopes: vec![],
+            username: None,
+            session: None,
+            whoami: None,
+        }
+    }
 
-#[derive(Deserialize)]
-struct Discovery {
-    issuer: String,
-    jwks_uri: String,
+    /// Settings from service flags: the expressions are read from files.
+    pub fn from_files(
+        issuer: &str,
+        client_id: &str,
+        audience: Option<String>,
+        scopes: Vec<String>,
+        username_file: Option<&Path>,
+        session_file: Option<&Path>,
+        whoami_file: Option<&Path>,
+    ) -> Result<Self> {
+        let expr = |f: Option<&Path>| f.map(Expr::from_file).transpose();
+        Ok(OidcSettings {
+            audience,
+            scopes,
+            username: expr(username_file)?,
+            session: expr(session_file)?,
+            whoami: expr(whoami_file)?,
+            ..Self::new(issuer, client_id)
+        })
+    }
 }
 
 /// Validates ID tokens and extracts principals. Discovery and JWKS are
-/// fetched on first use; an unknown key id triggers a (rate-limited) refetch.
+/// fetched on first use (or by [`Authenticator::start`]) and cached as
+/// described in [`keys`].
 pub struct Authenticator {
     issuer: String,
     client_id: String,
@@ -224,8 +260,8 @@ pub struct Authenticator {
     scopes: Vec<String>,
     username: Expr,
     session: Option<Expr>,
-    http: reqwest::Client,
-    keys: tokio::sync::RwLock<Keys>,
+    whoami: Expr,
+    keys: Arc<keys::KeyCache>,
 }
 
 /// The default scopes advertised to clients.
@@ -235,8 +271,14 @@ pub fn default_scopes() -> Vec<String> {
 
 impl Authenticator {
     pub fn new(s: OidcSettings) -> Result<Self> {
+        let issuer = s.issuer.trim_end_matches('/').to_string();
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .user_agent(concat!("nfi-auth/", env!("CARGO_PKG_VERSION")))
+            .build()?;
         Ok(Authenticator {
-            issuer: s.issuer.trim_end_matches('/').to_string(),
+            keys: Arc::new(keys::KeyCache::new(issuer.clone(), http)),
+            issuer,
             audience: s.audience.unwrap_or_else(|| s.client_id.clone()),
             client_id: s.client_id,
             scopes: if s.scopes.is_empty() {
@@ -249,75 +291,70 @@ impl Authenticator {
                 None => Expr::new(DEFAULT_USERNAME_EXPR)?,
             },
             session: s.session,
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .user_agent(concat!("nfi-auth/", env!("CARGO_PKG_VERSION")))
-                .build()?,
-            keys: Default::default(),
+            whoami: match s.whoami {
+                Some(e) => e,
+                None => Expr::new(DEFAULT_WHOAMI_EXPR)?,
+            },
         })
     }
 
-    /// The settings advertised at [`crate::CONFIG_PATH`].
+    /// [`Authenticator::new`] and fetch the provider's keys, at service
+    /// startup. A discovery document for another issuer is an error; an
+    /// unreachable provider only a warning (keys are fetched on demand).
+    pub async fn start(s: OidcSettings) -> Result<Arc<Self>> {
+        let a = Self::new(s)?;
+        match a.prefetch().await {
+            Ok(()) => {}
+            Err(AuthError::Unavailable(e)) => {
+                tracing::warn!(error = %e, "could not fetch the OpenID provider's keys yet");
+            }
+            Err(e) => bail!("{e}"),
+        }
+        Ok(Arc::new(a))
+    }
+
+    /// Change how often keys are refetched for an unknown key id (default
+    /// [`keys::DEFAULT_MIN_REFETCH`]) and when a key set is refreshed in the
+    /// background (default [`keys::DEFAULT_MAX_AGE`]); for tests. Call it
+    /// before the authenticator is used.
+    pub fn with_key_refresh(mut self, min_refetch: Duration, max_age: Duration) -> Self {
+        let k = Arc::get_mut(&mut self.keys).expect("the authenticator has not been used yet");
+        k.min_refetch = min_refetch;
+        k.max_age = max_age;
+        self
+    }
+
+    /// The settings advertised at [`nfi_auth::CONFIG_PATH`] (`anonymous` is
+    /// the [`Guard`]'s business and false here).
     pub fn config(&self) -> AuthConfig {
         AuthConfig {
             issuer: self.issuer.clone(),
             client_id: self.client_id.clone(),
             scopes: self.scopes.clone(),
+            anonymous: false,
         }
     }
 
-    /// Fetch discovery and keys now, e.g. at startup.
+    /// Fetch discovery and keys now.
     pub async fn prefetch(&self) -> Result<(), AuthError> {
-        let mut k = self.keys.write().await;
-        self.refresh(&mut k).await
+        self.keys.prefetch().await
     }
 
-    async fn refresh(&self, k: &mut Keys) -> Result<(), AuthError> {
-        let unavailable = |e: anyhow::Error| AuthError::Unavailable(format!("{e:#}"));
-        k.fetched = Some(Instant::now());
-        if k.jwks_uri.is_none() {
-            let url = format!("{}/.well-known/openid-configuration", self.issuer);
-            let d: Discovery = get_json(&self.http, &url).await.map_err(unavailable)?;
-            if d.issuer.trim_end_matches('/') != self.issuer {
-                return Err(AuthError::Internal(format!(
-                    "issuer mismatch: discovery document at {url} is for {}",
-                    d.issuer
-                )));
-            }
-            k.jwks_uri = Some(d.jwks_uri);
-        }
-        let uri = k.jwks_uri.clone().expect("set above");
-        k.set = Some(get_json(&self.http, &uri).await.map_err(unavailable)?);
-        Ok(())
-    }
-
-    async fn key(&self, kid: Option<&str>) -> Result<DecodingKey, AuthError> {
-        let find = |k: &Keys| -> Option<Result<DecodingKey, AuthError>> {
-            let set = k.set.as_ref()?;
-            let jwk = match kid {
-                Some(kid) => set.find(kid)?,
-                None if set.keys.len() == 1 => &set.keys[0],
-                None => return None,
-            };
-            Some(DecodingKey::from_jwk(jwk).map_err(|e| AuthError::Internal(format!("unusable JWK: {e}"))))
+    /// The whoami response for `p`: `additional_info` is the whoami
+    /// expression's result, which must be a map.
+    pub fn whoami(&self, p: &Principal) -> Result<Whoami> {
+        let v = self.whoami.eval(&p.vars())?;
+        let json = v
+            .json()
+            .map_err(|e| anyhow::anyhow!("{:?}: converting the result to JSON: {e}", self.whoami.source()))?;
+        let serde_json::Value::Object(additional_info) = json else {
+            bail!("{:?} evaluated to {json}, not a map", self.whoami.source());
         };
-        if let Some(r) = find(&*self.keys.read().await) {
-            return r;
-        }
-        let mut k = self.keys.write().await;
-        if let Some(r) = find(&k) {
-            return r;
-        }
-        if k.set.is_none() || k.fetched.is_none_or(|t| t.elapsed() >= JWKS_MIN_REFRESH) {
-            self.refresh(&mut k).await?;
-            if let Some(r) = find(&k) {
-                return r;
-            }
-        }
-        Err(AuthError::Invalid(format!(
-            "unknown signing key {}",
-            kid.unwrap_or("(no kid)")
-        )))
+        Ok(Whoami {
+            username: p.username.clone(),
+            session: p.session.clone(),
+            additional_info,
+        })
     }
 
     /// Validate an ID token and extract its principal.
@@ -326,7 +363,7 @@ impl Authenticator {
         if matches!(header.alg, Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512) {
             return Err(AuthError::Invalid("symmetric signatures are not accepted".into()));
         }
-        let key = self.key(header.kid.as_deref()).await?;
+        let key = self.keys.key(header.kid.as_deref(), header.alg).await?;
         let mut v = Validation::new(header.alg);
         v.set_issuer(&[&self.issuer, &format!("{}/", self.issuer)]);
         v.set_audience(&[&self.audience]);
@@ -361,7 +398,7 @@ impl Authenticator {
     }
 }
 
-async fn get_json<T: serde::de::DeserializeOwned>(http: &reqwest::Client, url: &str) -> Result<T> {
+pub(crate) async fn get_json<T: serde::de::DeserializeOwned>(http: &reqwest::Client, url: &str) -> Result<T> {
     let r = http
         .get(url)
         .send()

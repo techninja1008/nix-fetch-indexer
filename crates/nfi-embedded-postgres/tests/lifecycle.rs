@@ -1,4 +1,6 @@
-use nfi_embedded_postgres::{EmbeddedPostgres, Options, PORT, USER, find_bin_dir};
+use nfi_embedded_postgres::{EmbeddedPostgres, Options, PORT, USER, find_bin_dir, is_root};
+use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
 use std::process::Command;
 
 fn psql(bin: &std::path::Path, pg: &EmbeddedPostgres, sql: &str) -> String {
@@ -19,31 +21,58 @@ fn alive(pid: u32) -> bool {
             .contains(") Z ")
 }
 
-#[test]
-fn start_persist_restart_and_version_check() {
-    // SAFETY: no preconditions.
-    if unsafe { libc_geteuid() } == 0 {
-        eprintln!("skipping: PostgreSQL cannot run as root");
-        let dir = tempfile::tempdir().unwrap();
-        let err = EmbeddedPostgres::start(&Options::new(dir.path())).err().unwrap();
-        assert!(format!("{err:#}").contains("root"));
-        return;
+/// The `nobody` user and group.
+const NOBODY: u32 = 65534;
+
+/// PostgreSQL refuses to run as root, so as root, check that starting fails
+/// and run test `name` again in a child process of this test binary as
+/// `nobody`. Returns whether it did (the caller then returns).
+fn ran_unprivileged(name: &str) -> bool {
+    if !is_root() {
+        return false;
     }
-    let bin = match find_bin_dir(
-        std::env::var_os("NFI_TEST_PG_BINDIR")
-            .map(std::path::PathBuf::from)
-            .as_deref(),
-    ) {
-        Ok(b) => b,
+    let dir = tempfile::tempdir().unwrap();
+    let err = EmbeddedPostgres::start(&Options::new(dir.path())).err().unwrap();
+    assert!(format!("{err:#}").contains("root"));
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args([name, "--exact", "--nocapture", "--test-threads=1"])
+        .current_dir("/")
+        .uid(NOBODY)
+        .gid(NOBODY)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    eprintln!(
+        "{name} as nobody:\n{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{name} as nobody: {}", out.status);
+    assert!(stdout.contains("1 passed"), "{name} did not run as nobody");
+    true
+}
+
+/// The server binaries, or `None` to skip (unless services are required).
+fn bin_dir() -> Option<PathBuf> {
+    let explicit = std::env::var_os("NFI_TEST_PG_BINDIR").map(PathBuf::from);
+    match find_bin_dir(explicit.as_deref()) {
+        Ok(b) => Some(b),
         Err(e) => {
             assert!(
                 std::env::var("NFI_TEST_REQUIRE_SERVICES").as_deref() != Ok("1"),
                 "{e:#}"
             );
             eprintln!("skipping: {e:#}");
-            return;
+            None
         }
-    };
+    }
+}
+
+#[test]
+fn start_persist_restart_and_version_check() {
+    if ran_unprivileged("start_persist_restart_and_version_check") {
+        return;
+    }
+    let Some(bin) = bin_dir() else { return };
     let dir = tempfile::tempdir().unwrap();
     let mut opts = Options::new(dir.path().join("pg"));
     opts.bin_dir = Some(bin.clone());
@@ -72,7 +101,28 @@ fn start_persist_restart_and_version_check() {
     assert!(format!("{err:#}").contains("pg_upgrade"), "{err:#}");
 }
 
-unsafe extern "C" {
-    #[link_name = "geteuid"]
-    fn libc_geteuid() -> u32;
+/// A `postmaster.pid` left behind by a server that is gone, naming a PID
+/// now used by another process (here this one, as after a container
+/// restart), does not stop the server from starting.
+#[test]
+fn stale_pid_file_with_live_pid() {
+    if ran_unprivileged("stale_pid_file_with_live_pid") {
+        return;
+    }
+    let Some(bin) = bin_dir() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = Options::new(dir.path().join("pg"));
+    opts.bin_dir = Some(bin.clone());
+    EmbeddedPostgres::start(&opts).unwrap().stop().unwrap();
+
+    let pgdata = dir.path().join("pg/pgdata");
+    let me = std::process::id();
+    std::fs::write(
+        pgdata.join("postmaster.pid"),
+        format!("{me}\n{}\n", pgdata.display()),
+    )
+    .unwrap();
+    let pg = EmbeddedPostgres::start(&opts).unwrap();
+    assert_ne!(pg.pid(), Some(me));
+    assert_eq!(psql(&bin, &pg, "SELECT 1"), "1");
 }

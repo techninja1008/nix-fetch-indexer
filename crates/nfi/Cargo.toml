@@ -15,21 +15,25 @@ name = "nfi"
 path = "src/main.rs"
 
 [dependencies]
-nfi-api = { workspace = true, features = ["client"] }
-nfi-auth = { workspace = true, features = ["client"] }
+nfi-api.workspace = true
+nfi-drv.workspace = true
+nfi-auth-client.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
+reqwest.workspace = true
 clap.workspace = true
 tempfile.workspace = true
 shell-words.workspace = true
 toml = "0.8"
 
 [dev-dependencies]
-nfi-auth = { workspace = true, features = ["testing"] }
+chrono.workspace = true
+nfi-auth-server.workspace = true
+nfi-test-support.workspace = true
 nfi-service = { path = "../nfi-service" }
 nfi-testenv = { path = "../nfi-testenv" }
 nfi-interchange.workspace = true
-reqwest.workspace = true
 nfi-indexer = { path = "../nfi-indexer" }

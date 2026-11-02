@@ -28,7 +28,8 @@ use sha2::Digest;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use yoink_api::{NixTarget, PhaseDef, Purl, Unit};
+use yoink_api::{PhaseDef, Unit};
+use yoink_purl::{NixTarget, Purl};
 use yoink_server::{Job, JobReporter, JobTable, Mirror};
 
 pub const QUEUED: &str = "queued";
@@ -131,9 +132,8 @@ macro_rules! credential_args {
 
         impl $name {
             pub fn credential(&self) -> Result<Credential> {
-                let read = |p: &PathBuf| read_secret(p);
                 if let Some(p) = &self.basic_auth_file {
-                    let s = read(p)?;
+                    let s = read_secret(p)?;
                     let (user, password) = s
                         .split_once(':')
                         .with_context(|| format!("{} must hold user:password", p.display()))?;
@@ -143,11 +143,11 @@ macro_rules! credential_args {
                     });
                 }
                 if let Some(p) = &self.bearer_token_file {
-                    return Ok(Credential::Bearer(read(p)?));
+                    return Ok(Credential::Bearer(read_secret(p)?));
                 }
                 if let (Some(n), Some(p)) = (&self.header_name, &self.header_file) {
                     let name = HeaderName::try_from(n.as_str()).with_context(|| format!("header name {n:?}"))?;
-                    let mut value = HeaderValue::try_from(read(p)?).context("header value")?;
+                    let mut value = HeaderValue::try_from(read_secret(p)?).context("header value")?;
                     value.set_sensitive(true);
                     return Ok(Credential::Header(name, value));
                 }
@@ -425,7 +425,7 @@ impl Inner {
                 if resp.status() == reqwest::StatusCode::NOT_FOUND {
                     return Ok(false);
                 }
-                ok("checking the target", resp).await.map(|_| true)
+                ok(&format!("GET {hash}.narinfo"), resp).await.map(|_| true)
             })
             .await?;
         if present {
@@ -447,7 +447,7 @@ impl Inner {
                         self.cfg.upstream.url
                     )));
                 }
-                Ok(ok("fetching the narinfo", resp).await?.text().await?)
+                Ok(ok(&format!("GET {hash}.narinfo"), resp).await?.text().await?)
             })
             .await?;
         let ni = Narinfo::parse(&text).context("parsing the upstream narinfo")?;
@@ -495,7 +495,7 @@ impl Inner {
                 .body(body.clone())
                 .send()
                 .await?;
-            ok("publishing the narinfo", resp).await.map(|_| ())
+            ok(&format!("PUT {hash}.narinfo"), resp).await.map(|_| ())
         })
         .await?;
         Ok(())

@@ -1,15 +1,40 @@
-//! Request/response types shared by the query service and CLIs, plus the
-//! derivation-graph reduction and minimise planning algorithms.
+//! Request/response types shared by the query service and CLIs.
 
-#[cfg(feature = "client")]
-pub mod client;
 pub mod drv;
-pub mod minimise;
 
+pub use nfi_auth::ErrorBody;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub const DEFAULT_SYSTEM: &str = "x86_64-linux";
+
+// ---------- routes ----------
+
+/// GET, [`SearchQuery`] -> [`SearchResponse`].
+pub const SEARCH_PATH: &str = "/v1/search";
+/// GET `{PACKAGES_PATH}/<attr>`, [`PackageParams`] -> [`PackageInfo`].
+pub const PACKAGES_PATH: &str = "/v1/packages";
+/// POST [`BulkRequest`] -> [`BulkResponse`].
+pub const BULK_PATH: &str = "/v1/lookup/bulk";
+/// POST a derivation graph, [`MinimiseParams`] -> [`MinimiseResponse`].
+pub const MINIMISE_PATH: &str = "/v1/minimise";
+/// GET, [`ReleasesParams`] -> `Vec<`[`ReleaseInfo`]`>`.
+pub const RELEASES_PATH: &str = "/v1/releases";
+/// POST a bundle ([`IngestParams`]) or an [`IngestUrlRequest`] ->
+/// [`JobCreated`]; the job's result is an [`IngestReport`].
+pub const ADMIN_INGEST_PATH: &str = "/admin/v1/ingest";
+/// GET, [`ListParams`] -> `Vec<`[`JobInfo`]`>`; GET `{ADMIN_JOBS_PATH}/<id>`
+/// -> [`JobInfo`].
+pub const ADMIN_JOBS_PATH: &str = "/admin/v1/jobs";
+/// [`RELEASES_PATH`] on the admin listener.
+pub const ADMIN_RELEASES_PATH: &str = "/admin/v1/releases";
+/// POST [`PruneRequest`] -> [`JobCreated`]; the job's result is a
+/// [`PruneReport`].
+pub const ADMIN_PRUNE_PATH: &str = "/admin/v1/prune";
+/// POST -> [`JobCreated`]; the job's result is `{"search_documents": n}`.
+pub const ADMIN_REINDEX_PATH: &str = "/admin/v1/reindex";
+/// POST -> [`JobCreated`]; the job's result is a [`CheckReport`].
+pub const ADMIN_CHECK_PATH: &str = "/admin/v1/check";
 
 // ---------- search ----------
 
@@ -92,6 +117,15 @@ pub struct OutputInfo {
     pub cached: bool,
 }
 
+/// Query parameters of [`PACKAGES_PATH`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PackageParams {
+    pub commit: String,
+    /// Default [`DEFAULT_SYSTEM`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PackageInfo {
     pub attr: String,
@@ -138,12 +172,13 @@ pub struct BulkRequest {
 pub enum ItemStatus {
     Ok,
     UnknownCommit,
-    AmbiguousCommit,
     UnknownAttr,
     /// The attribute exists but no evaluated out paths are indexed for it.
     NoOutpaths,
     /// Out paths are known but (some of) them are not in the cache.
     NotCached,
+    /// Some requested outputs don't exist (see `missing_outputs`).
+    UnknownOutput,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -156,6 +191,12 @@ pub struct BulkItemResult {
     pub release: Option<String>,
     /// Selected outputs to full store paths.
     pub outputs: BTreeMap<String, OutputInfo>,
+    /// With `unknown_output`: the requested outputs that don't exist, and
+    /// the outputs that do.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_outputs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_outputs: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -168,6 +209,16 @@ pub struct BulkResponse {
 }
 
 // ---------- minimise ----------
+
+/// Query parameters of [`MINIMISE_PATH`].
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct MinimiseParams {
+    /// A derivation name matching this many indexed paths or more is too
+    /// common for a [`CLOSE_MISS`] warning; server default when `None`, 0
+    /// disables the check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_miss_threshold: Option<u64>,
+}
 
 /// Result of a minimise query.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -205,7 +256,23 @@ pub struct Warning {
     pub paths: Vec<String>,
 }
 
+/// [`Warning::code`]: the graph was most likely evaluated from a nixpkgs
+/// revision that is not indexed.
+pub const UNINDEXED_NIXPKGS: &str = "unindexed_nixpkgs";
+/// [`Warning::code`]: derivations to build whose name matches indexed paths.
+pub const CLOSE_MISS: &str = "close_miss";
+
 // ---------- releases ----------
+
+/// Query parameters of [`RELEASES_PATH`] and [`ADMIN_RELEASES_PATH`].
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ReleasesParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    /// List each evaluation's errors, not only their count.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub errors: bool,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReleaseInfo {
@@ -239,57 +306,16 @@ pub struct EvalInfo {
     pub errors: Option<Vec<String>>,
 }
 
-impl EvalInfo {
-    /// The error count, falling back to the listed errors (services that
-    /// predate `error_count`).
-    pub fn error_count(&self) -> Option<u64> {
-        self.error_count
-            .or_else(|| self.errors.as_ref().map(|e| e.len() as u64))
-    }
-}
-
-/// A human-readable table of releases, one per line after a header; listed
-/// errors follow their release, one evaluation per line.
-pub fn releases_table(rels: &[ReleaseInfo]) -> String {
-    let mut out = format!(
-        "{:<40} {:<18} {:<12} {:<42} {:<28} EVALS\n",
-        "RELEASE", "CHANNEL", "SERIES", "COMMIT", "DATASETS"
-    );
-    for r in rels {
-        // e.g. `helpers[direct,full] (2 errors)`, `store-paths`.
-        let evals: Vec<String> = r
-            .evals
-            .iter()
-            .map(|e| {
-                let mut s = e.eval_type.clone();
-                if e.closures.iter().any(|c| !c.is_empty()) {
-                    s += &format!("[{}]", e.closures.join(","));
-                }
-                if let Some(n) = e.error_count() {
-                    s += &format!(" ({n} errors)");
-                }
-                s
-            })
-            .collect();
-        out += &format!(
-            "{:<40} {:<18} {:<12} {:<42} {:<28} {}\n",
-            r.name,
-            r.channel,
-            r.series,
-            r.commit,
-            r.datasets.join(","),
-            evals.join(", ")
-        );
-        for e in &r.evals {
-            if let Some(errors) = e.errors.as_ref().filter(|e| !e.is_empty()) {
-                out += &format!("    {} errors: {}\n", e.eval_type, errors.join(" "));
-            }
-        }
-    }
-    out
-}
-
 // ---------- admin ----------
+
+/// Query parameters of an upload to [`ADMIN_INGEST_PATH`].
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct IngestParams {
+    /// Closure type to read a version 2 bundle (which predates closure
+    /// types) as; default `store-paths`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v2_closure_type: Option<String>,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IngestUrlRequest {
@@ -321,6 +347,14 @@ impl PruneRequest {
     pub fn is_empty(&self) -> bool {
         self.releases.is_empty() && self.commits.is_empty() && self.channels.is_empty()
     }
+}
+
+/// Query parameters of [`ADMIN_JOBS_PATH`].
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ListParams {
+    /// Default 50, at most 1000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -357,6 +391,43 @@ pub struct JobInfo {
     pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Result of an ingest job.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct IngestReport {
+    pub releases: Vec<String>,
+    /// `<release> <closure type>` for each closure ingested.
+    pub closures: Vec<String>,
+    pub store_paths: usize,
+    /// Store paths not previously in the database.
+    pub new_store_paths: usize,
+    pub references: usize,
+    pub missing: usize,
+    pub packages: usize,
+    pub outpaths: usize,
+    pub programs: usize,
+    /// `<release> <eval type>` for each evaluation ingested.
+    pub evals: Vec<String>,
+    pub eval_errors: usize,
+    /// Search documents updated; absent without search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_documents: Option<usize>,
+}
+
+/// Result of a prune job.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PruneReport {
+    /// Releases removed entirely.
+    pub releases: Vec<String>,
+    /// `<release> <closure type>` for closures removed from kept releases.
+    pub closures: Vec<String>,
+    pub store_paths_removed: u64,
+    pub packages_removed: u64,
+    /// Search documents after rebuilding the search index; absent without
+    /// search or when no release was removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_documents: Option<usize>,
+}
+
 /// One kind of index inconsistency found by a consistency check.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckIssue {
@@ -384,43 +455,4 @@ pub struct CheckReport {
     pub eval_errors: u64,
     /// Only kinds with at least one occurrence are listed.
     pub issues: Vec<CheckIssue>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ErrorBody {
-    pub error: String,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn releases_table_counts_and_lists_errors() {
-        let eval = |errors: Option<Vec<&str>>| EvalInfo {
-            eval_type: "helpers".into(),
-            closures: vec!["direct".into()],
-            error_count: Some(2),
-            errors: errors.map(|e| e.into_iter().map(String::from).collect()),
-        };
-        let mut r = ReleaseInfo {
-            name: "nixos-25.05.1.aaaa".into(),
-            commit: "a".repeat(40),
-            channel: "nixos-25.05".into(),
-            series: "25.05".into(),
-            url: None,
-            datasets: vec!["closure".into()],
-            evals: vec![eval(None)],
-            indexed_at: chrono::DateTime::UNIX_EPOCH,
-        };
-        let t = releases_table(std::slice::from_ref(&r));
-        assert_eq!(t.lines().count(), 2, "{t}");
-        assert!(t.contains("helpers[direct] (2 errors)"), "{t}");
-        r.evals = vec![eval(Some(vec!["a@x86_64-linux", "b@aarch64-linux"]))];
-        let t = releases_table(&[r]);
-        assert!(
-            t.ends_with("    helpers errors: a@x86_64-linux b@aarch64-linux\n"),
-            "{t}"
-        );
-    }
 }

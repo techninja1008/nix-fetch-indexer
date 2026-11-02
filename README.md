@@ -22,11 +22,16 @@ See [DESIGN.md](DESIGN.md) for the full design.
 Supporting libraries:
 
 - `nfi-interchange`: the bundle format.
-- `nfi-api`: shared API types, the derivation-graph reducer, the minimise planner and an HTTP client.
+- `nfi-api`: shared API types (types only).
+- `nfi-drv`: the derivation-graph reducer.
 - `nfi-embedded-postgres`, `nfi-embedded-meilisearch`: supervised child-process PostgreSQL and Meilisearch for single-node mode.
 - `nfi-testenv`: ephemeral Postgres and Meilisearch for tests.
-- `nfi-auth`: OIDC token validation and CEL policies for services; device code login and the token cache for CLIs.
-- `yoink-api`, `yoink-server`, `yoink-mirror-http`: yoink's API types and client, service core (with the `Mirror` trait), and HTTP cache backend.
+- `nfi-test-support`: a mock OpenID provider and a pseudo-terminal runner for tests.
+- `nfi-service-common`: what nfi-service and yoink-service share: tracing set-up, the shutdown signal and the OIDC flags.
+- `nfi-auth`: authentication protocol types (types only); `nfi-auth-server`: OIDC token validation and CEL policies for services; `nfi-auth-client`: device code login, the token cache and the HTTP error/401 retry helpers for CLIs.
+- `yoink-api`, `yoink-purl`, `yoink-server`, `yoink-mirror-http`: yoink's API types (types only), package URLs, service core (with the `Mirror` trait), and HTTP cache backend.
+
+API clients live with their CLIs: the `nfi` library has the nfi-service client, the `yoink` library the yoink client.
 
 ## Building
 
@@ -301,6 +306,7 @@ Both listeners are open by default. Optionally, callers log in with OIDC (the de
 | `--oidc-scopes` | `NFI_OIDC_SCOPES` | Scopes CLIs request (default `openid,profile,offline_access`) |
 | `--oidc-username-cel-file` | `NFI_OIDC_USERNAME_CEL_FILE` | Username, over `claims` (default `preferred_username`, else `sub`) |
 | `--oidc-session-cel-file` | `NFI_OIDC_SESSION_CEL_FILE` | Optional credential or session id to log, over `claims` (e.g. `claims.sid`) |
+| `--oidc-whoami-cel-file` | `NFI_OIDC_WHOAMI_CEL_FILE` | The map `whoami` reports as `additional_info`, over `claims` and `user` (default `claims`) |
 | `--main-authz-cel-file` | `NFI_MAIN_AUTHZ_CEL_FILE` | Policy for the public API (default `true`) |
 | `--allow-anonymous` | `NFI_ALLOW_ANONYMOUS` | Let requests without a token use the public API |
 | `--admin-token-file` | `NFI_ADMIN_TOKEN_FILE` | Protect the admin listener with a static bearer token |
@@ -312,6 +318,8 @@ Both listeners are open by default. Optionally, callers log in with OIDC (the de
 - Public API with OIDC: a request with a token must carry a valid ID token (401 otherwise) that passes the main policy (403 otherwise). A request without one gets 401, unless `--allow-anonymous`, in which case the policy is skipped.
 - Admin API: open, a static token, or OIDC with the admin policy. The static token and `--admin-oidc` are mutually exclusive.
 - `/healthz` and `/auth/v1/config` never need a token.
+- Startup: the provider's keys are fetched at once. If it is unreachable the service starts anyway (requests get 503 until its keys can be fetched); if its discovery document names another issuer, the service exits.
+- Logs: every accepted request is logged with its method, path, user and session (`-` if none) and its status; a rejected one as `request rejected` with the status and reason.
 
 **Policies** are CEL expressions that must evaluate to `true`. Variables:
 
@@ -327,15 +335,15 @@ Both listeners are open by default. Optionally, callers log in with OIDC (the de
 
 | method | path | description |
 |---|---|---|
-| GET | `/auth/v1/config` | `{"issuer", "client_id", "scopes"}` for CLIs to log in with; 404 when the listener doesn't use OIDC |
-| GET | `/auth/v1/whoami` | `{"username", "session"}` of the caller; 401 when not logged in |
+| GET | `/auth/v1/config` | `{"issuer", "client_id", "scopes", "anonymous"}` for CLIs to log in with (`anonymous`: requests without a token are served too); 404 when the listener doesn't use OIDC |
+| GET | `/auth/v1/whoami` | `{"username", "session", "additional_info"}` of the caller (`additional_info`: the whoami expression's map, by default the token's claims), whether or not the authorisation policy admits them; 401 when not logged in, 404 when the listener doesn't use OIDC |
 
 ### Public API
 
 | method | path | description |
 |---|---|---|
 | GET | `/v1/search?q=&attr=&pname=&version=&program=&system=&release=&channel=&series=&commit=&limit=&offset=` | Search over packages and programs |
-| GET | `/v1/packages/{attr}?commit=&system=` | Metadata, output paths (with a `cached` flag) and programs for an attribute at a commit; unique commit prefixes are accepted |
+| GET | `/v1/packages/{attr}?commit=&system=` | Metadata, output paths (with a `cached` flag) and programs for an attribute at a commit; the commit is a hex prefix of at least 8 digits (any case, the full hash included) that must match exactly one release: a malformed commit or a prefix matching several releases (the error names the prefix and the count) is a 400, and one matching none is a 404 |
 | POST | `/v1/lookup/bulk` | Body `{"items":[{"attr","commit","system"?,"outputs"?}]}`; returns per-item status and outputs, plus the deduplicated closure |
 | POST | `/v1/minimise?close_miss_threshold=` | Body: raw `nix derivation show --recursive` JSON (legacy or v4 format) or a reduced graph `{"derivations":{drv:{outputs,inputDrvs,inputSrcs,fixed}}}` |
 | GET | `/v1/releases?channel=&errors=` | What is in the index: releases (name, commit, channel, series) with their datasets and evaluations: eval type, closure type names, and `error_count` (`null` when errors are not indexed). With `errors=true`, each evaluation with indexed errors also lists them as `errors` (`<attr>@<system>`; `nfi releases --errors`). The same as `/admin/v1/releases` |
@@ -343,7 +351,7 @@ Both listeners are open by default. Optionally, callers log in with OIDC (the de
 **Bulk lookup details**
 
 - Output selection: the default is `out`, or all outputs when there is no `out`. `["*"]` selects all outputs.
-- Item statuses: `ok`, `unknown_commit`, `ambiguous_commit`, `unknown_attr`, `no_outpaths`, `not_cached`.
+- Item statuses: `ok`, `unknown_commit`, `unknown_attr`, `no_outpaths`, `not_cached`, `unknown_output` (a requested output doesn't exist; the item lists `missing_outputs` and `available_outputs` and adds nothing to the closure). Every item's commit must be a full 40-character hex hash (`attr@commit` is lockfile-style, so it must be unambiguous); a request with any other commit, prefixes included, is rejected with a 400 naming the offending items.
 
 **Minimise algorithm**
 
@@ -372,7 +380,7 @@ Both listeners are open by default. Optionally, callers log in with OIDC (the de
 | POST | `/admin/v1/ingest?v2_closure_type=` | Streamed bundle body (binary or JSON), or `{"url": ..., "v2_closure_type": ...}` with `Content-Type: application/json`; returns `{"id"}`. `v2_closure_type` (default `store-paths`) is the closure type to read a version 2 bundle as (`nfi-admin ingest --v2-closure-type`) |
 | GET | `/admin/v1/jobs`, `/admin/v1/jobs/{id}` | Job status, progress and result |
 | GET | `/admin/v1/releases?channel=&errors=` | The same as the public `/v1/releases` |
-| POST | `/admin/v1/prune` | `{"releases":[], "commits":[], "channels":[], "closure_types":[]}`; garbage-collects orphaned paths and packages, then rebuilds search. With `closure_types` (`nfi-admin prune --closure-type`), only the closures of those closure types (e.g. `helpers:full`) are removed from the selected releases, and the releases are kept; evaluations left with neither closures nor indexed errors are removed too |
+| POST | `/admin/v1/prune` | `{"releases":[], "commits":[], "channels":[], "closure_types":[]}`; commits are prefixes of at least 8 hex digits, and one matching more than one release is rejected (400) while one matching none selects nothing. Garbage-collects orphaned paths and packages, then rebuilds search. With `closure_types` (`nfi-admin prune --closure-type`), only the closures of those closure types (e.g. `helpers:full`) are removed from the selected releases, and the releases are kept; evaluations left with neither closures nor indexed errors are removed too |
 | POST | `/admin/v1/reindex` | Rebuilds the Meilisearch index from Postgres and swaps it in |
 | POST | `/admin/v1/check` | Checks closure-index consistency (see below); the job result is a report with `ok`, counts and example rows per issue |
 
@@ -400,12 +408,14 @@ The check takes about 20 s on all of `nixos-26.05`: 2.7M paths and 38M reference
 ## CLIs
 
 ```sh
-export NFI_URL=http://nfi.example:8080
+export NFI_URL=https://nfi.example
 nfi releases --channel nixos-25.05
 nfi search ripgrep --series 25.05
 nfi search --program rg
-nfi show ripgrep --commit ac62194c3917
-nfi bulk ripgrep@ac62194c3917 jq@ac62194c3917 --outputs out,man
+nfi show ripgrep --commit ac62194c3917   # a unique prefix (8+ hex digits) will do
+# attr@commit is for lockfile-style use and must be unambiguous: full hashes only
+C=<full 40-character commit hash>        # from `nfi releases`
+nfi bulk ripgrep@$C jq@$C --outputs out,man
 nfi minimise .#mypackage --fetch-hook 'sh -c "xargs nix-store --realise < {}"'
 nix derivation show --recursive .#foo | nfi minimise -f -
 ```
@@ -422,15 +432,17 @@ nix derivation show --recursive .#foo | nfi minimise -f -
 
 ```sh
 nfi login            # device code flow; prints a URL and code to approve
-nfi whoami           # alice (session ...)
+nfi whoami           # http://...: alice (session ...), then the service's additional_info
 nfi logout
 NFI_TOKEN=$CI_ID_TOKEN nfi releases     # or --token-file / NFI_TOKEN_FILE
 ```
 
-- Tokens: an explicit token (`NFI_TOKEN`, `--token-file`) is sent as is, e.g. an ID token issued to CI with the service's client id as its audience. Otherwise a cached login is used, and refreshed when it expires.
-- Cache: `$XDG_CACHE_HOME/nfi/tokens` (or `$NFI_TOKEN_CACHE`), keyed by provider and client, so `nfi`, `nfi-admin` and `yoink` share a login when their services use the same provider and client. `login` reuses a valid cached login for the same provider unless `--force` is given.
-- On a 401, an interactive CLI (stdin and stderr are terminals) without an explicit token logs in and retries the command once; otherwise it fails and suggests `nfi login`.
-- `nfi-admin` has the same `login`, `logout` and `whoami` commands for the admin listener, and keeps `--token`/`NFI_ADMIN_TOKEN` and `--token-file`/`NFI_ADMIN_TOKEN_FILE` for an explicit token (the static admin token or an ID token).
+- Tokens: an explicit token is sent as is, e.g. an ID token issued to CI with the service's client id as its audience. Precedence: a token on the command line (`nfi-admin --token`), then a token file (`--token-file` or its `*_TOKEN_FILE` variable), then the token variable (`NFI_TOKEN`, `NFI_ADMIN_TOKEN`, `YOINK_TOKEN`); values are trimmed and an empty variable counts as unset. Otherwise the CLI uses the cached login of a URL logged in to, refreshing it when it has less than a minute left. The service's login settings (`/auth/v1/config`, or that it has none) are fetched on the first use of a URL and cached; after that only `login` and a 401 from the service fetch them again. A URL logged in to uses the settings recorded by its login. Cached settings never make a URL receive a token: only a login there does.
+- Cache: `$XDG_CACHE_HOME/nfi/tokens` (or `$NFI_TOKEN_CACHE`, mode 0700), one login per provider and client, with a record of the service URLs it was made for. A login applies only to those URLs: the ones `login` was run for (`yoink login` records both of its URLs) and the ones a command logged in to through its prompt. The provider login is shared between them, so `nfi`, `nfi-admin` and `yoink` use one login for those URLs; a URL that was never logged in to counts as not logged in, even if it names the same provider and client. `login` there reuses the provider login if that service accepts it (no new device flow) and records the URL; `--force` always runs the device flow. `logout` needs no network: it removes the provider login and its URLs, so it also logs out of the other URLs using that login, and says which; for a URL that was never logged in to it removes nothing and says so. If reusing the provider login fails (e.g. the provider is unavailable), `login` warns and runs the device flow; a service that rejects a new login is no longer recorded as logged in (the provider login is kept). A corrupt cache file counts as missing.
+- Prompting: when a command needs a login (the service's settings do not allow anonymous requests) and there is none for that URL, or it has expired, a CLI whose stderr is a terminal runs the device flow up front, before reading stdin, evaluating anything or uploading (stdin may be a pipe); otherwise it fails and suggests `nfi login`, before sending its request. On a 401 when no explicit token was used, the CLI fetches the service's settings again (they may have changed), logs in again once (recording the URL with the new settings) and repeats that one request (never the whole command); an explicit token that is rejected fails with no prompt. A refresh token is dropped only when the provider says it is invalid (`invalid_grant`); other provider errors fail the command (or, where anonymous access is allowed, it continues without the login) and keep it.
+- Plain HTTP: tokens (explicit or cached) are never sent, and logins and refreshes never made, over plain `http://` to a host other than loopback (`localhost`, 127.0.0.0/8, `::1`): not to the service URL, nor to the provider's issuer or endpoints. The command fails before sending anything, unless `--allow-insecure` (all CLIs) or `NFI_ALLOW_INSECURE=1` is given. Requests without a token are not affected.
+- `whoami` never logs in: it sends the login of a URL logged in to, if usable, and otherwise no token; it prints `<url>: <username>` (and the session, if any), then the service's `additional_info` as indented JSON (`--json`: the whole response); `<url>: not authenticated` with exit status 1 without a valid login; `<url>: does not use login` for a listener without OIDC.
+- `nfi-admin` has the same `login`, `logout` and `whoami` commands for the admin listener, and keeps `--token`, `--token-file`/`NFI_ADMIN_TOKEN_FILE` and `NFI_ADMIN_TOKEN` for an explicit token (the static admin token or an ID token).
 
 **Admin CLI**
 
@@ -451,7 +463,7 @@ yoink pulls the dependencies of a flake into a binary cache you control, so that
 
 ```sh
 export YOINK_URL=https://yoink.example NFI_URL=https://nfi.example
-yoink login                       # OIDC device flow (also logs in to NFI if it uses another provider/client)
+yoink login [--force]             # OIDC device flow for the yoink service and NFI (once per provider/client)
 yoink nixpkgs#hello .#devShells.x86_64-linux.default
 yoink .                           # the current flake's default package
 yoink 'pkg:nix/%2Fnix%2Fstore%2F0xy6xjvbl4bm3pq4w6p2b6vfffw4vi9b-hello-2.12.3'
@@ -467,7 +479,8 @@ YOINK_TOKEN=$CI_ID_TOKEN yoink --plain .#foo   # CI: a pre-obtained ID token, li
 **Behaviour**
 
 - The CLI exits only when every path has a result: 0 if all were mirrored, 1 if any failed, or on an unrecoverable error. A dropped connection is resumed by re-posting the unfinished paths (the service deduplicates); it gives up after 5 minutes without progress. `q`/Ctrl-C detaches with status 130, and the service keeps mirroring.
-- **Monitor** (on a terminal): overall progress by path count and by size, and a scrollable field with one indicator per path, in request order. Indicators shrink, from a full line (name, bar, phase, `12.3/45.6 MiB`) down to `[T 57]` (phase abbreviation and percent), to fit as many as possible. Yellow means warnings, red errors. Keys: arrows/`j`/`k` move, Enter shows that path's log, `l` all logs, Esc back, `q` quit; click selects, clicking again opens the log.
+- **Monitor** (on a terminal): overall progress by path count, and a scrollable field with one indicator per path, in request order. Indicators shrink, from a full line (name, bar, phase, `12.3/45.6 MiB`) down to `[T 57]` (phase abbreviation and percent), to fit as many as possible; a finished path shows only its result, not its last phase. Yellow means warnings, red errors. Keys: arrows/`j`/`k` move, Enter shows that path's log, `l` all logs, Esc back, `q` quit; click selects, clicking again opens the log.
+- **Nix's lookup cache**: when any of the PURLs were `pkg:nix`, the CLI finally removes nix's `binary-cache*` files from `$XDG_CACHE_HOME/nix` (`~/.cache/nix`), which remember cache misses, so the paths just mirrored are found by the next nix command.
 - **Plain mode** (not a terminal, or `--plain`): phase changes, errors and results, one per line; `-v` adds warnings and info, `-vv` progress; `-q` only errors.
 - Configuration: `$XDG_CONFIG_HOME/yoink/config.toml` may set `url`, `nfi_url` and `nix`.
 
@@ -487,6 +500,7 @@ The service always requires an OIDC ID token. Options before the backend subcomm
 | `--listen` | listen address (default `0.0.0.0:8090`) |
 | `--oidc-issuer`, `--oidc-client-id`, `--oidc-audience`, `--oidc-scopes` | as for `nfi-service` (see [Authentication](#authentication)) |
 | `--oidc-username-cel-file`, `--oidc-session-cel-file` | CEL giving the username (default `preferred_username`, else `sub`) and an optional session id for logs |
+| `--oidc-whoami-cel-file` | CEL map reported by whoami as `additional_info`; variables `claims`, `user` (default `claims`) |
 | `--authz-cel-file` | CEL policy per request; variables `claims`, `user`, `request` (default `true`) |
 | `--purl-authz-cel-file` | CEL policy per requested PURL; also `purl` (`{type, namespace, name, version, qualifiers, subpath, raw}`), e.g. `purl.type == 'nix'` (default `true`) |
 | `--max-purls` | most PURLs per request (default 100000) |

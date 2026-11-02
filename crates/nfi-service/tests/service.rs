@@ -5,7 +5,7 @@ use nfi_interchange::*;
 use serde_json::{Value, json};
 use std::time::Duration;
 
-use nfi_testenv::{A, bundle, h, path};
+use nfi_testenv::{A, B, bundle, h, path};
 
 fn encode(b: &Bundle, format: Format) -> Vec<u8> {
     let mut v = Vec::new();
@@ -129,18 +129,45 @@ async fn ingest_lookup_bulk_minimise_prune() {
     let (_, none): (u16, Vec<ReleaseInfo>) = c.get("/v1/releases?channel=nope").await;
     assert!(none.is_empty());
 
-    // Direct lookup (with a commit prefix).
-    let (s, p): (u16, PackageInfo) = c.get("/v1/packages/curl?commit=aaaaaaa").await;
+    // Direct lookup.
+    let (s, p): (u16, PackageInfo) = c.get(&format!("/v1/packages/curl?commit={A}")).await;
     assert_eq!(s, 200);
     assert_eq!(p.version.as_deref(), Some("8.0"));
     assert_eq!(p.release.channel, "nixos-25.05");
+    assert_eq!(p.release.commit, A);
     assert!(p.outputs["out"].cached);
     assert!(!p.outputs["dev"].cached);
     assert_eq!(p.programs, vec!["curl"]);
-    let (s, _): (u16, Value) = c.get("/v1/packages/curl?commit=bbbb").await;
+    // A full hash in upper case resolves too.
+    let (s, p): (u16, PackageInfo) = c
+        .get(&format!("/v1/packages/curl?commit={}", A.to_uppercase()))
+        .await;
+    assert_eq!(s, 200);
+    assert_eq!(p.release.commit, A);
+    // Not at release B.
+    let (s, _): (u16, Value) = c.get(&format!("/v1/packages/curl?commit={B}")).await;
     assert_eq!(s, 404);
-    let (s, _): (u16, Value) = c.get("/v1/packages/curl?commit=cccc").await;
-    assert_eq!(s, 404);
+    // So does a unique prefix of at least 8 hex digits, in any case.
+    for prefix in ["aaaaaaaa", "AAAAaaaaAAAA"] {
+        let (s, p): (u16, PackageInfo) = c.get(&format!("/v1/packages/curl?commit={prefix}")).await;
+        assert_eq!(s, 200, "{prefix}");
+        assert_eq!(p.release.commit, A);
+    }
+    // A prefix (or full hash) of no release is an unknown commit.
+    for unknown in ["cccccccc".to_string(), "c".repeat(40), format!("{A}a")] {
+        let (s, e): (u16, ErrorBody) = c.get(&format!("/v1/packages/curl?commit={unknown}")).await;
+        assert_eq!(s, 404);
+        assert_eq!(e.error, format!("unknown commit {unknown}"));
+    }
+    // Fewer than 8 digits, or a non-hex digit, is a request error.
+    for bad in ["aaaaaaa", "", "aaaaaaag"] {
+        let (s, e): (u16, ErrorBody) = c.get(&format!("/v1/packages/curl?commit={bad}")).await;
+        assert_eq!(s, 400, "{bad:?}");
+        assert_eq!(
+            e.error,
+            format!("invalid commit {bad:?}: expected a hex commit prefix of at least 8 characters")
+        );
+    }
 
     // Bulk lookup.
     let (s, bulk): (u16, BulkResponse) = c
@@ -152,7 +179,10 @@ async fn ingest_lookup_bulk_minimise_prune() {
                 {"attr": "curl", "commit": A, "outputs": ["*"]},
                 {"attr": "missing", "commit": A},
                 {"attr": "nooutpaths", "commit": A},
-                {"attr": "hello", "commit": "dddd"},
+                {"attr": "hello", "commit": "d".repeat(40)},
+                {"attr": "hello", "commit": A.to_uppercase()},
+                {"attr": "curl", "commit": A, "outputs": ["lib"]},
+                {"attr": "curl", "commit": A, "outputs": ["out", "lib", "man"]},
             ]}),
         )
         .await;
@@ -166,8 +196,41 @@ async fn ingest_lookup_bulk_minimise_prune() {
             ItemStatus::NotCached,
             ItemStatus::UnknownAttr,
             ItemStatus::NoOutpaths,
-            ItemStatus::UnknownCommit
+            ItemStatus::UnknownCommit,
+            ItemStatus::Ok,
+            ItemStatus::UnknownOutput,
+            ItemStatus::UnknownOutput,
         ]
+    );
+    // A requested output that doesn't exist fails the item, which names the
+    // missing outputs and the existing ones, and selects nothing.
+    for (i, missing) in [(7, vec!["lib"]), (8, vec!["lib", "man"])] {
+        let it = &bulk.items[i];
+        assert_eq!(it.missing_outputs, missing, "item {i}");
+        assert_eq!(it.available_outputs, ["dev", "out"], "item {i}");
+        assert!(it.outputs.is_empty(), "item {i}");
+    }
+    // Items echo the release's (lowercase) commit once resolved.
+    assert_eq!(bulk.items[6].commit, A);
+    assert_eq!(bulk.items[6].release, bulk.items[0].release);
+    // Any commit that is not a full hash fails the whole request, naming each
+    // offending item.
+    let (s, e): (u16, ErrorBody) = c
+        .post(
+            "/v1/lookup/bulk",
+            &json!({"items": [
+                {"attr": "hello", "commit": A},
+                {"attr": "hello", "commit": "aaaaaaaa"},
+                {"attr": "curl", "commit": "d".repeat(40)},
+                {"attr": "curl", "commit": "zz"},
+            ]}),
+        )
+        .await;
+    assert_eq!(s, 400);
+    assert_eq!(
+        e.error,
+        "invalid commit in item 1 (hello@aaaaaaaa), item 3 (curl@zz): \
+         expected full 40-character hex commit hashes"
     );
     let mut expect = vec![
         path(1, "glibc-2.40"),
@@ -209,7 +272,7 @@ async fn ingest_lookup_bulk_minimise_prune() {
     cl.sort();
     assert_eq!(m.closure, cl);
     // The reduced form gives the same answer.
-    let reduced = nfi_api::drv::ReducedGraph::from_json(&graph).unwrap();
+    let reduced = nfi_drv::reduce(&graph).unwrap();
     let (_, m2): (u16, MinimiseResponse) = c
         .post("/v1/minimise", &serde_json::to_value(&reduced).unwrap())
         .await;
@@ -327,7 +390,7 @@ async fn ingest_lookup_bulk_minimise_prune() {
     // Prune by commit prefix removes everything else.
     let r = c
         .admin(reqwest::Method::POST, "/admin/v1/prune")
-        .json(&json!({"commits": ["aaaa"]}))
+        .json(&json!({"commits": ["aaaaaaaa"]}))
         .send()
         .await
         .unwrap();
@@ -343,6 +406,101 @@ async fn ingest_lookup_bulk_minimise_prune() {
         .await
         .unwrap();
     assert_eq!(n, 0);
+}
+
+/// A package lookup's commit prefix must select exactly one release.
+#[tokio::test]
+async fn package_lookup_rejects_ambiguous_commit_prefix() {
+    let Some(c) = setup(None).await else { return };
+    sqlx::raw_sql(&format!(
+        "INSERT INTO releases (name, commit, channel, series) VALUES
+           ('r1', 'abcdef01{a}', 'nixos-25.05', '25.05'),
+           ('r2', 'abcdef01{b}', 'nixos-25.05', '25.05'),
+           ('r3', 'abcdef02{a}', 'nixos-25.05', '25.05')",
+        a = &A[8..],
+        b = &B[8..]
+    ))
+    .execute(&c.svc.state.pool)
+    .await
+    .unwrap();
+    let (s, e): (u16, ErrorBody) = c.get("/v1/packages/curl?commit=ABCDEF01").await;
+    assert_eq!(s, 400);
+    assert_eq!(
+        e.error,
+        "commit prefix \"ABCDEF01\" is ambiguous: it matches 2 releases"
+    );
+    // A longer prefix disambiguates; the release has no curl.
+    let (s, e): (u16, ErrorBody) = c
+        .get(&format!("/v1/packages/curl?commit=abcdef01{}", &A[8..12]))
+        .await;
+    assert_eq!(s, 404);
+    assert!(e.error.contains("not found at"), "{}", e.error);
+    let (s, e): (u16, ErrorBody) = c.get("/v1/packages/curl?commit=abcdef02").await;
+    assert_eq!(s, 404);
+    assert_eq!(e.error, "curl (x86_64-linux) not found at abcdef02");
+}
+
+/// Commit prefixes must have at least 8 hex digits and match at most one
+/// release; one matching none prunes nothing.
+#[tokio::test]
+async fn prune_by_unambiguous_commit_prefix() {
+    let Some(c) = setup(None).await else { return };
+    let pool = &c.svc.state.pool;
+    sqlx::raw_sql(&format!(
+        "INSERT INTO releases (name, commit, channel, series) VALUES
+           ('r1', 'abcdef01{a}', 'nixos-25.05', '25.05'),
+           ('r2', 'abcdef01{b}', 'nixos-25.05', '25.05'),
+           ('r3', 'abcdef02{a}', 'nixos-25.05', '25.05')",
+        a = &A[8..],
+        b = &B[8..]
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+    let names = || async {
+        sqlx::query_scalar::<_, String>("SELECT name FROM releases ORDER BY name")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    };
+    let prune = |commits: &[&str]| {
+        c.admin(reqwest::Method::POST, "/admin/v1/prune")
+            .json(&json!({ "commits": commits }))
+            .send()
+    };
+
+    let r = prune(&["abcdef0"]).await.unwrap();
+    assert_eq!(r.status(), 400);
+    let e: ErrorBody = r.json().await.unwrap();
+    assert!(e.error.contains("at least 8"), "{}", e.error);
+
+    let r = prune(&["abcdef02", "ABCDEF01"]).await.unwrap();
+    assert_eq!(r.status(), 400);
+    let e: ErrorBody = r.json().await.unwrap();
+    assert!(
+        e.error.contains("\"ABCDEF01\"") && e.error.contains("matches 2 releases"),
+        "{}",
+        e.error
+    );
+    assert_eq!(names().await, ["r1", "r2", "r3"]);
+    // The job checks again (a release may have been ingested after the
+    // request was queued).
+    let req = PruneRequest {
+        commits: vec!["abcdef01".into()],
+        ..Default::default()
+    };
+    let e = nfi_service::prune::prune(pool, &req).await.unwrap_err();
+    assert!(e.to_string().contains("matches 2 releases"), "{e}");
+    assert_eq!(names().await, ["r1", "r2", "r3"]);
+
+    for (commits, pruned) in [(["ABCDEF02"], vec!["r3"]), (["12345678"], vec![])] {
+        let r = prune(&commits).await.unwrap();
+        assert_eq!(r.status(), 202);
+        let j = c.wait_job(r.json::<JobCreated>().await.unwrap().id).await;
+        assert_eq!(j.status, JobStatus::Succeeded, "{:?}", j.error);
+        assert_eq!(j.result.unwrap()["releases"], json!(pruned));
+    }
+    assert_eq!(names().await, ["r1", "r2"]);
 }
 
 #[tokio::test]
@@ -712,18 +870,18 @@ async fn closure_types_ingest_minimise_and_prune() {
 fn eval_errors_bundle() -> Bundle {
     let base = bundle();
     let mut b = Bundle::default();
-    let mut e = EvalErrorsSection::default();
+    let mut e = EvalErrorsBuilder::default();
     for (i, r) in base.releases.iter().enumerate() {
         let mut r = r.clone();
         r.datasets = vec![Dataset::EvalErrors];
         let ri = b.ensure_release(r);
         let ev = b.ensure_eval(ri as u32, "helpers");
-        e.add_error("fetchhg", "x86_64-linux", ev);
+        e.add("fetchhg", "x86_64-linux", ev);
         if i == 0 {
-            e.add_error("fetchsvn", "aarch64-linux", ev);
+            e.add("fetchsvn", "aarch64-linux", ev);
         }
     }
-    b.eval_errors = Some(e);
+    b.eval_errors = Some(e.finish());
     b.validate().unwrap();
     b
 }
@@ -910,4 +1068,196 @@ async fn closure_types_migration_keeps_ids() {
     .await
     .unwrap();
     assert!(id > 7, "{id}");
+}
+
+/// A fresh, migrated database without a service (so no worker claims jobs).
+async fn job_pool() -> Option<sqlx::PgPool> {
+    let url = nfi_testenv::fresh_database().await?;
+    Some(nfi_service::connect(&url, 5).await.unwrap())
+}
+
+/// Queue an ingest job with a staged upload and claim it.
+async fn claim_staged_job(pool: &sqlx::PgPool) -> nfi_service::jobs::Claim {
+    let id: i64 = sqlx::query_scalar("INSERT INTO jobs (kind) VALUES ('ingest') RETURNING id")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO job_blob_chunks (job_id, seq, data) VALUES ($1, 0, 'bundle')")
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    let job = nfi_service::jobs::claim(pool, "host-1", Duration::from_secs(120))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.id, id);
+    job
+}
+
+/// Another worker reclaims the job (with the same worker name, as in
+/// containers where every replica is pid 1).
+async fn reclaim(pool: &sqlx::PgPool, id: i64) {
+    sqlx::query("UPDATE jobs SET claim_id = gen_random_uuid() WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// (status, progress, result, blob chunks) of a job.
+async fn job_state(pool: &sqlx::PgPool, id: i64) -> (String, Option<String>, Option<Value>, i64) {
+    sqlx::query_as(
+        "SELECT status, progress, result, (SELECT count(*) FROM job_blob_chunks WHERE job_id = id)
+           FROM jobs WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// A worker whose job was reclaimed can't overwrite the job's result or
+/// progress, nor delete its staged upload; the new claim can.
+#[tokio::test]
+async fn reclaimed_job_is_fenced() {
+    use nfi_service::jobs;
+    let Some(pool) = job_pool().await else { return };
+    let old = claim_staged_job(&pool).await;
+    reclaim(&pool, old.id).await;
+    assert!(!jobs::touch(&pool, &old, Some("stale")).await.unwrap());
+    assert!(
+        !jobs::finish(&pool, &old, &Ok(json!({"from": "old"})), None)
+            .await
+            .unwrap()
+    );
+    let err: anyhow::Result<Value> = Err(anyhow::anyhow!("old worker failed"));
+    assert!(!jobs::finish(&pool, &old, &err, Some("stale")).await.unwrap());
+    assert_eq!(job_state(&pool, old.id).await, ("running".into(), None, None, 1));
+
+    // The current claim records its result and drops the upload.
+    sqlx::query("UPDATE jobs SET heartbeat_at = now() - interval '1 hour' WHERE id = $1")
+        .bind(old.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let new = jobs::claim(&pool, "host-1", Duration::from_secs(120))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(new.id, old.id);
+    assert!(jobs::touch(&pool, &new, Some("working")).await.unwrap());
+    assert!(
+        jobs::finish(&pool, &new, &Ok(json!({"from": "new"})), None)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        job_state(&pool, new.id).await,
+        ("succeeded".into(), None, Some(json!({"from": "new"})), 0)
+    );
+    // The old claim stays fenced off after the job finished.
+    assert!(
+        !jobs::finish(&pool, &old, &Ok(json!({"from": "old"})), None)
+            .await
+            .unwrap()
+    );
+    assert_eq!(job_state(&pool, old.id).await.2, Some(json!({"from": "new"})));
+}
+
+/// When the keep-alive notices the job was reclaimed, the running job is
+/// cancelled and nothing is recorded.
+#[tokio::test]
+async fn reclaimed_job_is_cancelled() {
+    use nfi_service::jobs;
+    let Some(pool) = job_pool().await else { return };
+    let job = claim_staged_job(&pool).await;
+    let id = job.id;
+    let (reached_tx, reached) = tokio::sync::oneshot::channel();
+    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    struct OnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for OnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let guard = OnDrop(dropped.clone());
+    let p2 = pool.clone();
+    let run = tokio::spawn(async move {
+        jobs::execute(&p2, job, |_, progress| async move {
+            let _guard = guard;
+            let mut reached_tx = Some(reached_tx);
+            // Keep reporting progress so a write after the reclaim notices it
+            // (the first step may already be written before the reclaim).
+            for i in 1.. {
+                progress.set(format!("step {i}"));
+                if let Some(tx) = reached_tx.take() {
+                    tx.send(()).unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            unreachable!()
+        })
+        .await
+    });
+    reached.await.unwrap();
+    reclaim(&pool, id).await;
+    // The next progress write (within about a second) finds the claim gone.
+    let recorded = tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("job was not cancelled")
+        .unwrap();
+    assert!(!recorded);
+    assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    // Progress may hold a step written before the reclaim; what matters is
+    // that the old claim recorded nothing and left the blob alone.
+    let (status, _, result, blobs) = job_state(&pool, id).await;
+    assert_eq!((status.as_str(), result, blobs), ("running", None, 1));
+}
+
+/// Progress is published while a job runs and cleared when it succeeds; no
+/// late progress write overwrites that.
+#[tokio::test]
+async fn progress_cleared_after_job_finishes() {
+    use nfi_service::jobs;
+    let Some(pool) = job_pool().await else { return };
+    let job = claim_staged_job(&pool).await;
+    let id = job.id;
+    let p2 = pool.clone();
+    let recorded = jobs::execute(&pool, job, |_, progress| async move {
+        progress.set("step 1".into());
+        let mut seen = None;
+        for _ in 0..50 {
+            seen = job_state(&p2, id).await.1;
+            if seen.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(seen.as_deref(), Some("step 1"));
+        // Pending when the job ends: must not be written after the result.
+        progress.set("step 2".into());
+        Ok(json!({"ok": true}))
+    })
+    .await;
+    assert!(recorded);
+    let after = job_state(&pool, id).await;
+    assert_eq!(after, ("succeeded".into(), None, Some(json!({"ok": true})), 0));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(job_state(&pool, id).await, after);
+
+    // A failed job keeps its latest progress, including one still pending.
+    let job = claim_staged_job(&pool).await;
+    let id = job.id;
+    let recorded = jobs::execute(&pool, job, |_, progress| async move {
+        progress.set("decoding".into());
+        anyhow::bail!("bad bundle")
+    })
+    .await;
+    assert!(recorded);
+    let (status, progress, _, blobs) = job_state(&pool, id).await;
+    assert_eq!(
+        (status.as_str(), progress.as_deref(), blobs),
+        ("failed", Some("decoding"), 0)
+    );
 }

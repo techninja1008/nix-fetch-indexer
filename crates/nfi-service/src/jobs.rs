@@ -135,13 +135,13 @@ async fn store_chunk(pool: &PgPool, job: i64, seq: i32, data: &[u8]) -> Result<(
     Ok(())
 }
 
-async fn load_blob(pool: &PgPool, job: i64) -> Result<Vec<u8>> {
+async fn load_blob(pool: &PgPool, job: i64) -> Result<Bytes> {
     let chunks: Vec<Vec<u8>> =
         sqlx::query_scalar("SELECT data FROM job_blob_chunks WHERE job_id = $1 ORDER BY seq")
             .bind(job)
             .fetch_all(pool)
             .await?;
-    Ok(chunks.concat())
+    Ok(Bytes::from(chunks.concat()))
 }
 
 pub async fn get(pool: &PgPool, id: i64) -> Result<Option<JobInfo>> {
@@ -166,67 +166,232 @@ pub async fn list(pool: &PgPool, limit: i64) -> Result<Vec<JobInfo>> {
     )
 }
 
+/// A job claimed by this worker.
+pub struct Claim {
+    pub id: i64,
+    pub kind: String,
+    pub params: Value,
+    /// Fencing token of this claim (a uuid). Updates for the job only apply
+    /// while the job still carries it, i.e. until another worker reclaims it.
+    claim_id: String,
+}
+
 /// Claim the next runnable job: queued, or running with a stale heartbeat
-/// (its replica died).
-async fn claim(pool: &PgPool, worker: &str, stale: Duration) -> Result<Option<(i64, String, Value)>> {
-    Ok(sqlx::query_as(
-        "UPDATE jobs SET status = 'running', worker = $1, started_at = now(), heartbeat_at = now(), error = NULL
+/// (its replica died, or lost touch with the database).
+pub async fn claim(pool: &PgPool, worker: &str, stale: Duration) -> Result<Option<Claim>> {
+    let row: Option<(i64, String, Value, String)> = sqlx::query_as(
+        "UPDATE jobs SET status = 'running', worker = $1, claim_id = gen_random_uuid(),
+                started_at = now(), heartbeat_at = now(), error = NULL
          WHERE id = (
              SELECT id FROM jobs
              WHERE status = 'queued'
                 OR (status = 'running' AND heartbeat_at < now() - make_interval(secs => $2))
              ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1)
-         RETURNING id, kind, params",
+         RETURNING id, kind, params, claim_id::text",
     )
     .bind(worker)
     .bind(stale.as_secs_f64())
     .fetch_optional(pool)
-    .await?)
+    .await?;
+    Ok(row.map(|(id, kind, params, claim_id)| Claim {
+        id,
+        kind,
+        params,
+        claim_id,
+    }))
 }
 
-async fn finish(pool: &PgPool, id: i64, res: &Result<Value>) -> Result<()> {
-    match res {
-        Ok(v) => sqlx::query(
-            "UPDATE jobs SET status = 'succeeded', result = $2, finished_at = now(), progress = NULL WHERE id = $1",
-        )
-        .bind(id)
-        .bind(v)
-        .execute(pool)
-        .await?,
-        Err(e) => sqlx::query("UPDATE jobs SET status = 'failed', error = $2, finished_at = now() WHERE id = $1")
-            .bind(id)
-            .bind(format!("{e:#}"))
+/// Bump the job's heartbeat and, when given, set its progress. Returns false
+/// when the claim was lost.
+pub async fn touch(pool: &PgPool, job: &Claim, progress: Option<&str>) -> Result<bool> {
+    let r = sqlx::query(
+        "UPDATE jobs SET heartbeat_at = now(), progress = COALESCE($3, progress)
+         WHERE id = $1 AND claim_id = $2::uuid",
+    )
+    .bind(job.id)
+    .bind(&job.claim_id)
+    .bind(progress)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected() == 1)
+}
+
+/// Record the job's result and drop its staged upload. Returns false (and
+/// records nothing) when the claim was lost. A failed job keeps its last
+/// progress (`progress`, when given, is a newer one to record).
+pub async fn finish(pool: &PgPool, job: &Claim, res: &Result<Value>, progress: Option<&str>) -> Result<bool> {
+    let r = match res {
+        Ok(v) => {
+            sqlx::query(
+                "UPDATE jobs SET status = 'succeeded', result = $3, finished_at = now(), progress = NULL
+                 WHERE id = $1 AND claim_id = $2::uuid",
+            )
+            .bind(job.id)
+            .bind(&job.claim_id)
+            .bind(v)
             .execute(pool)
-            .await?,
+            .await?
+        }
+        Err(e) => {
+            sqlx::query(
+                "UPDATE jobs SET status = 'failed', error = $3, finished_at = now(),
+                        progress = COALESCE($4, progress)
+                 WHERE id = $1 AND claim_id = $2::uuid",
+            )
+            .bind(job.id)
+            .bind(&job.claim_id)
+            .bind(format!("{e:#}"))
+            .bind(progress)
+            .execute(pool)
+            .await?
+        }
     };
+    if r.rows_affected() == 0 {
+        return Ok(false);
+    }
     sqlx::query("DELETE FROM job_blob_chunks WHERE job_id = $1")
-        .bind(id)
+        .bind(job.id)
         .execute(pool)
         .await?;
-    Ok(())
+    Ok(true)
 }
 
-async fn run_job(state: &AppState, id: i64, kind: &str, params: &Value) -> Result<Value> {
-    let pool = &state.pool;
-    let progress_pool = pool.clone();
-    let progress = move |msg: String| {
-        tracing::info!(job = id, "{msg}");
-        let p = progress_pool.clone();
-        tokio::spawn(async move {
-            sqlx::query("UPDATE jobs SET progress = $2 WHERE id = $1")
-                .bind(id)
-                .bind(msg)
-                .execute(&p)
-                .await
-                .ok();
-        });
+/// A running job's latest progress message, published by its keep-alive task.
+pub struct Progress {
+    job: i64,
+    /// The latest message not yet written to the database.
+    pending: std::sync::Mutex<Option<String>>,
+}
+
+impl Progress {
+    fn new(job: i64) -> Self {
+        Self {
+            job,
+            pending: Default::default(),
+        }
+    }
+
+    pub fn set(&self, msg: String) {
+        tracing::info!(job = self.job, "{msg}");
+        *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg);
+    }
+
+    fn take(&self) -> Option<String> {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+/// How often the keep-alive task writes changed progress.
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
+/// How often the keep-alive task bumps the heartbeat.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Write progress when it changes and the heartbeat periodically, until
+/// `stop` fires (returns false) or the claim is lost (returns true). Queries
+/// are never interrupted, so once this returns nothing more is written.
+async fn keep_alive(
+    pool: PgPool,
+    job: std::sync::Arc<Claim>,
+    progress: std::sync::Arc<Progress>,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+) -> bool {
+    let mut tick = tokio::time::interval(PROGRESS_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut beat = tokio::time::Instant::now();
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut stop => return false,
+            _ = tick.tick() => {}
+        }
+        let msg = progress.take();
+        if msg.is_none() && beat.elapsed() < HEARTBEAT_INTERVAL {
+            continue;
+        }
+        match touch(&pool, &job, msg.as_deref()).await {
+            Ok(true) => beat = tokio::time::Instant::now(),
+            Ok(false) => return true,
+            Err(e) => {
+                tracing::warn!(job = job.id, error = %e, "job heartbeat failed");
+                // Retry the message on the next tick, unless a newer one came.
+                if let Some(m) = msg {
+                    progress
+                        .pending
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get_or_insert(m);
+                }
+            }
+        }
+    }
+}
+
+/// Run a claimed job: `run` executes while a keep-alive task publishes its
+/// progress and heartbeat, then the result is recorded. If the claim is lost
+/// meanwhile (another worker reclaimed the job), `run` is cancelled and
+/// nothing is recorded; returns false then.
+pub async fn execute<F, Fut>(pool: &PgPool, job: Claim, run: F) -> bool
+where
+    F: FnOnce(std::sync::Arc<Claim>, std::sync::Arc<Progress>) -> Fut,
+    Fut: std::future::Future<Output = Result<Value>>,
+{
+    use std::sync::Arc;
+    let job = Arc::new(job);
+    let progress = Arc::new(Progress::new(job.id));
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let mut keeper = tokio::spawn(keep_alive(pool.clone(), job.clone(), progress.clone(), stopped));
+    let res = tokio::select! {
+        r = run(job.clone(), progress.clone()) => Some(r),
+        _ = &mut keeper => None,
     };
-    match kind {
+    // Stop the keep-alive task before recording the result, so no progress
+    // write lands after it.
+    let lost = match res {
+        None => true,
+        Some(_) => {
+            let _ = stop.send(());
+            keeper.await.unwrap_or(false)
+        }
+    };
+    let res = match res {
+        Some(r) if !lost => r,
+        _ => {
+            tracing::warn!(
+                job = job.id,
+                "job was reclaimed by another worker (heartbeat lost); abandoning it"
+            );
+            return false;
+        }
+    };
+    if let Err(e) = &res {
+        tracing::error!(job = job.id, error = %format!("{e:#}"), "job failed");
+    }
+    match finish(pool, &job, &res, progress.take().as_deref()).await {
+        Ok(true) => true,
+        Ok(false) => {
+            tracing::warn!(
+                job = job.id,
+                "job was reclaimed by another worker before its result was recorded; discarding it"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::error!(job = job.id, error = %e, "recording job result failed");
+            true
+        }
+    }
+}
+
+async fn run_job(state: &AppState, job: &Claim, progress: &Progress) -> Result<Value> {
+    let pool = &state.pool;
+    let (id, params) = (job.id, &job.params);
+    let progress = |msg: String| progress.set(msg);
+    match job.kind.as_str() {
         "ingest" => {
             let data = if let Some(url) = params.get("url").and_then(Value::as_str) {
                 progress(format!("downloading {url}"));
                 let resp = state.http.get(url).send().await?.error_for_status()?;
-                resp.bytes().await?.to_vec()
+                resp.bytes().await?
             } else {
                 load_blob(pool, id).await?
             };
@@ -238,27 +403,21 @@ async fn run_job(state: &AppState, id: i64, kind: &str, params: &Value) -> Resul
                 .to_string();
             let bundle =
                 tokio::task::spawn_blocking(move || nfi_interchange::codec::read(&data[..], &v2)).await??;
-            let report = crate::ingest::ingest(pool, &bundle, &progress).await?;
-            let mut result = serde_json::to_value(&report)?;
+            let (mut report, touched_attrs) = crate::ingest::ingest(pool, &bundle, &progress).await?;
             if let Some(m) = &state.meili {
-                progress(format!(
-                    "updating search for {} attributes",
-                    report.touched_attrs.len()
-                ));
-                let n = m.sync_attrs(pool, &report.touched_attrs).await?;
-                result["search_documents"] = json!(n);
+                progress(format!("updating search for {} attributes", touched_attrs.len()));
+                report.search_documents = Some(m.sync_attrs(pool, &touched_attrs).await?);
             }
-            Ok(result)
+            Ok(serde_json::to_value(&report)?)
         }
         "prune" => {
             let req: PruneRequest = serde_json::from_value(params.clone())?;
-            let report = crate::prune::prune(pool, &req).await?;
-            let mut result = serde_json::to_value(&report)?;
+            let mut report = crate::prune::prune(pool, &req).await?;
             if let (Some(m), false) = (&state.meili, report.releases.is_empty()) {
                 progress("rebuilding search index".into());
-                result["search_documents"] = json!(m.reindex(pool).await?);
+                report.search_documents = Some(m.reindex(pool).await?);
             }
-            Ok(result)
+            Ok(serde_json::to_value(&report)?)
         }
         "reindex" => {
             let Some(m) = &state.meili else {
@@ -287,27 +446,13 @@ pub async fn worker(state: AppState, worker_id: String) {
     };
     loop {
         match claim(&state.pool, &worker_id, stale).await {
-            Ok(Some((id, kind, params))) => {
-                tracing::info!(job = id, %kind, "running job");
-                let hb_pool = state.pool.clone();
-                let heartbeat = tokio::spawn(async move {
-                    loop {
-                        tokio::time::sleep(Duration::from_secs(15)).await;
-                        sqlx::query("UPDATE jobs SET heartbeat_at = now() WHERE id = $1")
-                            .bind(id)
-                            .execute(&hb_pool)
-                            .await
-                            .ok();
-                    }
-                });
-                let res = run_job(&state, id, &kind, &params).await;
-                heartbeat.abort();
-                if let Err(e) = &res {
-                    tracing::error!(job = id, error = %format!("{e:#}"), "job failed");
-                }
-                if let Err(e) = finish(&state.pool, id, &res).await {
-                    tracing::error!(job = id, error = %e, "recording job result failed");
-                }
+            Ok(Some(job)) => {
+                tracing::info!(job = job.id, kind = %job.kind, "running job");
+                let st = &state;
+                execute(&state.pool, job, |job, progress| async move {
+                    run_job(st, &job, &progress).await
+                })
+                .await;
                 continue;
             }
             Ok(None) => {}

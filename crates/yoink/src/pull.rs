@@ -1,21 +1,21 @@
 //! `yoink <TARGET>...`: resolve targets to PURLs, start the mirror request
 //! and monitor it until every PURL has a result.
 
-use crate::auth::with_login;
 use crate::plain::{Plain, summary};
 use crate::state::{Conn, PlanSummary, State};
-use crate::stream::{Msg, Refresh, drive};
+use crate::stream::{Msg, drive};
 use crate::targets::{Target, classify, closure_purls, dedupe};
 use crate::tui;
 use anyhow::{Context, Result, bail};
-use nfi_auth::client::{Session, interactive};
+use nfi_auth_client::Credentials;
+use nfi_auth_client::http::retry;
 use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::time::Duration;
 use yoink_api::Outcome;
 
-const YOINK_HINT: &str = "run `yoink login` or set YOINK_TOKEN";
-const NFI_HINT: &str = "run `yoink login` (with the NFI URL configured) or set NFI_TOKEN";
+pub const YOINK_HINT: &str = "set YOINK_TOKEN or pass --token-file";
+pub const NFI_HINT: &str = "set NFI_TOKEN or pass --nfi-token-file";
 
 pub struct PullOptions {
     pub targets: Vec<String>,
@@ -27,30 +27,26 @@ pub struct PullOptions {
     pub plain: bool,
     pub verbosity: i8,
     pub close_miss_threshold: Option<u64>,
+    /// See [`Credentials::allow_insecure`].
+    pub allow_insecure: bool,
 }
 
 /// Evaluate flake references and ask NFI which cached paths they need.
 async fn resolve_flakes(
-    session: &Session,
-    o: &mut PullOptions,
+    creds: &Credentials,
+    nfi_url: &str,
+    o: &PullOptions,
     flakes: Vec<String>,
 ) -> Result<(Vec<String>, PlanSummary)> {
-    let Some(nfi_url) = o.nfi_url.clone() else {
-        bail!(
-            "flake references need the NFI service: set --nfi-url, NFI_URL or `nfi_url` in the config file"
-        );
-    };
     let nix = o.nix.clone();
     let graph = tokio::task::spawn_blocking(move || nfi::derivation_graph(&nix, &flakes)).await??;
-    let mut token = session.bearer(&nfi_url, o.nfi_token.clone()).await?;
+    let client = nfi::client::Client::new(nfi_url, None)?;
     let cmt = o.close_miss_threshold;
-    let r = with_login(session, &nfi_url, &mut token, NFI_HINT, |t| {
-        let (graph, url) = (&graph, &nfi_url);
-        async move { nfi_api::client::Client::new(url, t)?.minimise(graph, cmt).await }
+    let r = retry(creds, |t| async {
+        client.with_token(t).minimise(&graph, cmt).await
     })
     .await
     .context("minimising against NFI")?;
-    o.nfi_token = token;
     let mut warnings: Vec<String> = r.warnings.iter().map(|w| w.message.clone()).collect();
     warnings.extend(
         r.unresolved
@@ -66,13 +62,12 @@ async fn resolve_flakes(
     Ok((closure_purls(&r.closure), plan))
 }
 
-pub async fn pull(mut o: PullOptions) -> Result<ExitCode> {
+pub async fn pull(o: PullOptions) -> Result<ExitCode> {
     let targets = o
         .targets
         .iter()
         .map(|t| classify(t))
         .collect::<Result<Vec<_>>>()?;
-    let session = Session::new(nfi_auth::client::TokenStore::default_location()?)?;
     let flakes: Vec<String> = targets
         .iter()
         .filter_map(|t| match t {
@@ -80,11 +75,30 @@ pub async fn pull(mut o: PullOptions) -> Result<ExitCode> {
             Target::Purl(_) => None,
         })
         .collect();
-    let (closure, plan) = if flakes.is_empty() {
-        (vec![], None)
-    } else {
-        let (c, p) = resolve_flakes(&session, &mut o, flakes).await?;
-        (c, Some(p))
+    let nfi = match &o.nfi_url {
+        _ if flakes.is_empty() => None,
+        Some(u) => Some((
+            u.as_str(),
+            Credentials::new("yoink", u, o.nfi_token.clone(), NFI_HINT).allow_insecure(o.allow_insecure),
+        )),
+        None => bail!(
+            "flake references need the NFI service: set --nfi-url, NFI_URL or `nfi_url` in the config file"
+        ),
+    };
+    // Log in to both services up front, before evaluating anything and
+    // before the monitor takes over the terminal.
+    let creds =
+        Credentials::new("yoink", &o.url, o.token.clone(), YOINK_HINT).allow_insecure(o.allow_insecure);
+    creds.token(true).await?;
+    if let Some((_, c)) = &nfi {
+        c.token(true).await?;
+    }
+    let (closure, plan) = match &nfi {
+        None => (vec![], None),
+        Some((url, c)) => {
+            let (c, p) = resolve_flakes(c, url, &o, flakes).await?;
+            (c, Some(p))
+        }
     };
     // Flake closures go where the first flake reference was given.
     let mut purls = Vec::new();
@@ -114,33 +128,16 @@ pub async fn pull(mut o: PullOptions) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    // The service always requires a token.
-    let explicit = o.token.is_some();
-    let mut token = session.bearer(&o.url, o.token.clone()).await?;
-    if token.is_none() && interactive() {
-        token = session.relogin(&o.url, false).await?;
-    }
-    if token.is_none() {
-        bail!("{} requires authentication; {YOINK_HINT}", o.url);
-    }
-    let mut client = yoink_api::client::Client::new(&o.url, token.clone())?;
-    let mut first = client.mirror(&purls).await;
-    if let Err(e) = &first
-        && crate::auth::is_unauthorized(e)
-        && let Some(t) = session.relogin(&o.url, true).await?
-    {
-        client.set_token(Some(t));
-        first = client.mirror(&purls).await;
-    }
+    let client = crate::client::Client::new(&o.url, None)?;
+    let first = retry(&creds, |t| async { client.with_token(t).mirror(&purls).await }).await;
 
+    let nix = purls
+        .iter()
+        .any(|p| yoink_purl::Purl::parse(p).is_ok_and(|p| p.ty == "nix"));
     let mut state = State::new(&purls);
     state.plan = plan;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let refresh = (!explicit).then(|| Refresh {
-        session: session.clone(),
-        url: o.url.clone(),
-    });
-    let driver = tokio::spawn(drive(client, purls, Some(first), refresh, tx));
+    let driver = tokio::spawn(drive(client, purls, Some(first), creds, tx));
 
     let (state, quit) = if use_tui {
         let app = tui::App::new(state, o.targets.join(" "), o.url.clone());
@@ -179,18 +176,16 @@ pub async fn pull(mut o: PullOptions) -> Result<ExitCode> {
         (state, false)
     };
     driver.abort();
+    if nix && let Some(dir) = nix_cache_dir() {
+        forget_nix_cache(&dir);
+    }
+    eprintln!("{}", summary(&state));
     if quit {
-        eprintln!("{}", summary(&state));
         eprintln!("detached; the service keeps mirroring the remaining paths");
         return Ok(ExitCode::from(130));
     }
-    if use_tui {
-        eprintln!("{}", summary(&state));
-        if let Conn::Failed(e) = &state.conn {
-            eprintln!("error: {e}");
-        }
-    } else {
-        eprintln!("{}", summary(&state));
+    if use_tui && let Conn::Failed(e) = &state.conn {
+        eprintln!("error: {e}");
     }
     let failed = state.items.iter().any(|i| i.outcome != Some(Outcome::Success));
     Ok(if failed {
@@ -198,4 +193,49 @@ pub async fn pull(mut o: PullOptions) -> Result<ExitCode> {
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// Nix's cache directory: `$XDG_CACHE_HOME/nix`, else `~/.cache/nix`.
+fn nix_cache_dir() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".cache")))?;
+    Some(base.join("nix"))
+}
+
+/// Remove nix's binary-cache lookup caches (`binary-cache*` in `dir`): they
+/// remember misses, so paths just mirrored would otherwise look absent.
+fn forget_nix_cache(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        if e.file_name().to_string_lossy().starts_with("binary-cache")
+            && let Err(err) = std::fs::remove_file(e.path())
+        {
+            eprintln!("warning: removing {}: {err}", e.path().display());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn forgets_nix_cache() {
+        let d = tempfile::tempdir().unwrap();
+        for f in [
+            "binary-cache-v6.sqlite",
+            "binary-cache-v6.sqlite-journal",
+            "eval-cache-v5",
+        ] {
+            std::fs::write(d.path().join(f), b"").unwrap();
+        }
+        super::forget_nix_cache(d.path());
+        let left: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(left, ["eval-cache-v5"]);
+        super::forget_nix_cache(&d.path().join("missing"));
+    }
 }

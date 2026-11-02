@@ -22,10 +22,13 @@ fn in_unit(n: u64, u: usize) -> String {
     }
 }
 
-/// `12.3 MiB`.
-pub fn size(n: u64) -> String {
-    let u = scale(n);
-    format!("{} {}", in_unit(n, u), UNITS[u])
+/// Whole percent of `p`, 0 to 100 (0 when `max` is 0).
+pub fn percent(p: &Progress) -> u8 {
+    if p.max == 0 {
+        0
+    } else {
+        ((p.current.min(p.max) as u128 * 100) / p.max as u128) as u8
+    }
 }
 
 /// `12.3/45.6 MiB` (both in the unit of the larger), or `3/10` without a unit.
@@ -69,9 +72,6 @@ mod tests {
 
     #[test]
     fn formats() {
-        assert_eq!(size(512), "512 B");
-        assert_eq!(size(1536), "1.5 KiB");
-        assert_eq!(size(3 << 30), "3.0 GiB");
         let p = Progress {
             current: 1 << 20,
             max: 45 << 20,
@@ -84,6 +84,14 @@ mod tests {
             unit: None,
         };
         assert_eq!(readout(&p), "3/10");
+        assert_eq!(
+            percent(&Progress {
+                current: 1,
+                max: 3,
+                unit: None
+            }),
+            33
+        );
         assert_eq!(truncate("hello", 5), "hello");
         assert_eq!(truncate("hello", 4), "hel…");
         assert_eq!(truncate("hello", 0), "");

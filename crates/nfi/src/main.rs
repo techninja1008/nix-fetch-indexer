@@ -1,9 +1,11 @@
 use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
+use nfi::client::Client;
 use nfi::*;
-use nfi_api::client::Client;
 use nfi_api::drv::ReducedGraph;
 use nfi_api::{BulkRequest, ItemStatus, SearchQuery};
+use nfi_auth_client::Credentials;
+use nfi_auth_client::http::retry;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -16,10 +18,15 @@ struct Cli {
     /// Configuration file [default: $XDG_CONFIG_HOME/nfi/config.toml]
     #[arg(long, env = "NFI_CONFIG", global = true)]
     config: Option<PathBuf>,
-    /// Read the bearer token from this file instead of using `nfi login`
-    /// (e.g. a CI-issued ID token) [also: $NFI_TOKEN]
+    /// Read the bearer token (e.g. a CI-issued ID token) from this file
+    /// instead of using the login; takes precedence over $NFI_TOKEN, which
+    /// holds the token itself
     #[arg(long, env = "NFI_TOKEN_FILE", global = true)]
     token_file: Option<PathBuf>,
+    /// Allow sending tokens and logging in over plain http:// to hosts
+    /// other than loopback
+    #[arg(long, env = "NFI_ALLOW_INSECURE", global = true, value_parser = clap::builder::BoolishValueParser::new())]
+    allow_insecure: bool,
     /// Print raw JSON responses.
     #[arg(long, global = true)]
     json: bool,
@@ -27,7 +34,7 @@ struct Cli {
     cmd: Cmd,
 }
 
-#[derive(Args, Clone)]
+#[derive(Args)]
 struct HookArgs {
     /// Command run with a file listing the resolved store paths; `{}` is
     /// replaced by the file path (appended if absent) [env: NFI_FETCH_HOOK]
@@ -38,7 +45,7 @@ struct HookArgs {
     no_fetch_hook: bool,
 }
 
-#[derive(Subcommand, Clone)]
+#[derive(Subcommand)]
 enum Cmd {
     /// Log in to the service with OIDC (device code flow).
     Login {
@@ -46,9 +53,11 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
-    /// Forget the cached login for the service.
+    /// Forget the cached login for the service (and so for every other URL
+    /// logged in with the same OpenID provider and client).
     Logout,
-    /// Show who the service thinks you are.
+    /// Show who the service sees you as, without logging in (exit 1 when
+    /// not authenticated).
     Whoami,
     /// Full-text search over packages and programs.
     Search {
@@ -94,6 +103,8 @@ enum Cmd {
     /// Show a package's metadata and output paths at a nixpkgs commit.
     Show {
         attr: String,
+        /// Nixpkgs commit: a hex prefix of at least 8 digits that matches
+        /// exactly one indexed release, or the full hash.
         #[arg(long)]
         commit: String,
         #[arg(long)]
@@ -101,7 +112,8 @@ enum Cmd {
     },
     /// Resolve many attr@commit pairs to store paths and their closure.
     Bulk {
-        /// Items as attr@commit[@system].
+        /// Items as attr@commit[@system], with full 40-character commit
+        /// hashes (lockfile-style: prefixes are rejected).
         items: Vec<String>,
         /// Read items from a file (`-` for stdin): JSON or one item per line.
         #[arg(short = 'f', long)]
@@ -152,11 +164,6 @@ fn hook_cmd(args: &HookArgs, cfg: &Config) -> Option<String> {
         .or_else(|| cfg.fetch_hook.clone())
 }
 
-fn print_json<T: serde::Serialize>(v: &T) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(v)?);
-    Ok(())
-}
-
 fn human_size(n: u64) -> String {
     let units = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut v = n as f64;
@@ -168,6 +175,8 @@ fn human_size(n: u64) -> String {
     format!("{v:.1} {}", units[u])
 }
 
+const TOKEN_HINT: &str = "set NFI_TOKEN or pass --token-file";
+
 async fn run(cli: Cli) -> Result<ExitCode> {
     let cfg = load_config(cli.config.as_deref())?;
     let url = cli
@@ -175,42 +184,54 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         .clone()
         .or(cfg.url.clone())
         .unwrap_or_else(|| "http://localhost:8080".into());
-    let token = match &cli.token_file {
-        Some(f) => Some(nfi_auth::client::read_token_file(f)?),
-        None => std::env::var("NFI_TOKEN").ok().filter(|t| !t.is_empty()),
-    };
-    let login = auth::Login::new("nfi", "set NFI_TOKEN or --token-file", &url, token)?;
+    let token = nfi_auth_client::explicit(cli.token_file.as_deref(), "NFI_TOKEN")?;
+    let creds = Credentials::new("nfi", &url, token, TOKEN_HINT).allow_insecure(cli.allow_insecure);
     match &cli.cmd {
         Cmd::Login { force } => {
-            let w = login.login(*force).await?;
-            eprintln!("logged in to {url} as {}", auth::describe(&w));
+            let w = creds.login(*force).await?;
+            eprintln!("logged in to {url} as {}", nfi_auth_client::describe(&w));
             return Ok(ExitCode::SUCCESS);
         }
         Cmd::Logout => {
-            if login.logout().await? {
-                eprintln!("logged out of {url}");
-            } else {
-                eprintln!("not logged in to {url}");
-            }
+            nfi::logout(&creds, &url).await?;
             return Ok(ExitCode::SUCCESS);
         }
         Cmd::Whoami => {
-            let w = login.whoami().await?;
-            if cli.json {
-                print_json(&w)?;
+            return Ok(if whoami(&creds, &url, cli.json).await? {
+                ExitCode::SUCCESS
             } else {
-                println!("{}", auth::describe(&w));
-            }
-            return Ok(ExitCode::SUCCESS);
+                ExitCode::FAILURE
+            });
         }
         _ => {}
     }
-    login
-        .run(|client| exec(cli.cmd.clone(), cli.json, &cfg, client))
-        .await
+    validate(&cli.cmd)?;
+    // Log in now, before reading stdin or evaluating anything.
+    creds.token(true).await?;
+    let client = Client::new(&url, None)?;
+    exec(cli.cmd, cli.json, &cfg, &client, &creds).await
 }
 
-async fn exec(cmd: Cmd, json: bool, cfg: &Config, client: Client) -> Result<ExitCode> {
+/// The argument checks that need no I/O.
+fn validate(cmd: &Cmd) -> Result<()> {
+    match cmd {
+        Cmd::Bulk { items, file, .. } => {
+            if items.is_empty() && file.is_none() {
+                bail!("no items given");
+            }
+            for i in items {
+                parse_item(i, None, &None)?;
+            }
+        }
+        Cmd::Minimise {
+            installables, files, ..
+        } if installables.is_empty() && files.is_empty() => bail!("give installables and/or --file"),
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn exec(cmd: Cmd, json: bool, cfg: &Config, client: &Client, creds: &Credentials) -> Result<ExitCode> {
     match cmd {
         Cmd::Login { .. } | Cmd::Logout | Cmd::Whoami => unreachable!("handled in run"),
         Cmd::Search {
@@ -241,7 +262,7 @@ async fn exec(cmd: Cmd, json: bool, cfg: &Config, client: Client) -> Result<Exit
                 limit: Some(limit),
                 offset: Some(offset),
             };
-            let r = client.search(&q).await?;
+            let r = retry(creds, |t| async { client.with_token(t).search(&q).await }).await?;
             if json {
                 print_json(&r)?;
             } else {
@@ -266,17 +287,26 @@ async fn exec(cmd: Cmd, json: bool, cfg: &Config, client: Client) -> Result<Exit
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Releases { channel, errors } => {
-            let rels = client.releases(channel.as_deref(), errors).await?;
+            let rels = retry(creds, |t| async {
+                client.with_token(t).releases(channel.as_deref(), errors).await
+            })
+            .await?;
             if json {
                 print_json(&rels)?;
             } else {
-                print!("{}", nfi_api::releases_table(&rels));
+                print!("{}", nfi::releases_table(&rels));
             }
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Show { attr, commit, system } => {
             let system = system.or(cfg.system.clone());
-            let p = client.package(&attr, &commit, system.as_deref()).await?;
+            let p = retry(creds, |t| async {
+                client
+                    .with_token(t)
+                    .package(&attr, &commit, system.as_deref())
+                    .await
+            })
+            .await?;
             if json {
                 print_json(&p)?;
             } else {
@@ -326,20 +356,34 @@ async fn exec(cmd: Cmd, json: bool, cfg: &Config, client: Client) -> Result<Exit
             for i in &items {
                 all.push(parse_item(i, system.as_deref(), &outputs)?);
             }
-            if let Some(f) = &file {
-                all.extend(read_items(f, system.as_deref(), &outputs)?);
+            if let Some(f) = file {
+                all.extend(read_items(&f, system.as_deref(), &outputs)?);
             }
             if all.is_empty() {
                 bail!("no items given");
             }
-            let r = client.bulk(&BulkRequest { items: all }).await?;
-            let failed = r.items.iter().filter(|i| i.status != ItemStatus::Ok).count();
-            for i in r.items.iter().filter(|i| i.status != ItemStatus::Ok) {
-                eprintln!("warning: {}@{} ({}): {:?}", i.attr, i.commit, i.system, i.status);
+            let req = BulkRequest { items: all };
+            let hook = hook_cmd(&hook, cfg);
+            let r = retry(creds, |t| async { client.with_token(t).bulk(&req).await }).await?;
+            let failed: Vec<_> = r.items.iter().filter(|i| i.status != ItemStatus::Ok).collect();
+            for i in &failed {
+                let outputs = if i.status == ItemStatus::UnknownOutput {
+                    format!(
+                        ": no output {} (has {})",
+                        i.missing_outputs.join(", "),
+                        i.available_outputs.join(", ")
+                    )
+                } else {
+                    String::new()
+                };
+                eprintln!(
+                    "warning: {}@{} ({}): {:?}{outputs}",
+                    i.attr, i.commit, i.system, i.status
+                );
             }
             if json {
                 print_json(&r)?;
-            } else if hook_cmd(&hook, cfg).is_none() {
+            } else if hook.is_none() {
                 for p in &r.closure {
                     println!("{p}");
                 }
@@ -350,13 +394,13 @@ async fn exec(cmd: Cmd, json: bool, cfg: &Config, client: Client) -> Result<Exit
                 human_size(r.file_size),
                 human_size(r.nar_size)
             );
-            if let Some(h) = hook_cmd(&hook, cfg) {
+            if let Some(h) = hook {
                 let code = run_fetch_hook(&h, &r.closure)?;
                 if code != 0 {
                     return Ok(ExitCode::from(code.clamp(1, 255) as u8));
                 }
             }
-            Ok(if strict && failed > 0 {
+            Ok(if strict && !failed.is_empty() {
                 ExitCode::from(2)
             } else {
                 ExitCode::SUCCESS
@@ -370,22 +414,23 @@ async fn exec(cmd: Cmd, json: bool, cfg: &Config, client: Client) -> Result<Exit
             close_miss_threshold,
             hook,
         } => {
-            if installables.is_empty() && files.is_empty() {
-                bail!("give installables and/or --file");
-            }
             let mut graph = ReducedGraph::default();
             if !installables.is_empty() {
                 let nix = nix.or(cfg.nix.clone()).unwrap_or_else(|| "nix".into());
-                graph.merge(derivation_graph(&nix, &installables)?);
+                nfi_drv::merge(&mut graph, derivation_graph(&nix, &installables)?);
             }
             for f in &files {
-                graph.merge(read_graph(f)?);
+                nfi_drv::merge(&mut graph, read_graph(f)?);
             }
-            let r = client.minimise(&graph, close_miss_threshold).await?;
+            let hook = hook_cmd(&hook, cfg);
+            let r = retry(creds, |t| async {
+                client.with_token(t).minimise(&graph, close_miss_threshold).await
+            })
+            .await?;
             let paths = if roots_only { &r.roots } else { &r.closure };
             if json {
                 print_json(&r)?;
-            } else if hook_cmd(&hook, cfg).is_none() {
+            } else if hook.is_none() {
                 for p in paths {
                     println!("{p}");
                 }
@@ -406,7 +451,7 @@ async fn exec(cmd: Cmd, json: bool, cfg: &Config, client: Client) -> Result<Exit
                 human_size(r.file_size),
                 human_size(r.nar_size)
             );
-            if let Some(h) = hook_cmd(&hook, cfg) {
+            if let Some(h) = hook {
                 let code = run_fetch_hook(&h, paths)?;
                 if code != 0 {
                     return Ok(ExitCode::from(code.clamp(1, 255) as u8));

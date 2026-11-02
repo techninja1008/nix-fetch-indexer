@@ -1957,12 +1957,16 @@ name = "nfi"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "nfi-api",
- "nfi-auth",
+ "nfi-auth-client",
+ "nfi-auth-server",
+ "nfi-drv",
  "nfi-indexer",
  "nfi-interchange",
  "nfi-service",
+ "nfi-test-support",
  "nfi-testenv",
  "reqwest",
  "serde",
@@ -1970,6 +1974,7 @@ dependencies = [
  "shell-words",
  "tempfile",
  "tokio",
+ "tokio-util",
  "toml",
 ]
 
@@ -1978,12 +1983,16 @@ name = "nfi-admin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "nfi",
  "nfi-api",
  "nfi-auth",
+ "nfi-auth-client",
+ "nfi-auth-server",
  "nfi-interchange",
  "nfi-service",
+ "nfi-test-support",
  "nfi-testenv",
  "reqwest",
  "serde_json",
@@ -1996,41 +2005,70 @@ dependencies = [
 name = "nfi-api"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "base64 0.22.1",
  "chrono",
- "futures",
- "hex",
- "nfi-interchange",
- "reqwest",
+ "nfi-auth",
  "serde",
  "serde_json",
- "sha2",
- "tokio",
- "tokio-util",
 ]
 
 [[package]]
 name = "nfi-auth"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "nfi-auth-client"
+version = "0.1.0"
+dependencies = [
  "anyhow",
- "axum",
  "base64 0.22.1",
- "cel",
  "hex",
- "http",
- "jsonwebtoken",
- "libc",
  "nfi-auth",
+ "nfi-test-support",
  "reqwest",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "nfi-auth-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "cel",
+ "http",
+ "jsonwebtoken",
+ "nfi-auth",
+ "nfi-auth-client",
+ "nfi-test-support",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "nfi-drv"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "hex",
+ "nfi-api",
+ "nfi-interchange",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -2039,6 +2077,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "libc",
+ "nfi-embedded-postgres",
  "tempfile",
  "tracing",
 ]
@@ -2064,6 +2103,7 @@ dependencies = [
  "clap",
  "futures",
  "nfi-api",
+ "nfi-drv",
  "nfi-interchange",
  "reqwest",
  "rusqlite",
@@ -2107,9 +2147,13 @@ dependencies = [
  "hex",
  "nfi-api",
  "nfi-auth",
+ "nfi-auth-server",
+ "nfi-drv",
  "nfi-embedded-meilisearch",
  "nfi-embedded-postgres",
  "nfi-interchange",
+ "nfi-service-common",
+ "nfi-test-support",
  "nfi-testenv",
  "reqwest",
  "serde",
@@ -2121,7 +2165,30 @@ dependencies = [
  "tokio",
  "tower-http",
  "tracing",
+]
+
+[[package]]
+name = "nfi-service-common"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "nfi-auth-server",
+ "tokio",
+ "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "nfi-test-support"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "jsonwebtoken",
+ "libc",
+ "nfi-auth",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -2129,6 +2196,7 @@ name = "nfi-testenv"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "nfi-embedded-postgres",
  "nfi-interchange",
  "nfi-service",
  "reqwest",
@@ -4813,18 +4881,21 @@ dependencies = [
  "crossterm",
  "futures",
  "nfi",
- "nfi-api",
  "nfi-auth",
+ "nfi-auth-client",
+ "nfi-auth-server",
  "nfi-interchange",
+ "nfi-test-support",
  "ratatui",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "tokio",
- "toml",
  "yoink-api",
  "yoink-mirror-http",
+ "yoink-purl",
  "yoink-server",
 ]
 
@@ -4832,16 +4903,8 @@ dependencies = [
 name = "yoink-api"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "bytes",
- "futures",
- "nfi-interchange",
- "percent-encoding",
- "reqwest",
+ "nfi-auth",
  "serde",
- "serde_json",
- "thiserror 2.0.21",
- "tokio",
 ]
 
 [[package]]
@@ -4855,8 +4918,9 @@ dependencies = [
  "bytes",
  "clap",
  "futures",
- "nfi-auth",
+ "nfi-auth-server",
  "nfi-interchange",
+ "nfi-test-support",
  "reqwest",
  "serde_json",
  "sha2",
@@ -4864,8 +4928,19 @@ dependencies = [
  "tokio",
  "tracing",
  "xz2",
+ "yoink",
  "yoink-api",
+ "yoink-purl",
  "yoink-server",
+]
+
+[[package]]
+name = "yoink-purl"
+version = "0.1.0"
+dependencies = [
+ "nfi-interchange",
+ "percent-encoding",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -4877,13 +4952,18 @@ dependencies = [
  "clap",
  "futures",
  "nfi-auth",
+ "nfi-auth-client",
+ "nfi-auth-server",
+ "nfi-service-common",
+ "nfi-test-support",
  "reqwest",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
- "tracing-subscriber",
+ "yoink",
  "yoink-api",
+ "yoink-purl",
 ]
 
 [[package]]

@@ -1,17 +1,10 @@
 //! HTTP client for the yoink service.
 
-use crate::{ErrorBody, Event, MIRROR_PATH, MirrorRequest};
 use anyhow::{Context, Result};
 use futures::stream::{BoxStream, StreamExt};
+use nfi_auth_client::http::check;
 use std::time::Duration;
-
-/// A non-success HTTP response.
-#[derive(Debug, thiserror::Error)]
-#[error("HTTP {status}: {message}")]
-pub struct HttpError {
-    pub status: u16,
-    pub message: String,
-}
+use yoink_api::{Event, MIRROR_PATH, MirrorRequest};
 
 /// The service sends a keep-alive comment every 15 s; a stream silent for
 /// this long is considered dead.
@@ -43,8 +36,12 @@ impl Client {
         &self.base
     }
 
-    pub fn set_token(&mut self, token: Option<String>) {
-        self.token = token;
+    /// The same client (sharing its connections) sending `token`.
+    pub fn with_token(&self, token: Option<String>) -> Self {
+        Self {
+            token,
+            ..self.clone()
+        }
     }
 
     fn req(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
@@ -55,22 +52,6 @@ impl Client {
         }
     }
 
-    async fn check(&self, resp: reqwest::Response) -> Result<reqwest::Response> {
-        let status = resp.status();
-        if status.is_success() {
-            return Ok(resp);
-        }
-        let bytes = resp.bytes().await.unwrap_or_default();
-        let message = serde_json::from_slice::<ErrorBody>(&bytes)
-            .map(|e| e.error)
-            .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).into_owned());
-        Err(HttpError {
-            status: status.as_u16(),
-            message,
-        }
-        .into())
-    }
-
     /// GET a JSON document.
     pub async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
         let r = self
@@ -78,7 +59,7 @@ impl Client {
             .send()
             .await
             .with_context(|| format!("connecting to {}", self.base))?;
-        Ok(self.check(r).await?.json().await?)
+        Ok(check(r).await?.json().await?)
     }
 
     /// Start mirroring `purls` and stream the events. The stream ends when
@@ -93,7 +74,7 @@ impl Client {
             .send()
             .await
             .with_context(|| format!("connecting to {}", self.base))?;
-        let r = self.check(r).await?;
+        let r = check(r).await?;
         let mut parser = SseParser::default();
         let s = r
             .bytes_stream()
@@ -103,9 +84,8 @@ impl Client {
                     Ok(b) => parser
                         .feed(&b)
                         .into_iter()
-                        .filter_map(|(name, data)| {
-                            Event::from_sse(&name, &data)
-                                .map(|r| r.with_context(|| format!("decoding {name} event")))
+                        .map(|(name, data)| {
+                            serde_json::from_str(&data).with_context(|| format!("decoding {name} event"))
                         })
                         .collect(),
                 }
