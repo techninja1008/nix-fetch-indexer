@@ -3,15 +3,17 @@
 //! a device authorization grant that approves on the second poll, and
 //! rotating refresh tokens (each works once). It also answers
 //! [`nfi_auth::CONFIG_PATH`] like a service using it, so CLI credentials can
-//! be pointed at it directly. [`pty`] runs CLIs on a pseudo-terminal, so
-//! that their interactive paths (device login, fullscreen UIs) can be tested
-//! too.
+//! be pointed at it directly. [`Impostor`] is a service claiming a
+//! provider's settings, to check that CLIs do not send it cached logins.
+//! [`pty`] runs CLIs on a pseudo-terminal, so that their interactive paths
+//! (device login, fullscreen UIs) can be tested too.
 
 #[cfg(unix)]
 pub mod pty;
 
 use axum::Router;
 use axum::extract::{Form, State};
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
@@ -51,6 +53,8 @@ struct Inner {
     refreshes: AtomicUsize,
     /// Refresh tokens already used (and so no longer valid).
     used_refresh_tokens: Mutex<HashSet<String>>,
+    /// The OAuth error refresh requests get while set.
+    refresh_error: Mutex<Option<String>>,
     token_lifetime: Mutex<i64>,
     /// Index into [`KEYS`] of the signing (and published) key.
     key: AtomicUsize,
@@ -88,6 +92,7 @@ impl MockIdp {
                 device_logins: AtomicUsize::new(0),
                 refreshes: AtomicUsize::new(0),
                 used_refresh_tokens: Default::default(),
+                refresh_error: Default::default(),
                 token_lifetime: Mutex::new(3600),
                 key: AtomicUsize::new(0),
                 jwks: Mutex::new(None),
@@ -144,6 +149,11 @@ impl MockIdp {
     /// Lifetime of tokens issued from now on, in seconds (may be negative).
     pub fn set_token_lifetime(&self, secs: i64) {
         *self.inner.token_lifetime.lock().unwrap() = secs;
+    }
+
+    /// Answer refresh requests with this OAuth error (`None`: serve them).
+    pub fn set_refresh_error(&self, error: Option<&str>) {
+        *self.inner.refresh_error.lock().unwrap() = error.map(Into::into);
     }
 
     /// Sign new tokens with the other key, and publish only that one.
@@ -281,6 +291,9 @@ async fn token(State(i): State<MockIdp>, Form(f): Form<HashMap<String, String>>)
             .into_response()
         }
         Some("refresh_token") => {
+            if let Some(e) = i.inner.refresh_error.lock().unwrap().clone() {
+                return oauth_error(&e);
+            }
             let rt = f.get("refresh_token").cloned().unwrap_or_default();
             if !rt.starts_with("rt-") || !i.inner.used_refresh_tokens.lock().unwrap().insert(rt) {
                 return oauth_error("invalid_grant");
@@ -298,4 +311,57 @@ async fn token(State(i): State<MockIdp>, Form(f): Form<HashMap<String, String>>)
         }
         _ => oauth_error("unsupported_grant_type"),
     }
+}
+
+/// A service claiming a provider's settings on [`nfi_auth::CONFIG_PATH`]
+/// that records every bearer token sent to it. With a token, whoami answers
+/// `mallory` and any other request `[]`; without one, they get 401.
+#[derive(Clone)]
+pub struct Impostor {
+    url: String,
+    bearers: Arc<Mutex<Vec<String>>>,
+}
+
+impl Impostor {
+    pub async fn start(idp: &MockIdp) -> Self {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let i = Impostor {
+            url: format!("http://{}", l.local_addr().unwrap()),
+            bearers: Default::default(),
+        };
+        let app = Router::new()
+            .route(nfi_auth::CONFIG_PATH, get(config).with_state(idp.clone()))
+            .fallback(impostor)
+            .with_state(i.clone());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        i
+    }
+
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// The bearer tokens received so far.
+    pub fn bearers(&self) -> Vec<String> {
+        self.bearers.lock().unwrap().clone()
+    }
+}
+
+async fn impostor(State(i): State<Impostor>, uri: Uri, h: HeaderMap) -> Response {
+    let Some(t) = h
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(serde_json::json!({"error": "authentication required"})),
+        )
+            .into_response();
+    };
+    i.bearers.lock().unwrap().push(t.to_string());
+    if uri.path() == nfi_auth::WHOAMI_PATH {
+        return axum::Json(serde_json::json!({"username": "mallory"})).into_response();
+    }
+    axum::Json(serde_json::json!([])).into_response()
 }

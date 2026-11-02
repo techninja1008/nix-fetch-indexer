@@ -7,8 +7,8 @@ use crate::stream::{Msg, drive};
 use crate::targets::{Target, classify, closure_purls, dedupe};
 use crate::tui;
 use anyhow::{Context, Result, bail};
-use nfi::http::retry;
 use nfi_auth_client::Credentials;
+use nfi_auth_client::http::retry;
 use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -40,7 +40,7 @@ async fn resolve_flakes(
     let graph = tokio::task::spawn_blocking(move || nfi::derivation_graph(&nix, &flakes)).await??;
     let client = nfi::client::Client::new(nfi_url, None)?;
     let cmt = o.close_miss_threshold;
-    let r = retry(creds, true, |t| async {
+    let r = retry(creds, |t| async {
         client.with_token(t).minimise(&graph, cmt).await
     })
     .await
@@ -126,11 +126,7 @@ pub async fn pull(o: PullOptions) -> Result<ExitCode> {
     }
 
     let client = crate::client::Client::new(&o.url, None)?;
-    let first = retry(&creds, true, |t| async {
-        client.with_token(t).mirror(&purls).await
-    })
-    .await;
-    let client = client.with_token(creds.token(false).await.ok().flatten());
+    let first = retry(&creds, |t| async { client.with_token(t).mirror(&purls).await }).await;
 
     let mut state = State::new(&purls);
     state.plan = plan;

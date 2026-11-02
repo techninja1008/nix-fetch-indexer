@@ -3,8 +3,8 @@
 
 use crate::client::{Client, EventStream};
 use crate::state::Conn;
-use nfi::http::{HttpError, is_unauthorized};
 use nfi_auth_client::Credentials;
+use nfi_auth_client::http::{HttpError, is_unauthorized};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;

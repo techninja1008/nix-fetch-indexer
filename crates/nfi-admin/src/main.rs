@@ -1,10 +1,10 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use nfi::client::Client;
-use nfi::http::retry;
 use nfi::{print_json, whoami};
 use nfi_api::{JobInfo, JobStatus, PruneRequest};
 use nfi_auth_client::Credentials;
+use nfi_auth_client::http::retry;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -47,8 +47,8 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
-    /// Forget the cached login for the admin listener (and every service
-    /// sharing its OpenID provider and client).
+    /// Forget the cached login for the admin listener (and so for every
+    /// other URL logged in with the same OpenID provider and client).
     Logout,
     /// Show who the admin listener sees you as, without logging in (exit 1
     /// when not authenticated).
@@ -118,6 +118,8 @@ enum Cmd {
 /// How a command finished, mapped to the exit status.
 enum Outcome {
     Ok,
+    /// `whoami` found no login (exit 1, like the other CLIs).
+    NotAuthenticated,
     /// A job failed (exit 2).
     Failed,
     /// The consistency check found problems (exit 3).
@@ -165,7 +167,7 @@ impl Api {
         F: Fn(Client) -> Fut,
         Fut: Future<Output = Result<T>>,
     {
-        retry(&self.creds, true, |t| f(self.client.with_token(t))).await
+        retry(&self.creds, |t| f(self.client.with_token(t))).await
     }
 }
 
@@ -277,14 +279,15 @@ async fn run(cli: Cli) -> Result<Outcome> {
             true
         }
         Cmd::Logout => {
-            if creds.logout().await? {
-                eprintln!("logged out of {url}");
-            } else {
-                eprintln!("not logged in to {url}");
+            nfi::logout(&creds, url).await?;
+            true
+        }
+        Cmd::Whoami => {
+            if !whoami(&creds, url, cli.json).await? {
+                return Ok(Outcome::NotAuthenticated);
             }
             true
         }
-        Cmd::Whoami => whoami(&creds, url, cli.json).await?,
         cmd => {
             if let Cmd::Prune {
                 releases,
@@ -392,6 +395,7 @@ async fn exec(cmd: Cmd, json: bool, api: &Api) -> Result<Outcome> {
 async fn main() -> ExitCode {
     match run(Cli::parse()).await {
         Ok(Outcome::Ok) => ExitCode::SUCCESS,
+        Ok(Outcome::NotAuthenticated) => ExitCode::FAILURE,
         Ok(Outcome::Failed) => ExitCode::from(2),
         Ok(Outcome::Inconsistent) => ExitCode::from(3),
         Err(e) => {

@@ -1,8 +1,8 @@
 //! HTTP client for the query service (public and admin APIs).
 
-use crate::http::check;
 use anyhow::{Context, Result};
 use nfi_api::*;
+use nfi_auth_client::http::check;
 use std::path::Path;
 use std::time::Duration;
 
@@ -52,11 +52,6 @@ impl Client {
             .with_context(|| format!("connecting to {}", self.base))?;
         let bytes = check(resp).await?.bytes().await?;
         serde_json::from_slice(&bytes).context("decoding response")
-    }
-
-    /// GET a JSON document, e.g. `nfi_auth::WHOAMI_PATH`.
-    pub async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
-        self.send(self.req(reqwest::Method::GET, path)).await
     }
 
     // ----- public -----

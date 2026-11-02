@@ -8,7 +8,7 @@ use axum::routing::{get, post};
 use nfi_auth_client::{StoredToken, TokenStore};
 use nfi_auth_server::{Authenticator, Expr, OidcSettings};
 use nfi_service::auth::{AdminAuth, ServiceAuth};
-use nfi_test_support::MockIdp;
+use nfi_test_support::{Impostor, MockIdp};
 use serde_json::json;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -54,15 +54,18 @@ async fn tokens() {
     };
     let d = tempfile::tempdir().unwrap();
     // A login made with `nfi login` for the public listener: the admin CLI
-    // shares it (same provider and client), even without a terminal; bob
-    // fails the admin policy.
-    TokenStore::at(d.path().join("tokens"))
+    // does not send it to the admin listener until logged in there.
+    let store = TokenStore::at(d.path().join("tokens"));
+    store
         .save_token(&StoredToken {
             issuer: idp.issuer().into(),
             client_id: idp.client_id().into(),
             id_token: idp.token(json!({"sub": "2", "preferred_username": "bob"})),
             refresh_token: None,
         })
+        .unwrap();
+    store
+        .record_url(&svc.public_url, idp.issuer(), idp.client_id())
         .unwrap();
     let admin = |env: &[(&str, &str)], args: &[&str]| {
         let mut a = vec!["--url", svc.admin_url.as_str()];
@@ -71,7 +74,41 @@ async fn tokens() {
     };
     let o = admin(&[], &["jobs"]);
     assert_eq!(o.code, 1);
+    assert!(o.stderr.contains("run `nfi-admin login`"), "{}", o.stderr);
+    let o = admin(&[], &["whoami"]);
+    assert_eq!(o.code, 1);
+    assert_eq!(o.stdout.trim(), format!("{}: not authenticated", svc.admin_url));
+    // `login` there reuses it without a terminal, although bob fails the
+    // admin policy (whoami does not apply it); commands then get 403.
+    let o = admin(&[], &["login"]);
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(
+        o.stderr
+            .contains(&format!("logged in to {} as bob", svc.admin_url)),
+        "{}",
+        o.stderr
+    );
+    let o = admin(&[], &["whoami"]);
+    assert!(
+        o.stdout.starts_with(&format!("{}: bob\n", svc.admin_url)),
+        "{}",
+        o.stdout
+    );
+    let o = admin(&[], &["jobs"]);
+    assert_eq!(o.code, 1);
     assert!(o.stderr.contains("403"), "{}", o.stderr);
+    assert_eq!(idp.device_logins(), 0);
+    // A service at another URL claiming the same provider gets nothing.
+    let evil = Impostor::start(&idp).await;
+    let o = run(
+        env!("CARGO_BIN_EXE_nfi-admin"),
+        d.path(),
+        &[],
+        &["--url", evil.url(), "jobs"],
+    );
+    assert_eq!(o.code, 1);
+    assert!(o.stderr.contains("run `nfi-admin login`"), "{}", o.stderr);
+    assert!(evil.bearers().is_empty());
     let root = idp.token(json!({"sub": "0", "preferred_username": "root"}));
     let o = admin(&[("NFI_ADMIN_TOKEN", &root)], &["jobs"]);
     assert_eq!(o.code, 0, "{}", o.stderr);
@@ -141,7 +178,8 @@ async fn rejected_login_mid_command() {
     tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
 
     let d = tempfile::tempdir().unwrap();
-    TokenStore::at(d.path().join("tokens"))
+    let store = TokenStore::at(d.path().join("tokens"));
+    store
         .save_token(&StoredToken {
             issuer: idp.issuer().into(),
             client_id: idp.client_id().into(),
@@ -149,6 +187,7 @@ async fn rejected_login_mid_command() {
             refresh_token: None,
         })
         .unwrap();
+    store.record_url(&url, idp.issuer(), idp.client_id()).unwrap();
     let mut c = Command::new(env!("CARGO_BIN_EXE_nfi-admin"));
     c.args(["--url", &url, "ingest", "https://x/a.nfib", "https://x/b.nfib"])
         .env("XDG_CONFIG_HOME", d.path())

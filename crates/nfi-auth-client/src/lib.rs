@@ -1,13 +1,17 @@
 //! CLI side: device code login, token refresh and the token cache.
 //!
 //! Tokens are cached per (issuer, client id) in
-//! `$XDG_CACHE_HOME/nfi/tokens/` (mode 0600), so every CLI talking to
-//! services that share an OpenID provider and client shares one login. A
-//! service's [`AuthConfig`] is fetched once per process, never cached.
+//! `$XDG_CACHE_HOME/nfi/tokens/` (mode 0600), next to a record of the
+//! service URLs each was logged in to. A cached token is only sent to those
+//! URLs: every CLI talking to one of them shares the login. A service's
+//! [`AuthConfig`] is fetched once per process, never cached.
+
+pub mod http;
 
 use anyhow::{Context, Result, bail};
 use nfi_auth::oidc::{DeviceAuthorization, ProviderMetadata, TokenError, TokenResponse};
 use nfi_auth::{AuthConfig, Whoami};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::path::{Path, PathBuf};
@@ -50,6 +54,52 @@ fn digest(parts: &[&str]) -> String {
     hex::encode(&h.finalize()[..16])
 }
 
+/// The provider login a service URL was logged in with.
+#[derive(Debug, Serialize, Deserialize)]
+struct UrlLogin {
+    url: String,
+    issuer: String,
+    client_id: String,
+}
+
+/// Whether a corrupt cache file was reported already.
+static WARNED_CORRUPT: AtomicBool = AtomicBool::new(false);
+
+/// Read a cache file; a missing or corrupt one (reported once) is `None`.
+fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    match std::fs::read(path) {
+        Ok(b) => match serde_json::from_slice(&b) {
+            Ok(v) => Ok(Some(v)),
+            Err(e) => {
+                if !WARNED_CORRUPT.swap(true, Ordering::Relaxed) {
+                    eprintln!("warning: ignoring {}: {e}", path.display());
+                }
+                Ok(None)
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+fn remove(path: &Path) -> Result<bool> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
+/// Create `dir` (and its parents) accessible by the owner only.
+fn create_dir(dir: &Path) -> Result<()> {
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+    b.create(dir)
+        .with_context(|| format!("creating {}", dir.display()))
+}
+
 /// The on-disk token cache.
 #[derive(Clone, Debug)]
 pub struct TokenStore {
@@ -59,7 +109,7 @@ pub struct TokenStore {
 impl TokenStore {
     /// `$NFI_TOKEN_CACHE`, else `$XDG_CACHE_HOME/nfi/tokens`, else
     /// `~/.cache/nfi/tokens`.
-    pub fn default_location() -> Result<Self> {
+    fn default_location() -> Result<Self> {
         if let Some(d) = std::env::var_os("NFI_TOKEN_CACHE") {
             return Ok(Self::at(d));
         }
@@ -78,43 +128,90 @@ impl TokenStore {
         self.dir.join(format!("{}.json", digest(&[issuer, client_id])))
     }
 
-    pub fn token(&self, issuer: &str, client_id: &str) -> Result<Option<StoredToken>> {
-        let path = self.token_path(issuer, client_id);
-        match std::fs::read(&path) {
-            Ok(b) => Ok(Some(
-                serde_json::from_slice(&b).with_context(|| format!("parsing {}", path.display()))?,
-            )),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
-        }
+    fn urls_dir(&self) -> PathBuf {
+        self.dir.join("urls")
+    }
+
+    fn url_path(&self, url: &str) -> PathBuf {
+        self.urls_dir()
+            .join(format!("{}.json", digest(&[url.trim_end_matches('/')])))
     }
 
     /// Write atomically; the temporary file is created with mode 0600.
-    pub fn save_token(&self, t: &StoredToken) -> Result<()> {
+    fn write<T: Serialize>(path: &Path, v: &T) -> Result<()> {
         use std::io::Write;
-        let path = self.token_path(&t.issuer, &t.client_id);
-        std::fs::create_dir_all(&self.dir).with_context(|| format!("creating {}", self.dir.display()))?;
-        let mut f = tempfile::NamedTempFile::new_in(&self.dir)?;
-        f.write_all(&serde_json::to_vec_pretty(t)?)?;
-        f.persist(&path)
+        let dir = path.parent().expect("has a parent");
+        create_dir(dir)?;
+        let mut f = tempfile::NamedTempFile::new_in(dir)?;
+        f.write_all(&serde_json::to_vec_pretty(v)?)?;
+        f.persist(path)
             .with_context(|| format!("writing {}", path.display()))?;
         Ok(())
     }
 
+    pub fn token(&self, issuer: &str, client_id: &str) -> Result<Option<StoredToken>> {
+        read_json(&self.token_path(issuer, client_id))
+    }
+
+    pub fn save_token(&self, t: &StoredToken) -> Result<()> {
+        Self::write(&self.token_path(&t.issuer, &t.client_id), t)
+    }
+
     pub fn remove_token(&self, issuer: &str, client_id: &str) -> Result<bool> {
-        let path = self.token_path(issuer, client_id);
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+        remove(&self.token_path(issuer, client_id))
+    }
+
+    /// Record that `url` was logged in to with the provider login
+    /// (`issuer`, `client_id`): its token may be sent there.
+    pub fn record_url(&self, url: &str, issuer: &str, client_id: &str) -> Result<()> {
+        let r = UrlLogin {
+            url: url.trim_end_matches('/').into(),
+            issuer: issuer.into(),
+            client_id: client_id.into(),
+        };
+        Self::write(&self.url_path(url), &r)
+    }
+
+    /// The provider login `url` was logged in with, if any.
+    fn url_login(&self, url: &str) -> Result<Option<UrlLogin>> {
+        let r: Option<UrlLogin> = read_json(&self.url_path(url))?;
+        Ok(r.filter(|r| r.url == url.trim_end_matches('/')))
+    }
+
+    /// Whether `url` was logged in to with (`issuer`, `client_id`).
+    fn is_recorded(&self, url: &str, issuer: &str, client_id: &str) -> Result<bool> {
+        Ok(self
+            .url_login(url)?
+            .is_some_and(|r| (r.issuer.as_str(), r.client_id.as_str()) == (issuer, client_id)))
+    }
+
+    /// The URLs logged in to with (`issuer`, `client_id`).
+    fn urls(&self, issuer: &str, client_id: &str) -> Result<Vec<String>> {
+        let dir = self.urls_dir();
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+        };
+        let mut urls = vec![];
+        for e in entries {
+            let p = e?.path();
+            if p.extension().is_some_and(|x| x == "json")
+                && let Some(r) = read_json::<UrlLogin>(&p)?
+                && (r.issuer.as_str(), r.client_id.as_str()) == (issuer, client_id)
+            {
+                urls.push(r.url);
+            }
         }
+        urls.sort();
+        Ok(urls)
     }
 
     /// Block until this process holds the refresh lock for a login; it is
     /// released when the file is dropped.
     fn lock(&self, issuer: &str, client_id: &str) -> Result<std::fs::File> {
         let path = self.token_path(issuer, client_id).with_extension("lock");
-        std::fs::create_dir_all(&self.dir).with_context(|| format!("creating {}", self.dir.display()))?;
+        create_dir(&self.dir)?;
         let f = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -127,11 +224,10 @@ impl TokenStore {
 }
 
 /// What the user must do to approve a device login.
-#[derive(Clone, Debug)]
-pub struct DevicePrompt {
-    pub verification_uri: String,
-    pub verification_uri_complete: Option<String>,
-    pub user_code: String,
+struct DevicePrompt {
+    verification_uri: String,
+    verification_uri_complete: Option<String>,
+    user_code: String,
 }
 
 impl std::fmt::Display for DevicePrompt {
@@ -149,6 +245,15 @@ impl std::fmt::Display for DevicePrompt {
             ),
         }
     }
+}
+
+/// Who a service sees with the credentials sent to it.
+#[derive(Debug)]
+pub enum Identity {
+    User(Whoami),
+    NotAuthenticated,
+    /// The service does not use OIDC login.
+    NoLogin,
 }
 
 /// What the token cache holds for a service.
@@ -273,40 +378,69 @@ impl Credentials {
         })
     }
 
-    /// Log in: unless `force`, keep a cached login the service accepts;
-    /// otherwise run the device flow. Returns who the service sees.
+    /// Who the service sees with [`Credentials::current`], without logging
+    /// in.
+    pub async fn whoami(&self) -> Result<Identity> {
+        let t = self.current().await?;
+        self.ask(t.as_deref()).await
+    }
+
+    /// Log in: unless `force`, keep a cached provider login the service
+    /// accepts (even one made for another URL: the user chose to log in
+    /// here); otherwise run the device flow. Either way the URL is recorded
+    /// as logged in. Returns who the service sees.
     pub async fn login(&self, force: bool) -> Result<Whoami> {
         let cfg = self
             .config()
             .await?
             .with_context(|| format!("{} does not use OIDC login", self.url))?;
         if !force
-            && let Login::Usable(t) = self.stored(cfg).await?
-            && let Some(w) = self.whoami(&t).await?
+            && let Some(store) = &self.store
+            && let Login::Usable(t) = self.provider(store, cfg).await?
+            && let Identity::User(w) = self.ask(Some(&t)).await?
         {
+            store.record_url(&self.url, &cfg.issuer, &cfg.client_id)?;
+            self.remember(t);
             return Ok(w);
         }
         let t = self.device(cfg).await?;
-        self.whoami(&t)
-            .await?
-            .with_context(|| format!("{} rejected the new login", self.url))
-    }
-
-    /// Forget the provider login the service uses (and so the login of
-    /// every service sharing it). Returns whether there was one.
-    pub async fn logout(&self) -> Result<bool> {
-        *self.current.lock().unwrap() = None;
-        match (self.config().await?, &self.store) {
-            (Some(cfg), Some(store)) => store.remove_token(&cfg.issuer, &cfg.client_id),
-            _ => Ok(false),
+        match self.ask(Some(&t)).await? {
+            Identity::User(w) => Ok(w),
+            _ => bail!("{} rejected the new login", self.url),
         }
     }
 
+    /// Log out of the service: forget the provider login it was logged in
+    /// with, which also logs out of every other URL logged in with it.
+    /// `None` if it was not logged in, else those other URLs. Works offline
+    /// unless the URL has no record (then its settings are fetched, if
+    /// possible).
+    pub async fn logout(&self) -> Result<Option<Vec<String>>> {
+        *self.current.lock().unwrap() = None;
+        let Some(store) = &self.store else {
+            return Ok(None);
+        };
+        let (issuer, client_id) = match store.url_login(&self.url)? {
+            Some(r) => (r.issuer, r.client_id),
+            None => match self.config().await {
+                Ok(Some(c)) => (c.issuer.clone(), c.client_id.clone()),
+                _ => return Ok(None),
+            },
+        };
+        let urls = store.urls(&issuer, &client_id)?;
+        for u in &urls {
+            remove(&store.url_path(u))?;
+        }
+        let removed = store.remove_token(&issuer, &client_id)?;
+        let was = removed || urls.contains(&self.url);
+        Ok(was.then(|| urls.into_iter().filter(|u| *u != self.url).collect()))
+    }
+
     /// After a 401: forget the token in use and log in again, if that is
-    /// possible (no explicit token, OIDC, stderr a terminal).
+    /// possible (no explicit token, a token cache, OIDC, stderr a terminal).
     pub async fn relogin(&self) -> Result<Option<String>> {
         *self.current.lock().unwrap() = None;
-        if self.explicit.is_some() || !interactive() {
+        if self.explicit.is_some() || self.store.is_none() || !interactive() {
             return Ok(None);
         }
         match self.config().await? {
@@ -334,7 +468,9 @@ impl Credentials {
         t
     }
 
-    /// The token held in memory or the cache, refreshing it if needed.
+    /// The login for this URL held in memory or the cache, refreshing it if
+    /// needed. A cached login is only used if this URL was logged in to with
+    /// it, so a service merely claiming the same provider never gets it.
     async fn stored(&self, cfg: &AuthConfig) -> Result<Login> {
         if let Some(t) = self.current.lock().unwrap().clone()
             && fresh(&t)
@@ -344,22 +480,40 @@ impl Credentials {
         let Some(store) = &self.store else {
             return Ok(Login::Missing);
         };
+        if !store.is_recorded(&self.url, &cfg.issuer, &cfg.client_id)? {
+            return Ok(Login::Missing);
+        }
+        let l = self.provider(store, cfg).await?;
+        if let Login::Usable(t) = &l {
+            self.remember(t.clone());
+        }
+        Ok(l)
+    }
+
+    /// Take the lock for refreshing or replacing the provider login.
+    async fn lock(&self, store: &TokenStore, cfg: &AuthConfig) -> Result<std::fs::File> {
+        let (s, i, c) = (store.clone(), cfg.issuer.clone(), cfg.client_id.clone());
+        tokio::task::spawn_blocking(move || s.lock(&i, &c)).await?
+    }
+
+    /// The cached provider login (whatever URLs it is for), refreshing it if
+    /// needed.
+    async fn provider(&self, store: &TokenStore, cfg: &AuthConfig) -> Result<Login> {
         match store.token(&cfg.issuer, &cfg.client_id)? {
             None => return Ok(Login::Missing),
-            Some(t) if fresh(&t.id_token) => return Ok(Login::Usable(self.remember(t.id_token))),
+            Some(t) if fresh(&t.id_token) => return Ok(Login::Usable(t.id_token)),
             Some(StoredToken {
                 refresh_token: None, ..
             }) => return Ok(Login::Expired),
             Some(_) => {}
         }
-        let (s, i, c) = (store.clone(), cfg.issuer.clone(), cfg.client_id.clone());
-        let _lock = tokio::task::spawn_blocking(move || s.lock(&i, &c)).await??;
+        let _lock = self.lock(store, cfg).await?;
         // Another process may have refreshed it meanwhile.
         let Some(t) = store.token(&cfg.issuer, &cfg.client_id)? else {
             return Ok(Login::Missing);
         };
         if fresh(&t.id_token) {
-            return Ok(Login::Usable(self.remember(t.id_token)));
+            return Ok(Login::Usable(t.id_token));
         }
         let Some(rt) = &t.refresh_token else {
             return Ok(Login::Expired);
@@ -367,7 +521,7 @@ impl Credentials {
         match self.refresh(cfg, rt).await {
             Ok(Some(t)) => {
                 store.save_token(&t)?;
-                Ok(Login::Usable(self.remember(t.id_token)))
+                Ok(Login::Usable(t.id_token))
             }
             Ok(None) => {
                 store.remove_token(&cfg.issuer, &cfg.client_id)?;
@@ -381,32 +535,42 @@ impl Credentials {
         }
     }
 
-    /// Run the device flow (prompting on stderr) and cache the login.
+    /// Run the device flow (prompting on stderr), cache the login and
+    /// record this URL as logged in with it.
     async fn device(&self, cfg: &AuthConfig) -> Result<String> {
         let store = self
             .store
             .as_ref()
             .context("no token cache: set HOME, XDG_CACHE_HOME or NFI_TOKEN_CACHE")?;
         let t = self.device_login(cfg).await?;
+        let _lock = self.lock(store, cfg).await?;
         store.save_token(&t)?;
+        store.record_url(&self.url, &cfg.issuer, &cfg.client_id)?;
         Ok(self.remember(t.id_token))
     }
 
-    /// Who the service sees with `token`; `None` on a 401.
-    async fn whoami(&self, token: &str) -> Result<Option<Whoami>> {
+    /// Who the service sees with `token`.
+    async fn ask(&self, token: Option<&str>) -> Result<Identity> {
         let u = format!("{}{}", self.url, nfi_auth::WHOAMI_PATH);
-        let r = self
-            .http
-            .get(&u)
-            .bearer_auth(token)
+        let mut rb = self.http.get(&u);
+        if let Some(t) = token {
+            rb = rb.bearer_auth(t);
+        }
+        let r = rb
             .send()
             .await
             .with_context(|| format!("connecting to {}", self.url))?;
-        match r.status() {
-            reqwest::StatusCode::UNAUTHORIZED => Ok(None),
-            s if s.is_success() => Ok(Some(r.json().await.with_context(|| format!("decoding {u}"))?)),
-            s => bail!("fetching {u}: HTTP {s}"),
-        }
+        Ok(match r.status() {
+            reqwest::StatusCode::UNAUTHORIZED => Identity::NotAuthenticated,
+            reqwest::StatusCode::NOT_FOUND => Identity::NoLogin,
+            _ => Identity::User(
+                http::check(r)
+                    .await?
+                    .json()
+                    .await
+                    .with_context(|| format!("decoding {u}"))?,
+            ),
+        })
     }
 
     async fn metadata(&self, issuer: &str) -> Result<ProviderMetadata> {
@@ -455,8 +619,9 @@ impl Credentials {
         }
     }
 
-    /// Use a refresh token. `None` if the provider rejects it or issues no
-    /// new ID token.
+    /// Use a refresh token. `None` if the provider says it is no longer
+    /// valid (`invalid_grant`); other errors (the provider unavailable, a
+    /// misconfigured client...) leave it usable later.
     async fn refresh(&self, cfg: &AuthConfig, refresh_token: &str) -> Result<Option<StoredToken>> {
         let md = self.metadata(&cfg.issuer).await?;
         let scope = cfg.scopes.join(" ");
@@ -471,13 +636,19 @@ impl Credentials {
                 ],
             )
             .await?;
-        Ok(r.ok().and_then(|t| {
-            Some(StoredToken {
-                issuer: cfg.issuer.clone(),
-                client_id: cfg.client_id.clone(),
-                id_token: t.id_token?,
-                refresh_token: t.refresh_token.or_else(|| Some(refresh_token.to_string())),
-            })
+        let t = match r {
+            Ok(t) => t,
+            Err(e) if e.error == "invalid_grant" => return Ok(None),
+            Err(e) => bail!("{}", oauth_error(&e)),
+        };
+        let Some(id_token) = t.id_token else {
+            bail!("{} issued no ID token", cfg.issuer);
+        };
+        Ok(Some(StoredToken {
+            issuer: cfg.issuer.clone(),
+            client_id: cfg.client_id.clone(),
+            id_token,
+            refresh_token: t.refresh_token.or_else(|| Some(refresh_token.to_string())),
         }))
     }
 
@@ -543,13 +714,17 @@ impl Credentials {
                 }
                 Err(e) if e.error == "authorization_pending" => {}
                 Err(e) if e.error == "slow_down" => interval += Duration::from_secs(5),
-                Err(e) => bail!(
-                    "login failed: {}{}",
-                    e.error,
-                    e.error_description.map(|d| format!(": {d}")).unwrap_or_default()
-                ),
+                Err(e) => bail!("login failed: {}", oauth_error(&e)),
             }
         }
+    }
+}
+
+/// `invalid_grant` or `invalid_grant: description`.
+fn oauth_error(e: &TokenError) -> String {
+    match &e.error_description {
+        Some(d) => format!("{}: {d}", e.error),
+        None => e.error.clone(),
     }
 }
 
@@ -562,7 +737,7 @@ pub fn describe(w: &Whoami) -> String {
 }
 
 /// Read a pre-obtained token (e.g. a CI-issued ID token) from a file.
-pub fn read_token_file(path: &Path) -> Result<String> {
+fn read_token_file(path: &Path) -> Result<String> {
     let s = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let s = s.trim();
     if s.is_empty() {
@@ -585,13 +760,13 @@ pub fn explicit(file: Option<&Path>, env: &str) -> Result<Option<String>> {
 
 /// Whether a device login can be prompted for (stderr is a terminal; the
 /// device flow never reads stdin, so it may be a pipe).
-pub fn interactive() -> bool {
+fn interactive() -> bool {
     use std::io::IsTerminal;
     std::io::stderr().is_terminal()
 }
 
 /// Read the unverified `exp` claim of a JWT (seconds since the epoch).
-pub fn jwt_expiry(token: &str) -> Option<i64> {
+fn jwt_expiry(token: &str) -> Option<i64> {
     use base64::Engine;
     let payload = token.split('.').nth(1)?;
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -627,6 +802,31 @@ mod tests {
         }
         assert!(s.remove_token("i", "c").unwrap());
         assert!(!s.remove_token("i", "c").unwrap());
+
+        // URL records, keyed by the URL without a trailing slash.
+        s.record_url("http://a/", "i", "c").unwrap();
+        s.record_url("http://b", "i", "c").unwrap();
+        s.record_url("http://c", "i", "other").unwrap();
+        assert!(s.is_recorded("http://a", "i", "c").unwrap());
+        assert!(!s.is_recorded("http://c", "i", "c").unwrap());
+        assert!(!s.is_recorded("http://d", "i", "c").unwrap());
+        assert_eq!(s.urls("i", "c").unwrap(), ["http://a", "http://b"]);
+
+        // A corrupt file counts as missing.
+        std::fs::write(s.token_path("i", "c"), "{").unwrap();
+        assert!(s.token("i", "c").unwrap().is_none());
+        std::fs::write(s.url_path("http://a"), "").unwrap();
+        assert!(!s.is_recorded("http://a", "i", "c").unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for dir in [s.dir.clone(), s.urls_dir()] {
+                assert_eq!(
+                    std::fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+            }
+        }
     }
 
     #[test]

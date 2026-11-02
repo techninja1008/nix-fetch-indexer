@@ -17,7 +17,6 @@ path = "src/main.rs"
 [dependencies]
 nfi-api.workspace = true
 nfi-drv.workspace = true
-nfi-auth.workspace = true
 nfi-auth-client.workspace = true
 anyhow.workspace = true
 serde.workspace = true

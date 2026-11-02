@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use futures::stream::{BoxStream, StreamExt};
-use nfi::http::check;
+use nfi_auth_client::http::check;
 use std::time::Duration;
 use yoink_api::{Event, MIRROR_PATH, MirrorRequest};
 

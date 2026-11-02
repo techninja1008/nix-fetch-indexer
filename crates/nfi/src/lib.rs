@@ -1,11 +1,11 @@
 //! Support code for the `nfi` query CLI, and its API client.
 
 pub mod client;
-pub mod http;
 
 use anyhow::{Context, Result, bail};
 use nfi_api::drv::ReducedGraph;
 use nfi_api::{BulkItem, EvalInfo, ReleaseInfo};
+use nfi_auth_client::{Credentials, Identity};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use std::io::Write;
@@ -61,23 +61,17 @@ pub fn print_json<T: serde::Serialize>(v: &T) -> Result<()> {
 
 /// `whoami` for the service at `url`, without logging in: prints who it
 /// sees (`json`: the whole response). False if not authenticated.
-pub async fn whoami(creds: &nfi_auth_client::Credentials, url: &str, json: bool) -> Result<bool> {
-    let r = client::Client::new(url, creds.current().await?)?
-        .get_json::<nfi_auth::Whoami>(nfi_auth::WHOAMI_PATH)
-        .await;
-    let w = match r {
-        Ok(w) => w,
-        Err(e) => match e.downcast_ref::<http::HttpError>().map(|h| h.status) {
-            Some(401) => {
-                println!("{url}: not authenticated");
-                return Ok(false);
-            }
-            Some(404) => {
-                println!("{url}: does not use login");
-                return Ok(true);
-            }
-            _ => return Err(e),
-        },
+pub async fn whoami(creds: &Credentials, url: &str, json: bool) -> Result<bool> {
+    let w = match creds.whoami().await? {
+        Identity::User(w) => w,
+        Identity::NotAuthenticated => {
+            println!("{url}: not authenticated");
+            return Ok(false);
+        }
+        Identity::NoLogin => {
+            println!("{url}: does not use login");
+            return Ok(true);
+        }
     };
     if json {
         return print_json(&w).map(|()| true);
@@ -89,6 +83,21 @@ pub async fn whoami(creds: &nfi_auth_client::Credentials, url: &str, json: bool)
         }
     }
     Ok(true)
+}
+
+/// `logout` for the service at `url`, printing what was logged out (with
+/// the provider login, every other URL logged in with it). Returns those
+/// other URLs.
+pub async fn logout(creds: &Credentials, url: &str) -> Result<Vec<String>> {
+    let Some(others) = creds.logout().await? else {
+        eprintln!("not logged in to {url}");
+        return Ok(vec![]);
+    };
+    eprintln!("logged out of {url}");
+    if !others.is_empty() {
+        eprintln!("also logged out of {} (same login)", others.join(", "));
+    }
+    Ok(others)
 }
 
 /// Build the fetch hook command line: `{}` in any argument is replaced by

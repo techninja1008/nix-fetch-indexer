@@ -1,11 +1,11 @@
 use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
 use nfi::client::Client;
-use nfi::http::retry;
 use nfi::*;
 use nfi_api::drv::ReducedGraph;
 use nfi_api::{BulkRequest, ItemStatus, SearchQuery};
 use nfi_auth_client::Credentials;
+use nfi_auth_client::http::retry;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -49,8 +49,8 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
-    /// Forget the cached login for the service (and every service sharing
-    /// its OpenID provider and client).
+    /// Forget the cached login for the service (and so for every other URL
+    /// logged in with the same OpenID provider and client).
     Logout,
     /// Show who the service sees you as, without logging in (exit 1 when
     /// not authenticated).
@@ -186,11 +186,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
         Cmd::Logout => {
-            if creds.logout().await? {
-                eprintln!("logged out of {url}");
-            } else {
-                eprintln!("not logged in to {url}");
-            }
+            nfi::logout(&creds, &url).await?;
             return Ok(ExitCode::SUCCESS);
         }
         Cmd::Whoami => {
@@ -259,7 +255,7 @@ async fn exec(cmd: Cmd, json: bool, cfg: &Config, client: &Client, creds: &Crede
                 limit: Some(limit),
                 offset: Some(offset),
             };
-            let r = retry(creds, true, |t| async { client.with_token(t).search(&q).await }).await?;
+            let r = retry(creds, |t| async { client.with_token(t).search(&q).await }).await?;
             if json {
                 print_json(&r)?;
             } else {
@@ -284,7 +280,7 @@ async fn exec(cmd: Cmd, json: bool, cfg: &Config, client: &Client, creds: &Crede
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Releases { channel, errors } => {
-            let rels = retry(creds, true, |t| async {
+            let rels = retry(creds, |t| async {
                 client.with_token(t).releases(channel.as_deref(), errors).await
             })
             .await?;
@@ -297,7 +293,7 @@ async fn exec(cmd: Cmd, json: bool, cfg: &Config, client: &Client, creds: &Crede
         }
         Cmd::Show { attr, commit, system } => {
             let system = system.or(cfg.system.clone());
-            let p = retry(creds, true, |t| async {
+            let p = retry(creds, |t| async {
                 client
                     .with_token(t)
                     .package(&attr, &commit, system.as_deref())
@@ -361,7 +357,7 @@ async fn exec(cmd: Cmd, json: bool, cfg: &Config, client: &Client, creds: &Crede
             }
             let req = BulkRequest { items: all };
             let hook = hook_cmd(&hook, cfg);
-            let r = retry(creds, true, |t| async { client.with_token(t).bulk(&req).await }).await?;
+            let r = retry(creds, |t| async { client.with_token(t).bulk(&req).await }).await?;
             let failed: Vec<_> = r.items.iter().filter(|i| i.status != ItemStatus::Ok).collect();
             for i in &failed {
                 eprintln!("warning: {}@{} ({}): {:?}", i.attr, i.commit, i.system, i.status);
@@ -408,7 +404,7 @@ async fn exec(cmd: Cmd, json: bool, cfg: &Config, client: &Client, creds: &Crede
                 nfi_drv::merge(&mut graph, read_graph(f)?);
             }
             let hook = hook_cmd(&hook, cfg);
-            let r = retry(creds, true, |t| async {
+            let r = retry(creds, |t| async {
                 client.with_token(t).minimise(&graph, close_miss_threshold).await
             })
             .await?;

@@ -24,6 +24,6 @@ axum.workspace = true
 [dev-dependencies]
 nfi-auth.workspace = true
 yoink = { path = "../yoink" }
-nfi = { path = "../nfi" }
+nfi-auth-client.workspace = true
 nfi-test-support.workspace = true
 reqwest.workspace = true

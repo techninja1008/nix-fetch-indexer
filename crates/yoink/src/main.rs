@@ -74,8 +74,8 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
-    /// Forget the cached logins for the yoink and NFI services (and every
-    /// service sharing their OpenID providers and clients).
+    /// Forget the cached logins for the yoink and NFI services (and so for
+    /// every other URL logged in with the same OpenID providers and clients).
     Logout,
     /// Show who the services see you as, without logging in (exit 1 when
     /// not authenticated).
@@ -118,14 +118,21 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Some(Cmd::Logout) => {
+            let (mut done, mut ok) = (Vec::new(), true);
             for u in [url.clone(), nfi_url.clone()].into_iter().flatten() {
-                if Credentials::new("yoink", &u, None, "").logout().await? {
-                    eprintln!("logged out of {u}");
-                } else {
-                    eprintln!("not logged in to {u}");
+                // Already logged out with the first URL's provider login.
+                if done.iter().any(|d: &String| d == u.trim_end_matches('/')) {
+                    continue;
+                }
+                match nfi::logout(&Credentials::new("yoink", &u, None, ""), &u).await {
+                    Ok(others) => done.extend(others),
+                    Err(e) => {
+                        ok = false;
+                        eprintln!("error: logging out of {u}: {e:#}");
+                    }
                 }
             }
-            Ok(ExitCode::SUCCESS)
+            Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE })
         }
         Some(Cmd::Whoami) => {
             let mut targets = vec![(need_url()?, token, YOINK_HINT)];

@@ -1,5 +1,5 @@
 use futures::StreamExt;
-use nfi::http::HttpError;
+use nfi_auth_client::http::HttpError;
 use nfi_auth_server::{Expr, OidcSettings};
 use nfi_test_support::MockIdp;
 use serde_json::json;

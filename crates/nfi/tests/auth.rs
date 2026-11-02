@@ -4,7 +4,7 @@
 use nfi_auth_client::{StoredToken, TokenStore};
 use nfi_auth_server::{Authenticator, Expr, OidcSettings};
 use nfi_service::auth::{AdminAuth, ServiceAuth};
-use nfi_test_support::MockIdp;
+use nfi_test_support::{Impostor, MockIdp};
 use serde_json::json;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -108,7 +108,8 @@ async fn tokens() {
         (1, format!("{url}: not authenticated").as_str())
     );
 
-    // A cached login (as `nfi login` leaves it) is used automatically.
+    // A cached login (as `nfi login` leaves it) is used automatically, but
+    // only for the URLs it was made for.
     let store = TokenStore::at(d.path().join("tokens"));
     store
         .save_token(&StoredToken {
@@ -119,12 +120,23 @@ async fn tokens() {
         })
         .unwrap();
     let o = nfi(&[], &["whoami"]);
+    assert_eq!(o.code, 1, "{}", o.stdout);
+    for u in [url, "http://127.0.0.1:9"] {
+        store.record_url(u, idp.issuer(), idp.client_id()).unwrap();
+    }
+    let o = nfi(&[], &["whoami"]);
     assert!(o.stdout.starts_with(&format!("{url}: bob\n")), "{}", o.stderr);
 
-    // Logging out forgets the login.
+    // Logging out forgets the login, also for the other URL using it.
     let o = nfi(&[], &["logout"]);
     assert_eq!(o.code, 0, "{}", o.stderr);
-    assert!(o.stderr.contains("logged out"), "{}", o.stderr);
+    assert!(
+        o.stderr.contains(&format!("logged out of {url}"))
+            && o.stderr
+                .contains("also logged out of http://127.0.0.1:9 (same login)"),
+        "{}",
+        o.stderr
+    );
     let o = nfi(&[], &["whoami"]);
     assert_eq!(o.code, 1);
     let o = nfi(&[], &["logout"]);
@@ -282,4 +294,62 @@ async fn interactive_login() {
     assert!(o.text.contains("the token was rejected"), "{}", o.text);
     assert!(!o.text.contains("To log in"), "{}", o.text);
     assert_eq!(idp.device_logins(), 4);
+}
+
+/// A service claiming the provider and client of a cached login, at a URL
+/// never logged in to, gets no token from any command, with or without a
+/// terminal.
+#[tokio::test(flavor = "multi_thread")]
+async fn cached_login_not_sent_to_other_urls() {
+    let idp = MockIdp::start("nfi").await;
+    let evil = Impostor::start(&idp).await;
+    let d = tempfile::tempdir().unwrap();
+    let cached = idp.token(json!({"sub": "cached", "preferred_username": "alice"}));
+    let store = TokenStore::at(d.path().join("tokens"));
+    store
+        .save_token(&StoredToken {
+            issuer: idp.issuer().into(),
+            client_id: idp.client_id().into(),
+            id_token: cached.clone(),
+            refresh_token: None,
+        })
+        .unwrap();
+    store
+        .record_url("http://nfi.example", idp.issuer(), idp.client_id())
+        .unwrap();
+    let url = evil.url();
+
+    let o = run(
+        env!("CARGO_BIN_EXE_nfi"),
+        d.path(),
+        &[],
+        &["--url", url, "releases"],
+    );
+    assert_eq!(o.code, 1);
+    assert!(o.stderr.contains("run `nfi login`"), "{}", o.stderr);
+    let o = run(
+        env!("CARGO_BIN_EXE_nfi"),
+        d.path(),
+        &[],
+        &["--url", url, "whoami"],
+    );
+    assert_eq!(
+        (o.code, o.stdout.trim()),
+        (1, format!("{url}: not authenticated").as_str())
+    );
+    assert!(evil.bearers().is_empty());
+
+    // On a terminal, `whoami` still sends nothing, and a command asks for a
+    // new login rather than using the cached one.
+    let o = nfi_tty(d.path(), &["--url", url, "whoami"]).await;
+    assert_eq!(o.code, Some(1), "{}", o.text);
+    assert!(!o.text.contains("To log in"), "{}", o.text);
+    assert!(evil.bearers().is_empty());
+    let o = nfi_tty(d.path(), &["--url", url, "releases"]).await;
+    assert_eq!(o.code, Some(0), "{}", o.text);
+    assert!(o.text.contains("To log in, open"), "{}", o.text);
+    assert_eq!(idp.device_logins(), 1);
+    let sent = evil.bearers();
+    assert_eq!(sent.len(), 1);
+    assert_ne!(sent[0], cached);
 }

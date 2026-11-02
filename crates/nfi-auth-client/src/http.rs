@@ -1,9 +1,9 @@
 //! HTTP errors shared by the nfi and yoink API clients, and retrying a
 //! request after logging in again.
 
+use crate::Credentials;
 use anyhow::Result;
-use nfi_api::ErrorBody;
-use nfi_auth_client::Credentials;
+use nfi_auth::ErrorBody;
 
 /// A non-success HTTP response from the service.
 #[derive(Debug)]
@@ -48,19 +48,18 @@ pub async fn check(resp: reqwest::Response) -> Result<reqwest::Response> {
 }
 
 /// Run one request with the current token; on a 401, unless the token was
-/// explicit, log in again if `prompt` (and stderr is a terminal) and run it
-/// once more. Wrap single requests only: a 401 means nothing was done.
-pub async fn retry<T, F, Fut>(creds: &Credentials, prompt: bool, f: F) -> Result<T>
+/// explicit, log in again (if stderr is a terminal) and run it once more.
+/// Wrap single requests only: a 401 means nothing was done.
+pub async fn retry<T, F, Fut>(creds: &Credentials, f: F) -> Result<T>
 where
     F: Fn(Option<String>) -> Fut,
     Fut: Future<Output = Result<T>>,
 {
-    let e = match f(creds.token(prompt).await?).await {
+    let e = match f(creds.token(true).await?).await {
         Err(e) if is_unauthorized(&e) => e,
         r => return r,
     };
-    let token = if prompt { creds.relogin().await? } else { None };
-    match token {
+    match creds.relogin().await? {
         Some(t) => f(Some(t)).await,
         None => Err(e.context(creds.hint())),
     }

@@ -75,6 +75,9 @@ async fn refreshed_login_validates() {
             refresh_token: Some("rt-1".into()),
         })
         .unwrap();
+    store
+        .record_url(idp.issuer(), idp.issuer(), idp.client_id())
+        .unwrap();
     let creds = Credentials::new("t", idp.issuer(), None, "").with_store(store);
     let t = creds.current().await.unwrap().unwrap();
     assert_eq!(idp.refreshes(), 1);
