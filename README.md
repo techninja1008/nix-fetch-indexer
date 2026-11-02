@@ -31,20 +31,29 @@ Supporting libraries:
 ## Building
 
 ```sh
-nix build            # all binaries (runs the full test suite, including integration tests)
+nix build            # all binaries
+nix flake check      # also runs the full test suite, including integration tests
 nix build .#nfi      # a single binary
 nix build .#nfi-service-image && docker load < result   # OCI image (also .#nfi-indexer-image, .#yoink-service-image)
-nix develop          # cargo, clippy, postgresql, meilisearch, nix-eval-jobs
+nix develop          # cargo, clippy, postgresql, meilisearch, nix-eval-jobs; installs the git hooks
 cargo build --release
 ```
 
-The packages live in [`nix/`](nix) and are loaded with `callPackage`. Each image takes its binary as an argument, so another build can be swapped in with `.override`:
+The packages live in [`nix/`](nix) and are loaded with `callPackage`. The workspace is built with [crate2nix](https://github.com/nix-community/crate2nix): every crate, third-party or from the workspace, is its own derivation, so a change only rebuilds the crates it touches and the crates that depend on them. Each workspace crate's tests are a separate check (e.g. `.#checks.x86_64-linux.test-nfi-service`) that runs them with [cargo-nextest](https://nexte.st), so binaries and images don't wait for them. The crate graph, [`nix/Cargo.nix`](nix/Cargo.nix), is generated from `Cargo.lock`. Regenerate it after changing dependencies or workspace members:
+
+```sh
+nix run .#generate-cargo-nix
+```
+
+`nix develop` installs git hooks ([git-hooks.nix](https://github.com/cachix/git-hooks.nix)) that do this whenever a `Cargo.toml` or `Cargo.lock` changes, and check Nix (nixfmt) and Rust (rustfmt) formatting. CI runs the same hooks on every file, so a stale `nix/Cargo.nix` or unformatted code fails the build.
+
+Each image takes its binary as an argument, so another build can be swapped in with `.override`:
 
 ```nix
 nfi.packages.x86_64-linux.nfi-service-image.override { nfi-service = my-nfi-service; }
 ```
 
-Any package whose `meta.mainProgram` is set works. Each binary is its own output of the workspace package (`out` links to all of them), so an image only contains its own binary.
+Any package whose `meta.mainProgram` is set works. Each binary is its own package (the default package links to all of them), so an image only contains its own binary.
 
 ## Indexing
 
