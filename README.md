@@ -31,14 +31,15 @@ Supporting libraries:
 ## Building
 
 ```sh
-nix build            # all binaries (runs the full test suite, including integration tests)
+nix build            # all binaries
+nix flake check      # also runs the full test suite, including integration tests
 nix build .#nfi      # a single binary
 nix build .#nfi-service-image && docker load < result   # OCI image (also .#nfi-indexer-image, .#yoink-service-image)
 nix develop          # cargo, clippy, postgresql, meilisearch, nix-eval-jobs
 cargo build --release
 ```
 
-The packages live in [`nix/`](nix) and are loaded with `callPackage`. Each image takes its binary as an argument, so another build can be swapped in with `.override`:
+The packages live in [`nix/`](nix) and are loaded with `callPackage`. The workspace is built with [crane](https://github.com/ipetkov/crane): third-party dependencies are compiled in a separate derivation (`.#default.cargoArtifacts`) that is only rebuilt when `Cargo.toml` or `Cargo.lock` change, and the tests (`.#default.tests`) are a separate derivation, so a code change only recompiles the workspace's own crates before the binaries and images are ready. Each image takes its binary as an argument, so another build can be swapped in with `.override`:
 
 ```nix
 nfi.packages.x86_64-linux.nfi-service-image.override { nfi-service = my-nfi-service; }

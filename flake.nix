@@ -3,9 +3,14 @@
 
   # Channel tarball (as used by the default `nixpkgs` registry entry).
   inputs.nixpkgs.url = "https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz";
+  inputs.crane.url = "github:ipetkov/crane";
 
   outputs =
-    { self, nixpkgs }:
+    {
+      self,
+      nixpkgs,
+      crane,
+    }:
     let
       systems = [
         "x86_64-linux"
@@ -20,7 +25,7 @@
       packages = forAll (
         pkgs:
         let
-          workspace = pkgs.callPackage ./nix/package.nix { };
+          workspace = pkgs.callPackage ./nix/package.nix { craneLib = crane.mkLib pkgs; };
           bins = {
             inherit (workspace) nfi yoink;
             nfi-admin = workspace.nfi_admin;
@@ -51,10 +56,17 @@
         }
       );
 
-      checks = forAll (pkgs: {
-        # Builds everything and runs the full test suite (unit + integration).
-        build = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
-      });
+      checks = forAll (
+        pkgs:
+        let
+          workspace = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+        in
+        {
+          build = workspace;
+          # The full test suite (unit + integration).
+          tests = workspace.tests;
+        }
+      );
 
       devShells = forAll (pkgs: {
         default = pkgs.mkShell {
