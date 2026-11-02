@@ -343,7 +343,7 @@ Both listeners are open by default. Optionally, callers log in with OIDC (the de
 | method | path | description |
 |---|---|---|
 | GET | `/v1/search?q=&attr=&pname=&version=&program=&system=&release=&channel=&series=&commit=&limit=&offset=` | Search over packages and programs |
-| GET | `/v1/packages/{attr}?commit=&system=` | Metadata, output paths (with a `cached` flag) and programs for an attribute at a commit; the commit must be a full 40-character hex hash (any case), anything else is a 400, and a hash of no indexed release is a 404 |
+| GET | `/v1/packages/{attr}?commit=&system=` | Metadata, output paths (with a `cached` flag) and programs for an attribute at a commit; the commit is a hex prefix of at least 8 digits (any case, the full hash included) that must match exactly one release: a malformed commit or a prefix matching several releases (the error names the prefix and the count) is a 400, and one matching none is a 404 |
 | POST | `/v1/lookup/bulk` | Body `{"items":[{"attr","commit","system"?,"outputs"?}]}`; returns per-item status and outputs, plus the deduplicated closure |
 | POST | `/v1/minimise?close_miss_threshold=` | Body: raw `nix derivation show --recursive` JSON (legacy or v4 format) or a reduced graph `{"derivations":{drv:{outputs,inputDrvs,inputSrcs,fixed}}}` |
 | GET | `/v1/releases?channel=&errors=` | What is in the index: releases (name, commit, channel, series) with their datasets and evaluations: eval type, closure type names, and `error_count` (`null` when errors are not indexed). With `errors=true`, each evaluation with indexed errors also lists them as `errors` (`<attr>@<system>`; `nfi releases --errors`). The same as `/admin/v1/releases` |
@@ -351,7 +351,7 @@ Both listeners are open by default. Optionally, callers log in with OIDC (the de
 **Bulk lookup details**
 
 - Output selection: the default is `out`, or all outputs when there is no `out`. `["*"]` selects all outputs.
-- Item statuses: `ok`, `unknown_commit`, `unknown_attr`, `no_outpaths`, `not_cached`. Every item's commit must be a full 40-character hex hash; a request with any other commit is rejected with a 400 naming the offending items.
+- Item statuses: `ok`, `unknown_commit`, `unknown_attr`, `no_outpaths`, `not_cached`. Every item's commit must be a full 40-character hex hash (`attr@commit` is lockfile-style, so it must be unambiguous); a request with any other commit, prefixes included, is rejected with a 400 naming the offending items.
 
 **Minimise algorithm**
 
@@ -412,8 +412,9 @@ export NFI_URL=https://nfi.example
 nfi releases --channel nixos-25.05
 nfi search ripgrep --series 25.05
 nfi search --program rg
-C=<full 40-character commit hash>   # from `nfi releases`; prefixes are rejected
-nfi show ripgrep --commit $C
+nfi show ripgrep --commit ac62194c3917   # a unique prefix (8+ hex digits) will do
+# attr@commit is for lockfile-style use and must be unambiguous: full hashes only
+C=<full 40-character commit hash>        # from `nfi releases`
 nfi bulk ripgrep@$C jq@$C --outputs out,man
 nfi minimise .#mypackage --fetch-hook 'sh -c "xargs nix-store --realise < {}"'
 nix derivation show --recursive .#foo | nfi minimise -f -

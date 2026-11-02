@@ -147,18 +147,25 @@ async fn ingest_lookup_bulk_minimise_prune() {
     // Not at release B.
     let (s, _): (u16, Value) = c.get(&format!("/v1/packages/curl?commit={B}")).await;
     assert_eq!(s, 404);
-    // A full hash of no release is an unknown commit.
-    let unknown = "c".repeat(40);
-    let (s, e): (u16, ErrorBody) = c.get(&format!("/v1/packages/curl?commit={unknown}")).await;
-    assert_eq!(s, 404);
-    assert_eq!(e.error, format!("unknown commit {unknown}"));
-    // Anything but a full hash is a request error, even an unambiguous prefix.
-    for bad in ["aaaaaaa", "", &format!("{A}a"), &format!("{}g", &A[..39])] {
+    // So does a unique prefix of at least 8 hex digits, in any case.
+    for prefix in ["aaaaaaaa", "AAAAaaaaAAAA"] {
+        let (s, p): (u16, PackageInfo) = c.get(&format!("/v1/packages/curl?commit={prefix}")).await;
+        assert_eq!(s, 200, "{prefix}");
+        assert_eq!(p.release.commit, A);
+    }
+    // A prefix (or full hash) of no release is an unknown commit.
+    for unknown in ["cccccccc".to_string(), "c".repeat(40), format!("{A}a")] {
+        let (s, e): (u16, ErrorBody) = c.get(&format!("/v1/packages/curl?commit={unknown}")).await;
+        assert_eq!(s, 404);
+        assert_eq!(e.error, format!("unknown commit {unknown}"));
+    }
+    // Fewer than 8 digits, or a non-hex digit, is a request error.
+    for bad in ["aaaaaaa", "", "aaaaaaag"] {
         let (s, e): (u16, ErrorBody) = c.get(&format!("/v1/packages/curl?commit={bad}")).await;
         assert_eq!(s, 400, "{bad:?}");
         assert_eq!(
             e.error,
-            format!("invalid commit {bad:?}: expected a full 40-character hex commit hash")
+            format!("invalid commit {bad:?}: expected a hex commit prefix of at least 8 characters")
         );
     }
 
@@ -387,6 +394,38 @@ async fn ingest_lookup_bulk_minimise_prune() {
         .await
         .unwrap();
     assert_eq!(n, 0);
+}
+
+/// A package lookup's commit prefix must select exactly one release.
+#[tokio::test]
+async fn package_lookup_rejects_ambiguous_commit_prefix() {
+    let Some(c) = setup(None).await else { return };
+    sqlx::raw_sql(&format!(
+        "INSERT INTO releases (name, commit, channel, series) VALUES
+           ('r1', 'abcdef01{a}', 'nixos-25.05', '25.05'),
+           ('r2', 'abcdef01{b}', 'nixos-25.05', '25.05'),
+           ('r3', 'abcdef02{a}', 'nixos-25.05', '25.05')",
+        a = &A[8..],
+        b = &B[8..]
+    ))
+    .execute(&c.svc.state.pool)
+    .await
+    .unwrap();
+    let (s, e): (u16, ErrorBody) = c.get("/v1/packages/curl?commit=ABCDEF01").await;
+    assert_eq!(s, 400);
+    assert_eq!(
+        e.error,
+        "commit prefix \"ABCDEF01\" is ambiguous: it matches 2 releases"
+    );
+    // A longer prefix disambiguates; the release has no curl.
+    let (s, e): (u16, ErrorBody) = c
+        .get(&format!("/v1/packages/curl?commit=abcdef01{}", &A[8..12]))
+        .await;
+    assert_eq!(s, 404);
+    assert!(e.error.contains("not found at"), "{}", e.error);
+    let (s, e): (u16, ErrorBody) = c.get("/v1/packages/curl?commit=abcdef02").await;
+    assert_eq!(s, 404);
+    assert_eq!(e.error, "curl (x86_64-linux) not found at abcdef02");
 }
 
 /// Commit prefixes must have at least 8 hex digits and match at most one

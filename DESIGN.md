@@ -59,7 +59,7 @@ OCI images for the service are built with Nix `dockerTools`. There is no Dockerf
   - `series`: e.g. `25.05` or `unstable`
   - `url`
   - `indexed_at`
-- **Commit lookups:** `attr@commit` lookups (package and bulk) take only full 40-character commit hashes (any case, normalised to lowercase) and match exactly; a malformed commit is a request error (400). Prune is the one place that takes commit prefixes (at least 8 hex digits, matching a single release).
+- **Commit lookups:** there are two kinds of commit input. Lockfile-style `attr@commit` (bulk items) must be entirely unambiguous, so it takes only full 40-character commit hashes (any case, normalised to lowercase) and matches exactly; anything else is a request error (400). Commits a user selects a release with (`GET /v1/packages/{attr}?commit=`, i.e. `nfi show --commit`, and prune's `commits`) share one prefix rule: at least 8 hex digits (any case), matching exactly one release. A malformed or ambiguous prefix is a 400 (the latter naming the prefix and its match count); one matching none is an unknown commit (404) for package lookups and selects nothing for prune.
 - **Store path keys:** store paths are keyed by their 32-char nix-base32 hash. The hash is unique across systems, so the closure graph is system-agnostic.
 - **System tags:** package, out-path and program entries are tagged with `system`.
 

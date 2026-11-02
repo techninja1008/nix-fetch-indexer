@@ -4,7 +4,7 @@ use anyhow::Result;
 use nfi_api::drv::ReducedGraph;
 use nfi_api::*;
 use nfi_interchange::StorePath;
-use sqlx::PgPool;
+use sqlx::{PgExecutor, PgPool};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 #[derive(Clone, Debug, sqlx::FromRow)]
@@ -37,16 +37,11 @@ pub struct Inconsistent(pub String);
 pub const COMMIT_HASH_LEN: usize = 40;
 
 /// `commit` normalised to lowercase if it is a full commit hash: exactly
-/// [`COMMIT_HASH_LEN`] hex digits, in either case. `attr@commit` lookups
-/// accept nothing else (no prefixes), so a commit selects at most one release.
+/// [`COMMIT_HASH_LEN`] hex digits, in either case. `attr@commit` is meant
+/// for lockfile-style use, so it accepts nothing else and matches exactly.
 pub fn full_commit(commit: &str) -> Option<String> {
     (commit.len() == COMMIT_HASH_LEN && commit.bytes().all(|b| b.is_ascii_hexdigit()))
         .then(|| commit.to_ascii_lowercase())
-}
-
-/// Why `commit` is rejected by [`full_commit`].
-pub fn malformed_commit_message(commit: &str) -> String {
-    format!("invalid commit {commit:?}: expected a full {COMMIT_HASH_LEN}-character hex commit hash")
 }
 
 /// Resolve a full, lowercase commit hash (see [`full_commit`]) to its release.
@@ -57,6 +52,44 @@ pub async fn resolve_commit(pool: &PgPool, commit: &str) -> Result<Option<Releas
             .fetch_optional(pool)
             .await?,
     )
+}
+
+/// Shortest commit prefix accepted where a user selects a release by commit
+/// (package lookups and prune).
+pub const MIN_COMMIT_PREFIX: usize = 8;
+
+/// `s` normalised to lowercase if it is a commit prefix: at least
+/// [`MIN_COMMIT_PREFIX`] hex digits, in either case.
+pub fn commit_prefix(s: &str) -> Option<String> {
+    (s.len() >= MIN_COMMIT_PREFIX && s.bytes().all(|b| b.is_ascii_hexdigit())).then(|| s.to_ascii_lowercase())
+}
+
+/// Why `s` is rejected by [`commit_prefix`].
+pub fn malformed_prefix_message(s: &str) -> String {
+    format!("invalid commit {s:?}: expected a hex commit prefix of at least {MIN_COMMIT_PREFIX} characters")
+}
+
+/// The releases a commit prefix selects.
+pub enum PrefixMatch {
+    None,
+    One(ReleaseRow),
+    /// More than one release, this many.
+    Many(usize),
+}
+
+/// Resolve a lowercase commit prefix (see [`commit_prefix`]) to its release.
+pub async fn resolve_commit_prefix(db: impl PgExecutor<'_>, prefix: &str) -> Result<PrefixMatch> {
+    // A valid prefix has no `LIKE` wildcards.
+    let mut rows: Vec<ReleaseRow> =
+        sqlx::query_as("SELECT id, name, commit, channel, series FROM releases WHERE commit LIKE $1 || '%'")
+            .bind(prefix)
+            .fetch_all(db)
+            .await?;
+    Ok(match rows.len() {
+        0 => PrefixMatch::None,
+        1 => PrefixMatch::One(rows.remove(0)),
+        n => PrefixMatch::Many(n),
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -308,8 +341,10 @@ fn with_cached(
 }
 
 pub enum LookupError {
-    /// Not a full commit hash; the message says why.
+    /// Not a commit prefix; the message says why.
     MalformedCommit(String),
+    /// The commit prefix matches this many releases.
+    AmbiguousCommit(usize),
     UnknownCommit,
     NotFound,
 }
@@ -320,13 +355,15 @@ pub async fn lookup(
     commit: &str,
     system: &str,
 ) -> Result<std::result::Result<PackageInfo, LookupError>> {
-    let Some(commit) = full_commit(commit) else {
-        return Ok(Err(LookupError::MalformedCommit(malformed_commit_message(
+    let Some(prefix) = commit_prefix(commit) else {
+        return Ok(Err(LookupError::MalformedCommit(malformed_prefix_message(
             commit,
         ))));
     };
-    let Some(release) = resolve_commit(pool, &commit).await? else {
-        return Ok(Err(LookupError::UnknownCommit));
+    let release = match resolve_commit_prefix(pool, &prefix).await? {
+        PrefixMatch::One(r) => r,
+        PrefixMatch::None => return Ok(Err(LookupError::UnknownCommit)),
+        PrefixMatch::Many(n) => return Ok(Err(LookupError::AmbiguousCommit(n))),
     };
     let pkg = package_row(pool, release.id, attr, system).await?;
     let (outs, drv_path) = outputs(pool, release.id, attr, system).await?;

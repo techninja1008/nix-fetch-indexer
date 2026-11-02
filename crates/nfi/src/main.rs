@@ -103,6 +103,8 @@ enum Cmd {
     /// Show a package's metadata and output paths at a nixpkgs commit.
     Show {
         attr: String,
+        /// Nixpkgs commit: a hex prefix of at least 8 digits that matches
+        /// exactly one indexed release, or the full hash.
         #[arg(long)]
         commit: String,
         #[arg(long)]
@@ -110,7 +112,8 @@ enum Cmd {
     },
     /// Resolve many attr@commit pairs to store paths and their closure.
     Bulk {
-        /// Items as attr@commit[@system].
+        /// Items as attr@commit[@system], with full 40-character commit
+        /// hashes (lockfile-style: prefixes are rejected).
         items: Vec<String>,
         /// Read items from a file (`-` for stdin): JSON or one item per line.
         #[arg(short = 'f', long)]

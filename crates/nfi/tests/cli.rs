@@ -99,14 +99,20 @@ async fn query_cli() {
     assert_eq!(o.code, 0, "{}", o.stderr);
     assert!(o.stdout.contains(&path(3, "curl-8.0")));
     assert!(o.stdout.contains("(not cached)"));
-    // Commits must be full hashes; a prefix is rejected by the service.
+    // A unique prefix of at least 8 hex digits selects the release.
     let o = run(&["show", "curl", "--commit", "aaaaaaaa"]);
-    assert_eq!(o.code, 1);
-    assert!(
-        o.stderr.contains("expected a full 40-character hex commit hash"),
-        "{}",
-        o.stderr
-    );
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(o.stdout.contains(&path(3, "curl-8.0")));
+    assert!(o.stdout.contains(A), "{}", o.stdout);
+    for (bad, msg) in [
+        ("aaaaaaa", "at least 8 characters"),
+        ("aaaaaaaz", "at least 8 characters"),
+        ("cccccccc", "unknown commit cccccccc"),
+    ] {
+        let o = run(&["show", "curl", "--commit", bad]);
+        assert_eq!(o.code, 1);
+        assert!(o.stderr.contains(msg), "{bad}: {}", o.stderr);
+    }
     let o = run(&["--json", "show", "hello", "--commit", A]);
     let v: serde_json::Value = serde_json::from_str(&o.stdout).unwrap();
     assert_eq!(v["outputs"]["out"]["cached"], true);

@@ -87,6 +87,13 @@ async fn package(
     match query::lookup(&s.pool, &attr, &p.commit, &system).await? {
         Ok(info) => Ok(Json(info)),
         Err(LookupError::MalformedCommit(e)) => Err(err(StatusCode::BAD_REQUEST, e)),
+        Err(LookupError::AmbiguousCommit(n)) => Err(err(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "commit prefix {:?} is ambiguous: it matches {n} releases",
+                p.commit
+            ),
+        )),
         Err(LookupError::UnknownCommit) => {
             Err(err(StatusCode::NOT_FOUND, format!("unknown commit {}", p.commit)))
         }
@@ -258,7 +265,7 @@ async fn prune(State(s): State<AppState>, Json(req): Json<PruneRequest>) -> Resu
         ));
     }
     // The job checks again, under the write lock.
-    if let Some(e) = crate::prune::commit_error(&s.pool, &req).await? {
+    if let Some(e) = crate::prune::commit_error(&mut *s.pool.acquire().await?, &req).await? {
         return Err(err(StatusCode::BAD_REQUEST, e));
     }
     let id = jobs::enqueue(&s.pool, "prune", serde_json::to_value(&req)?).await?;
