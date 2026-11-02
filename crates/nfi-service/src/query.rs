@@ -1,6 +1,5 @@
 //! Lookup, bulk lookup and minimise queries.
 
-use crate::prune::is_commit_prefix;
 use anyhow::Result;
 use nfi_api::drv::ReducedGraph;
 use nfi_api::*;
@@ -34,29 +33,30 @@ impl ReleaseRow {
 #[error("index inconsistency: {0}; run `nfi-admin check` for details")]
 pub struct Inconsistent(pub String);
 
-pub enum CommitLookup {
-    Found(ReleaseRow),
-    Unknown,
-    Ambiguous,
+/// Length of a full git commit hash (SHA-1, hex).
+pub const COMMIT_HASH_LEN: usize = 40;
+
+/// `commit` normalised to lowercase if it is a full commit hash: exactly
+/// [`COMMIT_HASH_LEN`] hex digits, in either case. `attr@commit` lookups
+/// accept nothing else (no prefixes), so a commit selects at most one release.
+pub fn full_commit(commit: &str) -> Option<String> {
+    (commit.len() == COMMIT_HASH_LEN && commit.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| commit.to_ascii_lowercase())
 }
 
-/// Resolve a full commit hash or unique prefix to its release.
-pub async fn resolve_commit(pool: &PgPool, commit: &str) -> Result<CommitLookup> {
-    let c = commit.trim().to_lowercase();
-    if !is_commit_prefix(&c) {
-        return Ok(CommitLookup::Unknown);
-    }
-    let rows: Vec<ReleaseRow> = sqlx::query_as(
-        "SELECT id, name, commit, channel, series FROM releases WHERE commit LIKE $1 || '%' ORDER BY id LIMIT 2",
+/// Why `commit` is rejected by [`full_commit`].
+pub fn malformed_commit_message(commit: &str) -> String {
+    format!("invalid commit {commit:?}: expected a full {COMMIT_HASH_LEN}-character hex commit hash")
+}
+
+/// Resolve a full, lowercase commit hash (see [`full_commit`]) to its release.
+pub async fn resolve_commit(pool: &PgPool, commit: &str) -> Result<Option<ReleaseRow>> {
+    Ok(
+        sqlx::query_as("SELECT id, name, commit, channel, series FROM releases WHERE commit = $1")
+            .bind(commit)
+            .fetch_optional(pool)
+            .await?,
     )
-    .bind(&c)
-    .fetch_all(pool)
-    .await?;
-    Ok(match rows.len() {
-        0 => CommitLookup::Unknown,
-        1 => CommitLookup::Found(rows.into_iter().next().expect("one row")),
-        _ => CommitLookup::Ambiguous,
-    })
 }
 
 #[derive(Clone, Debug)]
@@ -308,8 +308,9 @@ fn with_cached(
 }
 
 pub enum LookupError {
+    /// Not a full commit hash; the message says why.
+    MalformedCommit(String),
     UnknownCommit,
-    AmbiguousCommit,
     NotFound,
 }
 
@@ -319,10 +320,13 @@ pub async fn lookup(
     commit: &str,
     system: &str,
 ) -> Result<std::result::Result<PackageInfo, LookupError>> {
-    let release = match resolve_commit(pool, commit).await? {
-        CommitLookup::Found(r) => r,
-        CommitLookup::Unknown => return Ok(Err(LookupError::UnknownCommit)),
-        CommitLookup::Ambiguous => return Ok(Err(LookupError::AmbiguousCommit)),
+    let Some(commit) = full_commit(commit) else {
+        return Ok(Err(LookupError::MalformedCommit(malformed_commit_message(
+            commit,
+        ))));
+    };
+    let Some(release) = resolve_commit(pool, &commit).await? else {
+        return Ok(Err(LookupError::UnknownCommit));
     };
     let pkg = package_row(pool, release.id, attr, system).await?;
     let (outs, drv_path) = outputs(pool, release.id, attr, system).await?;
@@ -369,14 +373,38 @@ fn select_outputs(all: BTreeMap<String, String>, wanted: &Option<Vec<String>>) -
     }
 }
 
-pub async fn bulk(pool: &PgPool, req: &BulkRequest) -> Result<BulkResponse> {
-    let mut commits: HashMap<String, CommitLookup> = HashMap::new();
+/// Why the items of `req` can't be looked up, if they can't: every item
+/// whose commit is not a full commit hash (see [`full_commit`]).
+pub fn bulk_commit_error(req: &BulkRequest) -> Option<String> {
+    let bad: Vec<String> = req
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, it)| full_commit(&it.commit).is_none())
+        .map(|(i, it)| format!("item {i} ({}@{})", it.attr, it.commit))
+        .collect();
+    (!bad.is_empty()).then(|| {
+        format!(
+            "invalid commit in {}: expected full {COMMIT_HASH_LEN}-character hex commit hashes",
+            bad.join(", ")
+        )
+    })
+}
+
+/// Look up `req`'s items. Fails with a request error (the message of
+/// [`bulk_commit_error`]) before any lookup if a commit is malformed.
+pub async fn bulk(pool: &PgPool, req: &BulkRequest) -> Result<std::result::Result<BulkResponse, String>> {
+    if let Some(e) = bulk_commit_error(req) {
+        return Ok(Err(e));
+    }
+    let mut commits: HashMap<String, Option<ReleaseRow>> = HashMap::new();
     let mut items = Vec::with_capacity(req.items.len());
     let mut wanted_paths = BTreeSet::new();
     for it in &req.items {
         let system = it.system.clone().unwrap_or_else(|| DEFAULT_SYSTEM.to_string());
-        if !commits.contains_key(&it.commit) {
-            commits.insert(it.commit.clone(), resolve_commit(pool, &it.commit).await?);
+        let commit = full_commit(&it.commit).expect("validated above");
+        if !commits.contains_key(&commit) {
+            commits.insert(commit.clone(), resolve_commit(pool, &commit).await?);
         }
         let mut res = BulkItemResult {
             attr: it.attr.clone(),
@@ -386,18 +414,10 @@ pub async fn bulk(pool: &PgPool, req: &BulkRequest) -> Result<BulkResponse> {
             release: None,
             outputs: BTreeMap::new(),
         };
-        let release = match &commits[&it.commit] {
-            CommitLookup::Found(r) => r.clone(),
-            CommitLookup::Unknown => {
-                res.status = ItemStatus::UnknownCommit;
-                items.push(res);
-                continue;
-            }
-            CommitLookup::Ambiguous => {
-                res.status = ItemStatus::AmbiguousCommit;
-                items.push(res);
-                continue;
-            }
+        let Some(release) = commits[&commit].clone() else {
+            res.status = ItemStatus::UnknownCommit;
+            items.push(res);
+            continue;
         };
         res.release = Some(release.name.clone());
         res.commit = release.commit.clone();
@@ -439,10 +459,10 @@ pub async fn bulk(pool: &PgPool, req: &BulkRequest) -> Result<BulkResponse> {
     let ids: Vec<i64> = cached.values().copied().collect();
     let (nodes, _) = closure(pool, &ids).await?;
     let (nar_size, file_size) = sizes(&nodes);
-    Ok(BulkResponse {
+    Ok(Ok(BulkResponse {
         items,
         closure: nodes.into_iter().map(|n| n.path).collect(),
         nar_size,
         file_size,
-    })
+    }))
 }

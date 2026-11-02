@@ -4,10 +4,12 @@
 //! `$XDG_CACHE_HOME/nfi/tokens/` (mode 0600), next to a record of the
 //! service URLs each was logged in to and the [`AuthConfig`] each advertised
 //! then. A cached token is only sent to those URLs: every CLI talking to one
-//! of them shares the login. A service's settings are only fetched again by
-//! `login` and after it rejects a request (a 401). Tokens are never sent, and
-//! logins never made, over plain HTTP to hosts other than loopback unless
-//! that is explicitly allowed.
+//! of them shares the login. The settings of other URLs are cached too
+//! (`settings/`), which never makes them receive a token. A service's
+//! settings are fetched on first use and then again only by `login` and
+//! after it rejects a request (a 401). Tokens are never sent, and logins
+//! never made, over plain HTTP to hosts other than loopback unless that is
+//! explicitly allowed.
 
 pub mod http;
 
@@ -64,24 +66,27 @@ struct UrlLogin {
     url: String,
     issuer: String,
     client_id: String,
-    /// `None` in records written by older versions, which held only the
-    /// provider login.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    scopes: Option<Vec<String>>,
-    #[serde(default)]
+    scopes: Vec<String>,
     anonymous: bool,
 }
 
 impl UrlLogin {
-    /// The recorded [`AuthConfig`], unless the record predates it.
-    fn config(&self) -> Option<AuthConfig> {
-        Some(AuthConfig {
-            issuer: self.issuer.clone(),
-            client_id: self.client_id.clone(),
-            scopes: self.scopes.clone()?,
+    fn config(self) -> AuthConfig {
+        AuthConfig {
+            issuer: self.issuer,
+            client_id: self.client_id,
+            scopes: self.scopes,
             anonymous: self.anonymous,
-        })
+        }
     }
+}
+
+/// The settings a service URL advertised when last asked: `None` if it has
+/// no OIDC.
+#[derive(Debug, Serialize, Deserialize)]
+struct UrlSettings {
+    url: String,
+    config: Option<AuthConfig>,
 }
 
 /// Whether a corrupt cache file was reported already.
@@ -112,26 +117,14 @@ fn remove(path: &Path) -> Result<bool> {
     }
 }
 
-/// Create `dir` (and its parents) accessible by the owner only. An
-/// existing `dir` of ours (older versions made it 0755) is made so too.
+/// Create `dir` (and its parents) accessible by the owner only.
 fn create_dir(dir: &Path) -> Result<()> {
     let mut b = std::fs::DirBuilder::new();
     b.recursive(true);
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
     b.create(dir)
-        .with_context(|| format!("creating {}", dir.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let m = std::fs::metadata(dir).with_context(|| format!("reading {}", dir.display()))?;
-        // SAFETY: geteuid has no preconditions and cannot fail.
-        if m.uid() == unsafe { libc::geteuid() } && m.mode() & 0o777 != 0o700 {
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-                .with_context(|| format!("setting the mode of {}", dir.display()))?;
-        }
-    }
-    Ok(())
+        .with_context(|| format!("creating {}", dir.display()))
 }
 
 /// The on-disk token cache.
@@ -171,10 +164,17 @@ impl TokenStore {
             .join(format!("{}.json", digest(&[url.trim_end_matches('/')])))
     }
 
+    fn settings_path(&self, url: &str) -> PathBuf {
+        self.dir
+            .join("settings")
+            .join(format!("{}.json", digest(&[url.trim_end_matches('/')])))
+    }
+
     /// Create the store's directories (see [`create_dir`]).
     fn create_dirs(&self) -> Result<()> {
         create_dir(&self.dir)?;
-        create_dir(&self.urls_dir())
+        create_dir(&self.urls_dir())?;
+        create_dir(&self.dir.join("settings"))
     }
 
     /// Write atomically; the temporary file is created with mode 0600.
@@ -209,7 +209,7 @@ impl TokenStore {
             url: url.trim_end_matches('/').into(),
             issuer: cfg.issuer.clone(),
             client_id: cfg.client_id.clone(),
-            scopes: Some(cfg.scopes.clone()),
+            scopes: cfg.scopes.clone(),
             anonymous: cfg.anonymous,
         };
         self.write(&self.url_path(url), &r)
@@ -219,6 +219,23 @@ impl TokenStore {
     fn url_login(&self, url: &str) -> Result<Option<UrlLogin>> {
         let r: Option<UrlLogin> = read_json(&self.url_path(url))?;
         Ok(r.filter(|r| r.url == url.trim_end_matches('/')))
+    }
+
+    /// Cache the settings `url` advertises (`None`: no OIDC). This never
+    /// makes it receive a token: only [`TokenStore::record_url`] does.
+    fn save_settings(&self, url: &str, cfg: Option<&AuthConfig>) -> Result<()> {
+        let s = UrlSettings {
+            url: url.trim_end_matches('/').into(),
+            config: cfg.cloned(),
+        };
+        self.write(&self.settings_path(url), &s)
+    }
+
+    /// The cached settings of `url`: `None` if not cached (or unreadable),
+    /// `Some(None)` if it has no OIDC.
+    fn settings(&self, url: &str) -> Option<Option<AuthConfig>> {
+        let s: UrlSettings = read_json(&self.settings_path(url)).ok().flatten()?;
+        (s.url == url.trim_end_matches('/')).then_some(s.config)
     }
 
     /// The URLs logged in to with (`issuer`, `client_id`).
@@ -315,7 +332,8 @@ pub struct Credentials {
     /// For the provider: never follows redirects, which would replay a
     /// refresh token or device code to wherever they point.
     idp: reqwest::Client,
-    /// The service's settings, fetched by `login` or after a 401.
+    /// The service's settings, fetched on first use, by `login` or after a
+    /// 401.
     discovered: OnceCell<Option<AuthConfig>>,
     current: Mutex<Option<String>>,
     noted_expiry: AtomicBool,
@@ -353,8 +371,8 @@ impl Credentials {
         self
     }
 
-    /// The service's auth settings, fetched from it (once per process; only
-    /// to log in, and after a 401); `None` if it has no OIDC.
+    /// The service's auth settings, fetched from it (once per process) and
+    /// cached; `None` if it has no OIDC.
     pub async fn config(&self) -> Result<Option<&AuthConfig>> {
         let c = self
             .discovered
@@ -366,33 +384,40 @@ impl Credentials {
                     .send()
                     .await
                     .with_context(|| format!("connecting to {}", self.url))?;
-                match r.status() {
-                    s if s.is_success() => Ok(Some(r.json().await.with_context(|| format!("decoding {u}"))?)),
-                    reqwest::StatusCode::NOT_FOUND => Ok(None),
+                let c = match r.status() {
+                    s if s.is_success() => Some(r.json().await.with_context(|| format!("decoding {u}"))?),
+                    reqwest::StatusCode::NOT_FOUND => None,
                     s => bail!("fetching {u}: HTTP {s}"),
+                };
+                if let Some(store) = &self.store {
+                    store.save_settings(&self.url, c.as_ref())?;
                 }
+                Ok(c)
             })
             .await?;
         Ok(c.as_ref())
     }
 
-    /// The token for a command, without asking the service anything: the
-    /// explicit one, else the login of a URL logged in to (refreshed if
-    /// needed). Without a usable one, a service accepting anonymous requests
-    /// gets none; otherwise this logs in (if `prompt` and stderr is a
-    /// terminal) or fails with the hint. A URL never logged in to gets none:
-    /// a 401 then tells (see [`Credentials::relogin`]).
+    /// The token for a command: the explicit one, else the login of a URL
+    /// logged in to (refreshed if needed). Without a usable one, a service
+    /// without OIDC or accepting anonymous requests (as its settings say:
+    /// those recorded, else cached, else fetched now) gets none; otherwise
+    /// this logs in (if `prompt` and stderr is a terminal) or fails with the
+    /// hint.
     pub async fn token(&self, prompt: bool) -> Result<Option<String>> {
         if let Some(t) = self.explicit_token()? {
             return Ok(Some(t));
         }
-        let Some(cfg) = self.recorded().await? else {
-            return Ok(None);
-        };
-        let expired = match self.stored(&cfg).await? {
-            Login::Usable(t) => return Ok(Some(t)),
-            Login::Missing => false,
-            Login::Expired => true,
+        let (cfg, expired) = match self.recorded()? {
+            Some(cfg) => match self.stored(&cfg).await? {
+                Login::Usable(t) => return Ok(Some(t)),
+                Login::Missing => (cfg, false),
+                Login::Expired => (cfg, true),
+            },
+            None => match self.settings().await? {
+                Some(cfg) => (cfg, false),
+                None => return Ok(None),
+            },
         };
         if cfg.anonymous {
             if expired && !self.noted_expiry.swap(true, Ordering::Relaxed) {
@@ -403,7 +428,7 @@ impl Credentials {
             }
             return Ok(None);
         }
-        if prompt && interactive() {
+        if prompt && self.store.is_some() && interactive() {
             return self.device_rediscovered().await;
         }
         bail!("{}", self.hint())
@@ -415,7 +440,7 @@ impl Credentials {
         if let Some(t) = self.explicit_token()? {
             return Ok(Some(t));
         }
-        let Some(cfg) = self.recorded().await? else {
+        let Some(cfg) = self.recorded()? else {
             return Ok(None);
         };
         Ok(match self.stored(&cfg).await? {
@@ -519,18 +544,18 @@ impl Credentials {
     }
 
     /// What to do about a 401. Suggests logging in if the service uses OIDC
-    /// as far as known (from its settings fetched after the 401, else its
-    /// record).
+    /// as far as known (from its settings fetched in this process, else its
+    /// record, else its cached settings).
     pub fn hint(&self) -> String {
         if self.explicit.is_some() {
             return "the token was rejected".into();
         }
         let oidc = match self.discovered.get() {
             Some(c) => c.is_some(),
-            None => self
-                .store
-                .as_ref()
-                .is_some_and(|s| s.url_login(&self.url).ok().flatten().is_some()),
+            None => self.store.as_ref().is_some_and(|s| {
+                s.url_login(&self.url).ok().flatten().is_some()
+                    || matches!(s.settings(&self.url), Some(Some(_)))
+            }),
         };
         match (oidc, &self.store) {
             (true, Some(_)) => format!(
@@ -565,25 +590,20 @@ impl Credentials {
     }
 
     /// The settings recorded for this URL when it was logged in to, if it
-    /// was. A record from an older version, without them, is completed once
-    /// from the service if it still names the same provider login.
-    async fn recorded(&self) -> Result<Option<AuthConfig>> {
+    /// was.
+    fn recorded(&self) -> Result<Option<AuthConfig>> {
         let Some(store) = &self.store else {
             return Ok(None);
         };
-        let Some(r) = store.url_login(&self.url)? else {
-            return Ok(None);
-        };
-        if let Some(c) = r.config() {
-            return Ok(Some(c));
+        Ok(store.url_login(&self.url)?.map(UrlLogin::config))
+    }
+
+    /// The service's settings as cached, else fetched now (and cached).
+    async fn settings(&self) -> Result<Option<AuthConfig>> {
+        if let Some(c) = self.store.as_ref().and_then(|s| s.settings(&self.url)) {
+            return Ok(c);
         }
-        Ok(match self.config().await? {
-            Some(c) if (&c.issuer, &c.client_id) == (&r.issuer, &r.client_id) => {
-                store.record_url(&self.url, c)?;
-                Some(c.clone())
-            }
-            _ => None,
-        })
+        Ok(self.config().await?.cloned())
     }
 
     /// Fetch the service's settings and run the device flow; `None` if it
@@ -974,30 +994,42 @@ mod tests {
         s.record_url("http://a/", &cfg("c")).unwrap();
         s.record_url("http://b", &cfg("c")).unwrap();
         s.record_url("http://c", &cfg("other")).unwrap();
-        let recorded = |u: &str| s.url_login(u).unwrap().and_then(|r| r.config());
+        let recorded = |u: &str| s.url_login(u).unwrap().map(UrlLogin::config);
         assert_eq!(recorded("http://a"), Some(cfg("c")));
         assert_eq!(recorded("http://c"), Some(cfg("other")));
         assert_eq!(recorded("http://d"), None);
         assert_eq!(s.urls("i", "c").unwrap(), ["http://a", "http://b"]);
-        // A record from an older version names the provider login only.
+        // A record in another format counts as missing.
         std::fs::write(
             s.url_path("http://e"),
             r#"{"url": "http://e", "issuer": "i", "client_id": "c"}"#,
         )
         .unwrap();
-        let old = s.url_login("http://e").unwrap().unwrap();
-        assert_eq!((old.issuer.as_str(), old.config()), ("i", None));
-        assert_eq!(s.urls("i", "c").unwrap(), ["http://a", "http://b", "http://e"]);
+        assert!(s.url_login("http://e").unwrap().is_none());
+        assert_eq!(s.urls("i", "c").unwrap(), ["http://a", "http://b"]);
+
+        // Cached settings, also of no OIDC, apart from the URL records.
+        s.save_settings("http://f/", Some(&cfg("c"))).unwrap();
+        s.save_settings("http://g", None).unwrap();
+        assert_eq!(s.settings("http://f"), Some(Some(cfg("c"))));
+        assert_eq!(s.settings("http://g"), Some(None));
+        assert_eq!(s.settings("http://h"), None);
+        assert!(s.url_login("http://f").unwrap().is_none());
+        assert_eq!(s.urls("i", "c").unwrap(), ["http://a", "http://b"]);
 
         // A corrupt file counts as missing.
         std::fs::write(s.token_path("i", "c"), "{").unwrap();
         assert!(s.token("i", "c").unwrap().is_none());
         std::fs::write(s.url_path("http://a"), "").unwrap();
         assert!(s.url_login("http://a").unwrap().is_none());
+        std::fs::write(s.settings_path("http://f"), "{").unwrap();
+        assert_eq!(s.settings("http://f"), None);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            for dir in [s.dir.clone(), s.urls_dir()] {
+            let p = s.settings_path("http://g");
+            assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+            for dir in [s.dir.clone(), s.urls_dir(), p.parent().unwrap().into()] {
                 assert_eq!(
                     std::fs::metadata(dir).unwrap().permissions().mode() & 0o777,
                     0o700
@@ -1006,18 +1038,14 @@ mod tests {
         }
     }
 
-    /// Directories made by older versions (0755) are made 0700.
+    /// The store's directories are created accessible by the owner only.
     #[cfg(unix)]
     #[test]
-    fn store_dirs_are_tightened() {
+    fn store_dirs_are_private() {
         use std::os::unix::fs::PermissionsExt;
         let d = tempfile::tempdir().unwrap();
         let s = TokenStore::at(d.path().join("t"));
         let mode = |p: PathBuf| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        for dir in [s.dir.clone(), s.urls_dir()] {
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
         let cfg = AuthConfig {
             issuer: "i".into(),
             client_id: "c".into(),
@@ -1025,7 +1053,14 @@ mod tests {
             anonymous: false,
         };
         s.record_url("http://a", &cfg).unwrap();
-        assert_eq!((mode(s.dir.clone()), mode(s.urls_dir())), (0o700, 0o700));
+        assert_eq!(
+            (
+                mode(s.dir.clone()),
+                mode(s.urls_dir()),
+                mode(s.dir.join("settings"))
+            ),
+            (0o700, 0o700, 0o700)
+        );
     }
 
     #[test]

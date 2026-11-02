@@ -329,11 +329,16 @@ async fn token(State(i): State<MockIdp>, Form(f): Form<HashMap<String, String>>)
 
 /// A service claiming a provider's settings on [`nfi_auth::CONFIG_PATH`]
 /// that records every bearer token sent to it. With a token, whoami answers
-/// `mallory` and any other request `[]`; without one, they get 401.
+/// `mallory` and any other request `[]`; without one, they get 401. While
+/// [`Impostor::set_no_login`] is set, it is a service without OIDC instead:
+/// its settings are a 404 and requests without a token get `[]`.
 #[derive(Clone)]
 pub struct Impostor {
     url: String,
+    idp: MockIdp,
     bearers: Arc<Mutex<Vec<String>>>,
+    requests: Arc<AtomicUsize>,
+    no_login: Arc<AtomicBool>,
 }
 
 impl Impostor {
@@ -341,10 +346,13 @@ impl Impostor {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let i = Impostor {
             url: format!("http://{}", l.local_addr().unwrap()),
+            idp: idp.clone(),
             bearers: Default::default(),
+            requests: Default::default(),
+            no_login: Default::default(),
         };
         let app = Router::new()
-            .route(nfi_auth::CONFIG_PATH, get(config).with_state(idp.clone()))
+            .route(nfi_auth::CONFIG_PATH, get(impostor_config))
             .fallback(impostor)
             .with_state(i.clone());
         tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
@@ -359,9 +367,31 @@ impl Impostor {
     pub fn bearers(&self) -> Vec<String> {
         self.bearers.lock().unwrap().clone()
     }
+
+    /// Requests other than for [`nfi_auth::CONFIG_PATH`] so far.
+    pub fn requests(&self) -> usize {
+        self.requests.load(Ordering::SeqCst)
+    }
+
+    pub fn set_no_login(&self, no_login: bool) {
+        self.no_login.store(no_login, Ordering::SeqCst);
+    }
+}
+
+/// Counted by its provider's [`MockIdp::config_fetches`].
+async fn impostor_config(State(i): State<Impostor>) -> Response {
+    if i.no_login.load(Ordering::SeqCst) {
+        i.idp.inner.config_fetches.fetch_add(1, Ordering::SeqCst);
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    config(State(i.idp)).await
 }
 
 async fn impostor(State(i): State<Impostor>, uri: Uri, h: HeaderMap) -> Response {
+    i.requests.fetch_add(1, Ordering::SeqCst);
+    if i.no_login.load(Ordering::SeqCst) && !h.contains_key("authorization") {
+        return axum::Json(serde_json::json!([])).into_response();
+    }
     let Some(t) = h
         .get("authorization")
         .and_then(|v| v.to_str().ok())

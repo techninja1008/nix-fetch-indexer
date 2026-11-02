@@ -95,10 +95,18 @@ async fn query_cli() {
     assert_eq!(v[0]["channel"], "nixos-unstable");
 
     // show
-    let o = run(&["show", "curl", "--commit", "aaaaaaaa"]);
+    let o = run(&["show", "curl", "--commit", &A.to_uppercase()]);
     assert_eq!(o.code, 0, "{}", o.stderr);
     assert!(o.stdout.contains(&path(3, "curl-8.0")));
     assert!(o.stdout.contains("(not cached)"));
+    // Commits must be full hashes; a prefix is rejected by the service.
+    let o = run(&["show", "curl", "--commit", "aaaaaaaa"]);
+    assert_eq!(o.code, 1);
+    assert!(
+        o.stderr.contains("expected a full 40-character hex commit hash"),
+        "{}",
+        o.stderr
+    );
     let o = run(&["--json", "show", "hello", "--commit", A]);
     let v: serde_json::Value = serde_json::from_str(&o.stdout).unwrap();
     assert_eq!(v["outputs"]["out"]["cached"], true);
@@ -107,15 +115,18 @@ async fn query_cli() {
     assert!(o.stderr.contains("not found"));
 
     // bulk without hook prints the closure
-    let o = run(&["bulk", &format!("hello@{A}"), "missing@aaaa"]);
+    let o = run(&["bulk", &format!("hello@{A}"), &format!("missing@{A}")]);
     assert_eq!(o.code, 0, "{}", o.stderr);
     let lines: Vec<&str> = o.stdout.lines().collect();
     let mut expect = vec![path(1, "glibc-2.40"), path(2, "hello-2.12")];
     expect.sort();
     assert_eq!(lines, expect);
     assert!(o.stderr.contains("UnknownAttr"));
-    let o = run(&["bulk", "--strict", &format!("hello@{A}"), "missing@aaaa"]);
+    let o = run(&["bulk", "--strict", &format!("hello@{A}"), &format!("missing@{A}")]);
     assert_eq!(o.code, 2);
+    let o = run(&["bulk", &format!("hello@{A}"), "missing@aaaa"]);
+    assert_eq!(o.code, 1);
+    assert!(o.stderr.contains("item 1 (missing@aaaa)"), "{}", o.stderr);
 
     // bulk from a file with a fetch hook using {} substitution; hook output reaches the terminal.
     let items = d.join("items.txt");

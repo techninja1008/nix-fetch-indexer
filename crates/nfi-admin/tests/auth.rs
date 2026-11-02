@@ -71,9 +71,11 @@ async fn tokens() {
         a.extend_from_slice(args);
         run(env!("CARGO_BIN_EXE_nfi-admin"), d.path(), env, &a)
     };
+    // Without a terminal, the command stops before sending its request.
     let o = admin(&[], &["jobs"]);
     assert_eq!(o.code, 1);
     assert!(o.stderr.contains("run `nfi-admin login`"), "{}", o.stderr);
+    assert!(!o.stderr.contains("401"), "{}", o.stderr);
     let o = admin(&[], &["whoami"]);
     assert_eq!(o.code, 1);
     assert_eq!(o.stdout.trim(), format!("{}: not authenticated", svc.admin_url));
@@ -108,6 +110,7 @@ async fn tokens() {
     assert_eq!(o.code, 1);
     assert!(o.stderr.contains("run `nfi-admin login`"), "{}", o.stderr);
     assert!(evil.bearers().is_empty());
+    assert_eq!((idp.config_fetches(), evil.requests()), (1, 0));
     let root = idp.token(json!({"sub": "0", "preferred_username": "root"}));
     let o = admin(&[("NFI_ADMIN_TOKEN", &root)], &["jobs"]);
     assert_eq!(o.code, 0, "{}", o.stderr);

@@ -188,8 +188,9 @@ async fn authentication() {
     let (url, fake) = serve(|_, _| vec![]).await;
     let (code, err) = yoink(&url, None, std::slice::from_ref(&a)).await;
     assert_eq!(code, 1);
+    // Known before any request (none is sent: its 401 would show).
     assert!(
-        err.contains("authentication required: run `yoink login`"),
+        err.contains("authentication required: run `yoink login`") && !err.contains("401"),
         "{err}"
     );
     let (code, err) = yoink(&url, Some("wrong"), std::slice::from_ref(&a)).await;
@@ -216,4 +217,35 @@ async fn insecure_url_is_refused() {
             && err.contains("--allow-insecure or set NFI_ALLOW_INSECURE=1"),
         "{err}"
     );
+}
+
+/// A login the NFI service needs is known before nix evaluates anything:
+/// without a terminal the command fails then, having sent NFI no request
+/// but for its settings.
+#[tokio::test(flavor = "multi_thread")]
+async fn nfi_login_needed_before_evaluating() {
+    use std::os::unix::fs::PermissionsExt;
+    let idp = nfi_test_support::MockIdp::start("nfi").await;
+    let nfi = nfi_test_support::Impostor::start(&idp).await;
+    let (url, fake) = serve(|_, _| vec![]).await;
+    let d = tempfile::tempdir().unwrap();
+    let (nix, ran) = (d.path().join("nix"), d.path().join("ran"));
+    std::fs::write(&nix, format!("#!/bin/sh\ntouch '{}'\nexit 1\n", ran.display())).unwrap();
+    std::fs::set_permissions(&nix, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let args = [
+        "--nix".to_string(),
+        nix.display().to_string(),
+        "--nfi-url".into(),
+        nfi.url().into(),
+        "nixpkgs#hello".into(),
+    ];
+    let (code, err) = yoink(&url, Some("tok"), &args).await;
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("authentication required: run `yoink login` or set NFI_TOKEN"),
+        "{err}"
+    );
+    assert!(!ran.exists());
+    assert_eq!((idp.config_fetches(), nfi.requests()), (1, 0));
+    assert!(fake.requests.lock().unwrap().is_empty());
 }

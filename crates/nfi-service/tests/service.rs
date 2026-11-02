@@ -129,18 +129,38 @@ async fn ingest_lookup_bulk_minimise_prune() {
     let (_, none): (u16, Vec<ReleaseInfo>) = c.get("/v1/releases?channel=nope").await;
     assert!(none.is_empty());
 
-    // Direct lookup (with a commit prefix).
-    let (s, p): (u16, PackageInfo) = c.get("/v1/packages/curl?commit=aaaaaaa").await;
+    // Direct lookup.
+    let (s, p): (u16, PackageInfo) = c.get(&format!("/v1/packages/curl?commit={A}")).await;
     assert_eq!(s, 200);
     assert_eq!(p.version.as_deref(), Some("8.0"));
     assert_eq!(p.release.channel, "nixos-25.05");
+    assert_eq!(p.release.commit, A);
     assert!(p.outputs["out"].cached);
     assert!(!p.outputs["dev"].cached);
     assert_eq!(p.programs, vec!["curl"]);
-    let (s, _): (u16, Value) = c.get("/v1/packages/curl?commit=bbbb").await;
+    // A full hash in upper case resolves too.
+    let (s, p): (u16, PackageInfo) = c
+        .get(&format!("/v1/packages/curl?commit={}", A.to_uppercase()))
+        .await;
+    assert_eq!(s, 200);
+    assert_eq!(p.release.commit, A);
+    // Not at release B.
+    let (s, _): (u16, Value) = c.get(&format!("/v1/packages/curl?commit={B}")).await;
     assert_eq!(s, 404);
-    let (s, _): (u16, Value) = c.get("/v1/packages/curl?commit=cccc").await;
+    // A full hash of no release is an unknown commit.
+    let unknown = "c".repeat(40);
+    let (s, e): (u16, ErrorBody) = c.get(&format!("/v1/packages/curl?commit={unknown}")).await;
     assert_eq!(s, 404);
+    assert_eq!(e.error, format!("unknown commit {unknown}"));
+    // Anything but a full hash is a request error, even an unambiguous prefix.
+    for bad in ["aaaaaaa", "", &format!("{A}a"), &format!("{}g", &A[..39])] {
+        let (s, e): (u16, ErrorBody) = c.get(&format!("/v1/packages/curl?commit={bad}")).await;
+        assert_eq!(s, 400, "{bad:?}");
+        assert_eq!(
+            e.error,
+            format!("invalid commit {bad:?}: expected a full 40-character hex commit hash")
+        );
+    }
 
     // Bulk lookup.
     let (s, bulk): (u16, BulkResponse) = c
@@ -152,7 +172,8 @@ async fn ingest_lookup_bulk_minimise_prune() {
                 {"attr": "curl", "commit": A, "outputs": ["*"]},
                 {"attr": "missing", "commit": A},
                 {"attr": "nooutpaths", "commit": A},
-                {"attr": "hello", "commit": "dddd"},
+                {"attr": "hello", "commit": "d".repeat(40)},
+                {"attr": "hello", "commit": A.to_uppercase()},
             ]}),
         )
         .await;
@@ -166,8 +187,31 @@ async fn ingest_lookup_bulk_minimise_prune() {
             ItemStatus::NotCached,
             ItemStatus::UnknownAttr,
             ItemStatus::NoOutpaths,
-            ItemStatus::UnknownCommit
+            ItemStatus::UnknownCommit,
+            ItemStatus::Ok,
         ]
+    );
+    // Items echo the release's (lowercase) commit once resolved.
+    assert_eq!(bulk.items[6].commit, A);
+    assert_eq!(bulk.items[6].release, bulk.items[0].release);
+    // Any commit that is not a full hash fails the whole request, naming each
+    // offending item.
+    let (s, e): (u16, ErrorBody) = c
+        .post(
+            "/v1/lookup/bulk",
+            &json!({"items": [
+                {"attr": "hello", "commit": A},
+                {"attr": "hello", "commit": "aaaaaaaa"},
+                {"attr": "curl", "commit": "d".repeat(40)},
+                {"attr": "curl", "commit": "zz"},
+            ]}),
+        )
+        .await;
+    assert_eq!(s, 400);
+    assert_eq!(
+        e.error,
+        "invalid commit in item 1 (hello@aaaaaaaa), item 3 (curl@zz): \
+         expected full 40-character hex commit hashes"
     );
     let mut expect = vec![
         path(1, "glibc-2.40"),

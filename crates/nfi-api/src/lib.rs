@@ -172,7 +172,6 @@ pub struct BulkRequest {
 pub enum ItemStatus {
     Ok,
     UnknownCommit,
-    AmbiguousCommit,
     UnknownAttr,
     /// The attribute exists but no evaluated out paths are indexed for it.
     NoOutpaths,

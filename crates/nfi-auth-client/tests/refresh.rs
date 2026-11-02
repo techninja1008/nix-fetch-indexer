@@ -178,12 +178,19 @@ async fn cached_login_is_only_sent_to_urls_logged_in_to() {
     );
 
     // A URL never logged in to that claims the same provider and client
-    // gets nothing: no token, no whoami token.
-    let c = creds_for(evil.url(), &store);
-    assert_eq!(c.token(false).await.unwrap(), None);
-    assert_eq!(c.current().await.unwrap(), None);
-    assert!(matches!(c.whoami().await.unwrap(), Identity::NotAuthenticated));
+    // gets nothing: no token (but the hint), no whoami token, also once its
+    // settings are cached.
+    for _ in 0..2 {
+        let c = creds_for(evil.url(), &store);
+        let e = c.token(false).await.unwrap_err();
+        assert!(format!("{e:#}").contains("run `t login`"), "{e:#}");
+        assert_eq!(c.current().await.unwrap(), None);
+        assert!(matches!(c.whoami().await.unwrap(), Identity::NotAuthenticated));
+    }
+    assert_eq!(std::fs::read_dir(d.path().join("settings")).unwrap().count(), 1);
+    assert_eq!(idp.config_fetches(), 1);
     assert!(evil.bearers().is_empty());
+    let c = creds_for(evil.url(), &store);
 
     // Logging out of it removes nothing: it was not logged in.
     assert_eq!(c.logout().await.unwrap(), None);
@@ -217,11 +224,11 @@ async fn cached_login_is_only_sent_to_urls_logged_in_to() {
     assert_eq!(evil.bearers().len(), 1);
 }
 
-/// The service's settings are only fetched to log in and after a 401: a URL
-/// logged in to uses those recorded then, one never logged in to gets no
-/// token (until a 401 says it needs one).
+/// A URL's settings are fetched on its first use and cached: later uses
+/// (other processes) make no request for them, until `login` or a 401
+/// fetches them again. A URL logged in to uses those recorded then.
 #[tokio::test(flavor = "multi_thread")]
-async fn settings_are_fetched_only_to_log_in_and_after_a_401() {
+async fn settings_are_fetched_once_then_only_to_log_in_and_after_a_401() {
     let idp = MockIdp::start("cli").await;
     let evil = Impostor::start(&idp).await;
     let d = tempfile::tempdir().unwrap();
@@ -233,48 +240,63 @@ async fn settings_are_fetched_only_to_log_in_and_after_a_401() {
     assert!(c.token(false).await.unwrap().is_some());
     assert!(c.current().await.unwrap().is_some());
     assert!(c.hint().contains("run `t login`"), "{}", c.hint());
-    // Not recorded: no token, whoami without one, and a generic hint.
-    let c = creds_for(evil.url(), &store);
-    assert_eq!(c.token(true).await.unwrap(), None);
-    assert!(matches!(c.whoami().await.unwrap(), Identity::NotAuthenticated));
-    assert_eq!(c.hint(), "authentication required: set T_TOKEN");
     assert_eq!(idp.config_fetches(), 0);
+
+    // Not recorded: fetched on first use, then cached. A login is needed
+    // (and, without a terminal, the hint), whoami sends no token.
+    for _ in 0..2 {
+        let c = creds_for(evil.url(), &store);
+        let e = c.token(false).await.unwrap_err();
+        assert!(format!("{e:#}").contains("run `t login`"), "{e:#}");
+        assert!(matches!(c.whoami().await.unwrap(), Identity::NotAuthenticated));
+        assert!(c.hint().contains("run `t login`"), "{}", c.hint());
+    }
+    assert_eq!(idp.config_fetches(), 1);
     assert!(evil.bearers().is_empty());
 
-    // After a 401 the settings are fetched (once), which the hint uses.
+    // After a 401 they are fetched again. (Logging in again needs a
+    // terminal: tests may have one.)
+    if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        assert_eq!(creds_for(evil.url(), &store).relogin().await.unwrap(), None);
+        assert_eq!(idp.config_fetches(), 2);
+    }
+
+    // `login` fetches them, and records them for the URL.
+    let fetched = idp.config_fetches();
+    let c = creds_for(evil.url(), &store);
+    assert_eq!(c.login(false).await.unwrap().username, "mallory");
+    assert_eq!(idp.config_fetches(), fetched + 1);
+    let c = creds_for(evil.url(), &store);
+    assert!(c.token(false).await.unwrap().is_some());
+    assert_eq!(idp.config_fetches(), fetched + 1);
+}
+
+/// A service without OIDC: its settings (a 404) are cached too, and it gets
+/// no token. Once it uses OIDC, its first 401 fetches them again.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_login_is_cached_until_a_401() {
+    let idp = MockIdp::start("cli").await;
+    let svc = Impostor::start(&idp).await;
+    svc.set_no_login(true);
+    let d = tempfile::tempdir().unwrap();
+    let store = TokenStore::at(d.path());
+    for _ in 0..2 {
+        assert_eq!(creds_for(svc.url(), &store).token(true).await.unwrap(), None);
+    }
+    assert_eq!(idp.config_fetches(), 1);
+
+    svc.set_no_login(false);
+    let c = creds_for(svc.url(), &store);
+    assert_eq!(c.token(false).await.unwrap(), None);
+    assert_eq!(idp.config_fetches(), 1);
     // (Logging in again needs a terminal: tests may have one.)
     if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
         assert_eq!(c.relogin().await.unwrap(), None);
         assert!(c.hint().contains("run `t login`"), "{}", c.hint());
-        assert_eq!(idp.config_fetches(), 1);
+        assert_eq!(idp.config_fetches(), 2);
+        // The cache was updated: a login is needed up front now.
+        let e = creds_for(svc.url(), &store).token(false).await.unwrap_err();
+        assert!(format!("{e:#}").contains("run `t login`"), "{e:#}");
+        assert_eq!(idp.config_fetches(), 2);
     }
-
-    // `login` fetches them, and records them for the URL.
-    let c = creds_for(evil.url(), &store);
-    assert_eq!(c.login(false).await.unwrap().username, "mallory");
-    let fetched = idp.config_fetches();
-    let c = creds_for(evil.url(), &store);
-    assert!(c.token(false).await.unwrap().is_some());
-    assert_eq!(idp.config_fetches(), fetched);
-}
-
-/// A record written by an older version (without the settings) is completed
-/// from the service once, if it still names the same provider login.
-#[tokio::test(flavor = "multi_thread")]
-async fn old_records_are_completed_once() {
-    let idp = MockIdp::start("cli").await;
-    let d = tempfile::tempdir().unwrap();
-    let store = TokenStore::at(d.path());
-    plant(&idp, &store, "rt-o");
-    let urls = d.path().join("urls");
-    let f = std::fs::read_dir(&urls).unwrap().next().unwrap().unwrap().path();
-    let old = json!({"url": idp.issuer(), "issuer": idp.issuer(), "client_id": idp.client_id()});
-    std::fs::write(&f, old.to_string()).unwrap();
-    assert!(creds(&idp, &store).token(false).await.unwrap().is_some());
-    assert!(creds(&idp, &store).token(false).await.unwrap().is_some());
-    assert_eq!(idp.config_fetches(), 1);
-    // Naming another provider login: as if never logged in to.
-    let other = json!({"url": idp.issuer(), "issuer": idp.issuer(), "client_id": "other"});
-    std::fs::write(&f, other.to_string()).unwrap();
-    assert_eq!(creds(&idp, &store).token(false).await.unwrap(), None);
 }

@@ -36,16 +36,10 @@ pub fn invalid_commit(req: &PruneRequest) -> Option<&str> {
         .find(|c| !is_prune_commit_prefix(c))
 }
 
-/// Whether `s` is a non-empty string of hex digits (either case), usable as
-/// a commit prefix in lookups (which accept any unique prefix).
-pub fn is_commit_prefix(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
 /// Whether `s` is a commit prefix prune accepts: at least
-/// [`MIN_COMMIT_PREFIX`] hex digits.
+/// [`MIN_COMMIT_PREFIX`] hex digits (either case).
 pub fn is_prune_commit_prefix(s: &str) -> bool {
-    s.len() >= MIN_COMMIT_PREFIX && is_commit_prefix(s)
+    s.len() >= MIN_COMMIT_PREFIX && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Why the commits of `req` can't be used, if they can't: one is not a

@@ -86,13 +86,10 @@ async fn package(
     let system = p.system.unwrap_or_else(|| DEFAULT_SYSTEM.to_string());
     match query::lookup(&s.pool, &attr, &p.commit, &system).await? {
         Ok(info) => Ok(Json(info)),
+        Err(LookupError::MalformedCommit(e)) => Err(err(StatusCode::BAD_REQUEST, e)),
         Err(LookupError::UnknownCommit) => {
             Err(err(StatusCode::NOT_FOUND, format!("unknown commit {}", p.commit)))
         }
-        Err(LookupError::AmbiguousCommit) => Err(err(
-            StatusCode::BAD_REQUEST,
-            format!("ambiguous commit prefix {}", p.commit),
-        )),
         Err(LookupError::NotFound) => Err(err(
             StatusCode::NOT_FOUND,
             format!("{attr} ({system}) not found at {}", p.commit),
@@ -101,7 +98,10 @@ async fn package(
 }
 
 async fn bulk(State(s): State<AppState>, Json(req): Json<BulkRequest>) -> R<BulkResponse> {
-    Ok(Json(query::bulk(&s.pool, &req).await?))
+    match query::bulk(&s.pool, &req).await? {
+        Ok(r) => Ok(Json(r)),
+        Err(e) => Err(err(StatusCode::BAD_REQUEST, e)),
+    }
 }
 
 async fn minimise(

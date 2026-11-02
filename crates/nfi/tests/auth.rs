@@ -57,16 +57,12 @@ async fn tokens() {
 
     let url = svc.public_url.as_str();
 
-    // Never logged in, and no terminal to log in from: the request is sent
-    // without a token, and its 401 gets the hint (the service's settings,
-    // fetched after it, say it uses login).
+    // Not logged in, and no terminal to log in from: the command stops
+    // before sending anything.
     let o = nfi(&[], &["releases"]);
     assert_eq!(o.code, 1);
-    assert!(
-        o.stderr.contains("run `nfi login`") && o.stderr.contains("401"),
-        "{}",
-        o.stderr
-    );
+    assert!(o.stderr.contains("run `nfi login`"), "{}", o.stderr);
+    assert!(!o.stderr.contains("401"), "{}", o.stderr);
     let o = nfi(&[], &["whoami"]);
     assert_eq!(
         (o.code, o.stdout.trim()),
@@ -215,21 +211,20 @@ async fn interactive_login() {
     assert!(!o.text.contains("To log in"), "{}", o.text);
     assert_eq!(idp.device_logins(), 0);
 
-    // On a terminal, a command needing a login logs in once the service
-    // rejects it (it was never logged in to, so nothing says it needs one
-    // before), even with stdin piped (the device flow only uses stderr).
+    // On a terminal, a command needing a login logs in first, before
+    // reading stdin (a pipe: the device flow only uses stderr), which is
+    // written only once the login is recorded.
     let o = sh_tty(
         d.path(),
         &[("URL", url)],
-        "echo missing@aaaa | \"$NFI\" --url \"$URL\" bulk -f -",
+        "{ until [ -n \"$(ls \"$NFI_TOKEN_CACHE/urls\" 2>/dev/null)\" ]; do sleep 0.1; done; \
+         echo STDIN >&2; echo missing@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; } | \"$NFI\" --url \"$URL\" bulk -f -",
     )
     .await;
     assert_eq!(o.code, Some(0), "{}", o.text);
-    assert!(
-        o.text.contains("To log in, open") && o.text.contains("CODE-0"),
-        "{}",
-        o.text
-    );
+    let prompt = o.text.find("To log in, open").expect(&o.text);
+    assert!(o.text.contains("CODE-0"), "{}", o.text);
+    assert!(prompt < o.text.find("STDIN").expect(&o.text), "{}", o.text);
     assert!(o.text.contains("0 paths in closure"), "{}", o.text);
     assert_eq!(idp.device_logins(), 1);
 
@@ -360,10 +355,11 @@ async fn cached_login_not_sent_to_other_urls() {
     assert_ne!(sent[0], cached);
 }
 
-/// The service's settings are not fetched by commands to a URL logged in
-/// to (its record has them), nor to one never logged in to until a 401.
+/// A URL's settings are fetched once, on its first use: a login is then
+/// known to be needed before any other request. Later commands use the
+/// cached settings, or those recorded by a login.
 #[tokio::test(flavor = "multi_thread")]
-async fn settings_fetched_only_after_a_401() {
+async fn settings_fetched_on_first_use_only() {
     let idp = MockIdp::start("nfi").await;
     let evil = Impostor::start(&idp).await;
     let d = tempfile::tempdir().unwrap();
@@ -374,11 +370,13 @@ async fn settings_fetched_only_after_a_401() {
     };
     let o = nfi(&["whoami"]);
     assert_eq!(o.code, 1, "{}", o.stderr);
-    assert_eq!(idp.config_fetches(), 0);
-    let o = nfi(&["releases"]);
-    assert_eq!(o.code, 1);
-    assert!(o.stderr.contains("run `nfi login`"), "{}", o.stderr);
-    assert_eq!(idp.config_fetches(), 1);
+    assert_eq!((idp.config_fetches(), evil.requests()), (0, 1));
+    for _ in 0..2 {
+        let o = nfi(&["releases"]);
+        assert_eq!(o.code, 1);
+        assert!(o.stderr.contains("run `nfi login`"), "{}", o.stderr);
+    }
+    assert_eq!((idp.config_fetches(), evil.requests()), (1, 1));
 
     let store = TokenStore::at(d.path().join("tokens"));
     let alice = idp.token(json!({"sub": "1", "preferred_username": "alice"}));
@@ -397,6 +395,44 @@ async fn settings_fetched_only_after_a_401() {
     }
     assert_eq!(idp.config_fetches(), 1);
     assert_eq!(evil.bearers(), [alice.clone(), alice]);
+}
+
+/// A service without OIDC: its 404 is cached on first use; once it uses
+/// OIDC, its first 401 fetches the settings again, and later commands know
+/// a login is needed before sending anything.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_login_cached_until_a_401() {
+    let idp = MockIdp::start("nfi").await;
+    let svc = Impostor::start(&idp).await;
+    svc.set_no_login(true);
+    let d = tempfile::tempdir().unwrap();
+    let nfi = || {
+        run(
+            env!("CARGO_BIN_EXE_nfi"),
+            d.path(),
+            &[],
+            &["--url", svc.url(), "releases"],
+        )
+    };
+    for _ in 0..2 {
+        let o = nfi();
+        assert_eq!(o.code, 0, "{}", o.stderr);
+    }
+    assert_eq!((idp.config_fetches(), svc.requests()), (1, 2));
+
+    svc.set_no_login(false);
+    let o = nfi();
+    assert_eq!(o.code, 1);
+    assert!(
+        o.stderr.contains("run `nfi login`") && o.stderr.contains("401"),
+        "{}",
+        o.stderr
+    );
+    assert_eq!((idp.config_fetches(), svc.requests()), (2, 3));
+    let o = nfi();
+    assert_eq!(o.code, 1);
+    assert!(!o.stderr.contains("401"), "{}", o.stderr);
+    assert_eq!((idp.config_fetches(), svc.requests()), (2, 3));
 }
 
 /// A URL recorded with settings the service no longer uses (another
