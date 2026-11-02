@@ -479,7 +479,8 @@ YOINK_TOKEN=$CI_ID_TOKEN yoink --plain .#foo   # CI: a pre-obtained ID token, li
 **Behaviour**
 
 - The CLI exits only when every path has a result: 0 if all were mirrored, 1 if any failed, or on an unrecoverable error. A dropped connection is resumed by re-posting the unfinished paths (the service deduplicates); it gives up after 5 minutes without progress. `q`/Ctrl-C detaches with status 130, and the service keeps mirroring.
-- **Monitor** (on a terminal): overall progress by path count and by size, and a scrollable field with one indicator per path, in request order. Indicators shrink, from a full line (name, bar, phase, `12.3/45.6 MiB`) down to `[T 57]` (phase abbreviation and percent), to fit as many as possible. Yellow means warnings, red errors. Keys: arrows/`j`/`k` move, Enter shows that path's log, `l` all logs, Esc back, `q` quit; click selects, clicking again opens the log.
+- **Monitor** (on a terminal): overall progress by path count, and a scrollable field with one indicator per path, in request order. Indicators shrink, from a full line (name, bar, phase, `12.3/45.6 MiB`) down to `[T 57]` (phase abbreviation and percent), to fit as many as possible; a finished path shows only its result, not its last phase. Yellow means warnings, red errors. Keys: arrows/`j`/`k` move, Enter shows that path's log, `l` all logs, Esc back, `q` quit; click selects, clicking again opens the log.
+- **Nix's lookup cache**: when any of the PURLs were `pkg:nix`, the CLI finally removes nix's `binary-cache*` files from `$XDG_CACHE_HOME/nix` (`~/.cache/nix`), which remember cache misses, so the paths just mirrored are found by the next nix command.
 - **Plain mode** (not a terminal, or `--plain`): phase changes, errors and results, one per line; `-v` adds warnings and info, `-vv` progress; `-q` only errors.
 - Configuration: `$XDG_CONFIG_HOME/yoink/config.toml` may set `url`, `nfi_url` and `nix`.
 

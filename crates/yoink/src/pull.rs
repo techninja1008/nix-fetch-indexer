@@ -131,6 +131,9 @@ pub async fn pull(o: PullOptions) -> Result<ExitCode> {
     let client = crate::client::Client::new(&o.url, None)?;
     let first = retry(&creds, |t| async { client.with_token(t).mirror(&purls).await }).await;
 
+    let nix = purls
+        .iter()
+        .any(|p| yoink_purl::Purl::parse(p).is_ok_and(|p| p.ty == "nix"));
     let mut state = State::new(&purls);
     state.plan = plan;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -173,6 +176,9 @@ pub async fn pull(o: PullOptions) -> Result<ExitCode> {
         (state, false)
     };
     driver.abort();
+    if nix && let Some(dir) = nix_cache_dir() {
+        forget_nix_cache(&dir);
+    }
     eprintln!("{}", summary(&state));
     if quit {
         eprintln!("detached; the service keeps mirroring the remaining paths");
@@ -187,4 +193,49 @@ pub async fn pull(o: PullOptions) -> Result<ExitCode> {
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// Nix's cache directory: `$XDG_CACHE_HOME/nix`, else `~/.cache/nix`.
+fn nix_cache_dir() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".cache")))?;
+    Some(base.join("nix"))
+}
+
+/// Remove nix's binary-cache lookup caches (`binary-cache*` in `dir`): they
+/// remember misses, so paths just mirrored would otherwise look absent.
+fn forget_nix_cache(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        if e.file_name().to_string_lossy().starts_with("binary-cache")
+            && let Err(err) = std::fs::remove_file(e.path())
+        {
+            eprintln!("warning: removing {}: {err}", e.path().display());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn forgets_nix_cache() {
+        let d = tempfile::tempdir().unwrap();
+        for f in [
+            "binary-cache-v6.sqlite",
+            "binary-cache-v6.sqlite-journal",
+            "eval-cache-v5",
+        ] {
+            std::fs::write(d.path().join(f), b"").unwrap();
+        }
+        super::forget_nix_cache(d.path());
+        let left: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(left, ["eval-cache-v5"]);
+        super::forget_nix_cache(&d.path().join("missing"));
+    }
 }

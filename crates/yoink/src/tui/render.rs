@@ -86,7 +86,6 @@ pub fn indicator(s: &State, item: &Item, level: Level, width: u16) -> Line<'stat
         Level::Full => {
             let readout = match (item.outcome, item.progress) {
                 (None, Some(p)) => format::readout(&p),
-                (Some(Outcome::Success), _) => item.size.map(format::size).unwrap_or_default(),
                 _ => String::new(),
             };
             let (phase_w, readout_w) = (18, 21);
@@ -122,9 +121,9 @@ pub fn indicator(s: &State, item: &Item, level: Level, width: u16) -> Line<'stat
     Line::from(spans)
 }
 
-/// Header (4 lines), body, footer (1 line).
+/// Header (3 lines), body, footer (1 line).
 pub fn areas(area: Rect) -> [Rect; 3] {
-    Layout::vertical([Constraint::Length(4), Constraint::Min(1), Constraint::Length(1)]).areas(area)
+    Layout::vertical([Constraint::Length(3), Constraint::Min(1), Constraint::Length(1)]).areas(area)
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -140,7 +139,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 fn header(f: &mut Frame, app: &App, area: Rect) {
     let s = &app.state;
     let c = s.counts();
-    let rows = Layout::vertical([Constraint::Length(1); 4]).split(area);
+    let rows = Layout::vertical([Constraint::Length(1); 3]).split(area);
     let title = Line::from(vec![
         Span::styled("yoink ", Style::new().add_modifier(Modifier::BOLD)),
         Span::raw(format!("{} → {}", app.targets, app.server)),
@@ -159,17 +158,6 @@ fn header(f: &mut Frame, app: &App, area: Rect) {
             .label(format!("paths {}/{}{failed}", c.done(), c.total)),
         rows[1],
     );
-    f.render_widget(
-        Gauge::default()
-            .gauge_style(Style::new().fg(Color::Cyan))
-            .ratio(ratio(c.bytes_done as f64, c.bytes_total as f64))
-            .label(format!(
-                "size {} / {}",
-                format::size(c.bytes_done),
-                format::size(c.bytes_total)
-            )),
-        rows[2],
-    );
     let plan = match &s.plan {
         Some(p) => {
             let mut spans = vec![Span::raw(format!(
@@ -186,7 +174,7 @@ fn header(f: &mut Frame, app: &App, area: Rect) {
         }
         None => Line::raw(""),
     };
-    f.render_widget(Paragraph::new(plan).style(Style::new().fg(Color::Gray)), rows[3]);
+    f.render_widget(Paragraph::new(plan).style(Style::new().fg(Color::Gray)), rows[2]);
 }
 
 fn field(f: &mut Frame, app: &mut App, area: Rect) {

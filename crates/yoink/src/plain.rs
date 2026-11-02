@@ -110,15 +110,8 @@ pub fn summary(s: &State) -> String {
         }
     }
     out.push_str(&format!(
-        "{} of {} paths mirrored, {} failed{}",
-        c.succeeded,
-        c.total,
-        c.failed,
-        if c.bytes_total > 0 {
-            format!(" ({} transferred)", format::size(c.bytes_done))
-        } else {
-            String::new()
-        }
+        "{} of {} paths mirrored, {} failed",
+        c.succeeded, c.total, c.failed
     ));
     if c.done() < c.total {
         out.push_str(&format!(", {} unfinished", c.total - c.done()));

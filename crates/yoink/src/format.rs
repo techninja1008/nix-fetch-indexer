@@ -22,12 +22,6 @@ fn in_unit(n: u64, u: usize) -> String {
     }
 }
 
-/// `12.3 MiB`.
-pub fn size(n: u64) -> String {
-    let u = scale(n);
-    format!("{} {}", in_unit(n, u), UNITS[u])
-}
-
 /// Whole percent of `p`, 0 to 100 (0 when `max` is 0).
 pub fn percent(p: &Progress) -> u8 {
     if p.max == 0 {
@@ -78,9 +72,6 @@ mod tests {
 
     #[test]
     fn formats() {
-        assert_eq!(size(512), "512 B");
-        assert_eq!(size(1536), "1.5 KiB");
-        assert_eq!(size(3 << 30), "3.0 GiB");
         let p = Progress {
             current: 1 << 20,
             max: 45 << 20,
