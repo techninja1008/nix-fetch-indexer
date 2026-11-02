@@ -66,6 +66,33 @@ async fn rotation() {
 }
 
 #[tokio::test]
+async fn rotation_during_an_outage() {
+    let idp = MockIdp::start("c").await;
+    let a = authenticator(&idp).with_key_refresh(Duration::from_millis(300), Duration::from_secs(3600));
+    let old = idp.token(claims());
+    a.authenticate(&old).await.unwrap();
+    idp.set_down(true);
+    idp.rotate_key();
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    // The new key id cannot be checked: unavailable, not invalid, also
+    // while the refetch is rate limited.
+    let new = idp.token(claims());
+    for _ in 0..3 {
+        let r = a.authenticate(&new).await;
+        assert!(matches!(r, Err(AuthError::Unavailable(_))), "{r:?}");
+        assert_eq!(r.unwrap_err().status(), 503);
+    }
+    assert_eq!(idp.key_fetches(), 3);
+    // Known keys keep working.
+    a.authenticate(&old).await.unwrap();
+    // Recovery.
+    idp.set_down(false);
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert_eq!(a.authenticate(&new).await.unwrap().username, "alice");
+    assert_eq!(idp.key_fetches(), 4);
+}
+
+#[tokio::test]
 async fn old_key_sets_are_refreshed_in_the_background() {
     let idp = MockIdp::start("c").await;
     let a = authenticator(&idp).with_key_refresh(Duration::ZERO, Duration::from_millis(200));

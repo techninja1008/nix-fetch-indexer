@@ -7,12 +7,9 @@ use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{MethodRouter, get, post};
-use axum::{Extension, Json, Router};
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use nfi_api::*;
-use nfi_auth_server::{Caller, Guard};
-use serde::Deserialize;
-use std::sync::Arc;
 
 pub struct AppError(StatusCode, String);
 
@@ -36,49 +33,41 @@ fn err(status: StatusCode, msg: impl Into<String>) -> AppError {
 
 type R<T> = Result<Json<T>, AppError>;
 
-/// `CONFIG_PATH` and `WHOAMI_PATH` handlers for a listener's guard.
-fn auth_routes(guard: &Arc<Guard>) -> (MethodRouter<AppState>, MethodRouter<AppState>) {
-    let g = guard.clone();
-    let config = get(move || async move { g.config_response() });
-    let g = guard.clone();
-    let whoami =
-        get(move |c: Option<Extension<Caller>>| async move { g.whoami_response(c.as_ref().map(|c| &c.0)) });
-    (config, whoami)
-}
-
 pub fn public_router(state: AppState) -> Router {
     let guard = state.auth.public.clone();
-    let (config, whoami) = auth_routes(&guard);
     Router::new()
-        .route("/v1/search", get(search))
-        .route("/v1/packages/{*attr}", get(package))
-        .route("/v1/lookup/bulk", post(bulk))
-        .route("/v1/minimise", post(minimise))
-        .route("/v1/releases", get(releases))
-        .route(nfi_auth::WHOAMI_PATH, whoami)
+        .route(SEARCH_PATH, get(search))
+        .route(&format!("{PACKAGES_PATH}/{{*attr}}"), get(package))
+        .route(BULK_PATH, post(bulk))
+        .route(MINIMISE_PATH, post(minimise))
+        .route(RELEASES_PATH, get(releases))
         .layer(DefaultBodyLimit::max(512 << 20))
-        .layer(middleware::from_fn_with_state(guard, nfi_auth_server::middleware))
+        .layer(middleware::from_fn_with_state(
+            guard.clone(),
+            nfi_auth_server::middleware,
+        ))
         .route("/healthz", get(|| async { "ok" }))
-        .route(nfi_auth::CONFIG_PATH, config)
+        .merge(guard.routes())
         .with_state(state)
 }
 
 pub fn admin_router(state: AppState) -> Router {
     let guard = state.auth.admin.clone();
-    let (config, whoami) = auth_routes(&guard);
     Router::new()
-        .route("/admin/v1/ingest", post(ingest))
-        .route("/admin/v1/jobs", get(list_jobs))
-        .route("/admin/v1/jobs/{id}", get(get_job))
-        .route("/admin/v1/releases", get(releases))
-        .route("/admin/v1/prune", post(prune))
-        .route("/admin/v1/reindex", post(reindex))
-        .route("/admin/v1/check", post(check))
-        .route(nfi_auth::WHOAMI_PATH, whoami)
+        .route(ADMIN_INGEST_PATH, post(ingest))
+        .route(ADMIN_JOBS_PATH, get(list_jobs))
+        .route(&format!("{ADMIN_JOBS_PATH}/{{id}}"), get(get_job))
+        .route(ADMIN_RELEASES_PATH, get(releases))
+        .route(ADMIN_PRUNE_PATH, post(prune))
+        .route(ADMIN_REINDEX_PATH, post(reindex))
+        .route(ADMIN_CHECK_PATH, post(check))
         .layer(DefaultBodyLimit::disable())
-        .layer(middleware::from_fn_with_state(guard, nfi_auth_server::middleware))
+        .layer(middleware::from_fn_with_state(
+            guard.clone(),
+            nfi_auth_server::middleware,
+        ))
         .route("/healthz", get(|| async { "ok" }))
-        .route(nfi_auth::CONFIG_PATH, config)
+        .merge(guard.routes())
         .with_state(state)
 }
 
@@ -87,12 +76,6 @@ async fn search(State(s): State<AppState>, Query(q): Query<SearchQuery>) -> R<Se
         return Err(err(StatusCode::SERVICE_UNAVAILABLE, "search is not configured"));
     };
     Ok(Json(m.search(&q).await?))
-}
-
-#[derive(Deserialize)]
-struct PackageParams {
-    commit: String,
-    system: Option<String>,
 }
 
 async fn package(
@@ -119,12 +102,6 @@ async fn package(
 
 async fn bulk(State(s): State<AppState>, Json(req): Json<BulkRequest>) -> R<BulkResponse> {
     Ok(Json(query::bulk(&s.pool, &req).await?))
-}
-
-#[derive(Deserialize)]
-struct MinimiseParams {
-    /// See `minimise::close_miss_warnings`; 0 disables the check.
-    close_miss_threshold: Option<u64>,
 }
 
 async fn minimise(
@@ -160,11 +137,6 @@ fn is_json(headers: &HeaderMap) -> bool {
     essence == "application/json" || (essence.starts_with("application/") && essence.ends_with("+json"))
 }
 
-#[derive(Deserialize)]
-struct IngestParams {
-    v2_closure_type: Option<String>,
-}
-
 async fn ingest(
     State(s): State<AppState>,
     Query(p): Query<IngestParams>,
@@ -195,11 +167,6 @@ async fn ingest(
     Ok((StatusCode::ACCEPTED, Json(JobCreated { id })).into_response())
 }
 
-#[derive(Deserialize)]
-struct ListParams {
-    limit: Option<i64>,
-}
-
 async fn list_jobs(State(s): State<AppState>, Query(p): Query<ListParams>) -> R<Vec<JobInfo>> {
     Ok(Json(
         jobs::list(&s.pool, p.limit.unwrap_or(50).clamp(1, 1000)).await?,
@@ -211,14 +178,6 @@ async fn get_job(State(s): State<AppState>, Path(id): Path<i64>) -> R<JobInfo> {
         .await?
         .map(Json)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("no job {id}")))
-}
-
-#[derive(Deserialize)]
-struct ReleasesParams {
-    channel: Option<String>,
-    /// List each evaluation's errors, not only their count.
-    #[serde(default)]
-    errors: bool,
 }
 
 /// Served on both listeners: what is in the index is public.

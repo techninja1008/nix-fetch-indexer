@@ -6,6 +6,7 @@
 //! service's [`AuthConfig`] is fetched once per process, never cached.
 
 use anyhow::{Context, Result, bail};
+use nfi_auth::oidc::{DeviceAuthorization, ProviderMetadata, TokenError, TokenResponse};
 use nfi_auth::{AuthConfig, Whoami};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -148,35 +149,6 @@ impl std::fmt::Display for DevicePrompt {
             ),
         }
     }
-}
-
-#[derive(Deserialize)]
-struct ProviderMetadata {
-    token_endpoint: String,
-    device_authorization_endpoint: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct DeviceAuthorization {
-    device_code: String,
-    user_code: String,
-    #[serde(alias = "verification_url")]
-    verification_uri: String,
-    verification_uri_complete: Option<String>,
-    expires_in: Option<u64>,
-    interval: Option<u64>,
-}
-
-#[derive(Deserialize)]
-struct TokenResponse {
-    id_token: Option<String>,
-    refresh_token: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct TokenError {
-    error: String,
-    error_description: Option<String>,
 }
 
 /// What the token cache holds for a service.

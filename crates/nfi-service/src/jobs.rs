@@ -403,27 +403,21 @@ async fn run_job(state: &AppState, job: &Claim, progress: &Progress) -> Result<V
                 .to_string();
             let bundle =
                 tokio::task::spawn_blocking(move || nfi_interchange::codec::read(&data[..], &v2)).await??;
-            let report = crate::ingest::ingest(pool, &bundle, &progress).await?;
-            let mut result = serde_json::to_value(&report)?;
+            let (mut report, touched_attrs) = crate::ingest::ingest(pool, &bundle, &progress).await?;
             if let Some(m) = &state.meili {
-                progress(format!(
-                    "updating search for {} attributes",
-                    report.touched_attrs.len()
-                ));
-                let n = m.sync_attrs(pool, &report.touched_attrs).await?;
-                result["search_documents"] = json!(n);
+                progress(format!("updating search for {} attributes", touched_attrs.len()));
+                report.search_documents = Some(m.sync_attrs(pool, &touched_attrs).await?);
             }
-            Ok(result)
+            Ok(serde_json::to_value(&report)?)
         }
         "prune" => {
             let req: PruneRequest = serde_json::from_value(params.clone())?;
-            let report = crate::prune::prune(pool, &req).await?;
-            let mut result = serde_json::to_value(&report)?;
+            let mut report = crate::prune::prune(pool, &req).await?;
             if let (Some(m), false) = (&state.meili, report.releases.is_empty()) {
                 progress("rebuilding search index".into());
-                result["search_documents"] = json!(m.reindex(pool).await?);
+                report.search_documents = Some(m.reindex(pool).await?);
             }
-            Ok(result)
+            Ok(serde_json::to_value(&report)?)
         }
         "reindex" => {
             let Some(m) = &state.meili else {

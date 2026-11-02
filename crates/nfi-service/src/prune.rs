@@ -2,20 +2,9 @@
 
 use crate::ingest::WRITE_LOCK;
 use anyhow::{Result, bail};
-use nfi_api::PruneRequest;
+use nfi_api::{PruneReport, PruneRequest};
 use nfi_interchange::ClosureType;
-use serde::Serialize;
 use sqlx::{PgPool, Postgres, Transaction};
-
-#[derive(Debug, Default, Serialize)]
-pub struct PruneReport {
-    /// Releases removed entirely.
-    pub releases: Vec<String>,
-    /// `<release> <closure type>` for closures removed from kept releases.
-    pub closures: Vec<String>,
-    pub store_paths_removed: u64,
-    pub packages_removed: u64,
-}
 
 /// Delete store paths and packages that no closure or release refers to
 /// any more.
@@ -154,6 +143,7 @@ pub async fn prune(pool: &PgPool, req: &PruneRequest) -> Result<PruneReport> {
         closures,
         store_paths_removed: paths,
         packages_removed: packages,
+        search_documents: None,
     })
 }
 

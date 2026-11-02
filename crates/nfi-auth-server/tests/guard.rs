@@ -1,31 +1,23 @@
-//! Guards behind the middleware: status codes, config and whoami responses,
-//! and anonymous access.
+//! Guards: status codes behind the middleware, the config and whoami
+//! routes, and anonymous access.
 
+use axum::Router;
 use axum::routing::get;
-use axum::{Extension, Router};
 use nfi_auth::{AuthConfig, CONFIG_PATH, WHOAMI_PATH, Whoami};
-use nfi_auth_server::{Authenticator, Caller, Expr, Guard, OidcSettings, middleware};
+use nfi_auth_server::{Authenticator, Expr, Guard, OidcSettings, middleware};
 use nfi_test_support::MockIdp;
 use serde_json::json;
 use std::sync::Arc;
 
-/// Serve `guard` like the services do: `/x` and whoami behind the
-/// middleware, config and `/healthz` outside it.
+/// Serve `guard` like the services do: `/x` behind the middleware,
+/// `/healthz` and the guard's routes outside it.
 async fn serve(guard: Guard) -> String {
     let guard = Arc::new(guard);
-    let (g1, g2) = (guard.clone(), guard.clone());
-    let app =
-        Router::new()
-            .route("/x", get(|| async { "x" }))
-            .route(
-                WHOAMI_PATH,
-                get(move |c: Option<Extension<Caller>>| async move {
-                    g1.whoami_response(c.as_ref().map(|c| &c.0))
-                }),
-            )
-            .layer(axum::middleware::from_fn_with_state(guard, middleware))
-            .route("/healthz", get(|| async { "ok" }))
-            .route(CONFIG_PATH, get(move || async move { g2.config_response() }));
+    let app = Router::new()
+        .route("/x", get(|| async { "x" }))
+        .layer(axum::middleware::from_fn_with_state(guard.clone(), middleware))
+        .route("/healthz", get(|| async { "ok" }))
+        .merge(guard.routes());
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", l.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
@@ -80,10 +72,12 @@ async fn open_and_token() {
     assert_eq!(get_(format!("{u}/x"), Some("s3cret")).await.status(), 200);
     assert_eq!(get_(format!("{u}/healthz"), None).await.status(), 200);
     assert_eq!(get_(format!("{u}{CONFIG_PATH}"), None).await.status(), 404);
-    assert_eq!(
-        get_(format!("{u}{WHOAMI_PATH}"), Some("s3cret")).await.status(),
-        404
-    );
+    // Whoami answers the same with or without the token.
+    for t in [None, Some("s3cret"), Some("wrong")] {
+        let r = get_(format!("{u}{WHOAMI_PATH}"), t).await;
+        assert_eq!(r.status(), 404);
+        assert_eq!(error(r).await, "this listener does not use OIDC login");
+    }
 }
 
 #[tokio::test]
@@ -107,6 +101,16 @@ async fn oidc_config_and_policy() {
     assert_eq!(r.status(), 403);
     assert!(r.headers().get("www-authenticate").is_none());
     assert_eq!(error(r).await, "forbidden: denied by policy");
+    // Whoami authenticates without the policy: it reports who mallory is.
+    let me: Whoami = get_(format!("{u}{WHOAMI_PATH}"), Some(&mallory))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(me.username, "mallory");
+    let r = get_(format!("{u}{WHOAMI_PATH}"), Some("garbage")).await;
+    assert_eq!(r.status(), 401);
+    assert_eq!(r.headers()["www-authenticate"], "Bearer");
     let alice = idp.token(json!({"sub": "a", "preferred_username": "alice"}));
     assert_eq!(get_(format!("{u}/x"), Some(&alice)).await.status(), 200);
 
@@ -123,6 +127,16 @@ async fn oidc_config_and_policy() {
     let r = get_(format!("{u}{WHOAMI_PATH}"), None).await;
     assert_eq!(r.status(), 401);
     assert_eq!(r.headers()["www-authenticate"], "Bearer");
+    assert_eq!(error(r).await, "missing bearer token");
+    let r = get_(format!("{u}{WHOAMI_PATH}"), Some(&alice)).await;
+    assert_eq!(r.status(), 200);
+
+    // The provider is down and the keys were never fetched: 503.
+    let u = serve(oidc(&idp, None, "true", false)).await;
+    idp.set_down(true);
+    let r = get_(format!("{u}{WHOAMI_PATH}"), Some(&alice)).await;
+    assert_eq!(r.status(), 503);
+    idp.set_down(false);
 }
 
 #[tokio::test]

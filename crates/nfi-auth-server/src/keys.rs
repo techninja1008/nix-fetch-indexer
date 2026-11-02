@@ -7,7 +7,8 @@
 //! - A set older than [`KeyCache::max_age`] is refreshed in the background
 //!   while the old one is still used, so revoked keys drop out eventually.
 //! - Without any set (the provider has been unreachable since startup),
-//!   requests fail with [`AuthError::Unavailable`].
+//!   or for an unknown key id while the last fetch failed (a rotation
+//!   during an outage), requests fail with [`AuthError::Unavailable`].
 //!
 //! Fetches never happen under the snapshot lock; the refresh mutex
 //! serialises them.
@@ -15,7 +16,7 @@
 use crate::{AuthError, get_json};
 use jsonwebtoken::jwk::{Jwk, JwkSet, KeyAlgorithm, PublicKeyUse};
 use jsonwebtoken::{Algorithm, DecodingKey};
-use serde::Deserialize;
+use nfi_auth::oidc::ProviderMetadata;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -32,12 +33,8 @@ struct Snapshot {
     fetched: Option<Instant>,
     /// The last fetch attempt, successful or not.
     attempted: Option<Instant>,
-}
-
-#[derive(Deserialize)]
-struct Discovery {
-    issuer: String,
-    jwks_uri: String,
+    /// Whether the last fetch attempt failed.
+    failed: bool,
 }
 
 pub(crate) struct KeyCache {
@@ -76,7 +73,7 @@ impl KeyCache {
             Some(u) => u,
             None => {
                 let url = format!("{}/.well-known/openid-configuration", self.issuer);
-                let d: Discovery = get_json(&self.http, &url).await.map_err(unavailable)?;
+                let d: ProviderMetadata = get_json(&self.http, &url).await.map_err(unavailable)?;
                 if d.issuer.trim_end_matches('/') != self.issuer {
                     return Err(AuthError::Internal(format!(
                         "issuer mismatch: discovery document at {url} is for {}",
@@ -97,6 +94,7 @@ impl KeyCache {
         let mut w = self.snapshot.write().expect("not poisoned");
         let mut s = Snapshot::clone(&w);
         s.attempted = Some(now);
+        s.failed = r.is_err();
         let r = r.map(|(uri, set)| {
             s.jwks_uri = Some(uri);
             s.set = Some(Arc::new(set));
@@ -152,6 +150,12 @@ impl KeyCache {
             return Err(AuthError::Unavailable(
                 "the OpenID provider's signing keys have not been fetched yet".into(),
             ));
+        }
+        if snap.failed {
+            return Err(AuthError::Unavailable(format!(
+                "signing key {} is unknown and the OpenID provider's keys could not be refetched",
+                kid.unwrap_or("(no kid)")
+            )));
         }
         Err(AuthError::Invalid(format!(
             "unknown signing key {}",

@@ -1,20 +1,22 @@
 //! Per-listener authentication: the [`Guard`], its axum [`middleware`],
-//! and the responses of [`nfi_auth::CONFIG_PATH`] and
-//! [`nfi_auth::WHOAMI_PATH`].
+//! and the unauthenticated [`Guard::routes`] ([`CONFIG_PATH`] and
+//! [`WHOAMI_PATH`]).
 //!
-//! Every request that passes the guard runs in a `request` span with
-//! `method`, `path`, `user` and `session` (`-` for none) and ends with an
-//! `info` line `request` carrying its `status`. A rejected request is
-//! logged as `request rejected` with `method`, `path`, `status` and
-//! `error`: at `info` level, or `error` for a 5xx.
+//! Every request that passes the guard (and every whoami request that
+//! authenticates) runs in a `request` span with `method`, `path`, `user`
+//! and `session` (`-` for none) and ends with an `info` line `request`
+//! carrying its `status`. A rejected request is logged as `request
+//! rejected` with `method`, `path`, `status` and `error`: at `info` level,
+//! or `error` for a 5xx.
 
 use crate::{AuthError, Authenticator, Expr, Principal, Vars, bearer, request_var, token_matches};
-use axum::Json;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use nfi_auth::{AuthConfig, ErrorBody};
+use axum::routing::get;
+use axum::{Json, Router};
+use nfi_auth::{AuthConfig, CONFIG_PATH, ErrorBody, WHOAMI_PATH};
 use std::sync::Arc;
 use tracing::Instrument;
 
@@ -52,9 +54,7 @@ impl Caller {
         match self {
             Caller::Anonymous => ("-", "-"),
             Caller::Token => ("(token)", "-"),
-            Caller::User { principal, .. } => {
-                (&principal.username, principal.session.as_deref().unwrap_or("-"))
-            }
+            Caller::User { principal, .. } => principal.log_identity(),
         }
     }
 }
@@ -67,6 +67,13 @@ fn not_oidc() -> Response {
         }),
     )
         .into_response()
+}
+
+impl Principal {
+    /// `user` and `session` for the log.
+    fn log_identity(&self) -> (&str, &str) {
+        (&self.username, self.session.as_deref().unwrap_or("-"))
+    }
 }
 
 impl Guard {
@@ -100,7 +107,7 @@ impl Guard {
         }
     }
 
-    /// The [`nfi_auth::CONFIG_PATH`] response: the [`AuthConfig`], or 404
+    /// The [`CONFIG_PATH`] response: the [`AuthConfig`], or 404
     /// unless this is an OIDC guard.
     pub fn config_response(&self) -> Response {
         match self {
@@ -117,24 +124,69 @@ impl Guard {
         }
     }
 
-    /// The [`nfi_auth::WHOAMI_PATH`] response for `caller`: 404 unless this
-    /// is an OIDC guard, 401 unless the caller is a user, 500 if the whoami
-    /// expression fails.
-    pub fn whoami_response(&self, caller: Option<&Caller>) -> Response {
+    /// The [`WHOAMI_PATH`] response: 404 unless this is an OIDC guard;
+    /// otherwise the caller's token is authenticated, without the policy
+    /// or anonymous access: the [`AuthError`] response if that fails, 500
+    /// if the whoami expression fails, else 200 with the
+    /// [`nfi_auth::Whoami`]. Logged like requests through the
+    /// [`middleware`].
+    pub async fn whoami_response(&self, headers: &HeaderMap) -> Response {
+        let (method, path) = (Method::GET, WHOAMI_PATH);
         let Guard::Oidc { authenticator, .. } = self else {
-            return not_oidc();
+            return span(&method, path, ("-", "-")).in_scope(|| logged(not_oidc()));
         };
-        let Some(Caller::User { principal, .. }) = caller else {
-            return AuthError::Missing.into_response();
+        let principal = match bearer(headers) {
+            None => Err(AuthError::Missing),
+            Some(t) => authenticator.authenticate(t).await,
         };
-        match authenticator.whoami(principal) {
-            Ok(w) => Json(w).into_response(),
-            Err(e) => {
-                tracing::error!(error = %format!("{e:#}"), "whoami expression failed");
-                AuthError::Internal("whoami expression failed".into()).into_response()
-            }
-        }
+        let principal = match principal {
+            Ok(p) => p,
+            Err(e) => return rejected(&method, path, e),
+        };
+        span(&method, path, principal.log_identity()).in_scope(|| {
+            logged(match authenticator.whoami(&principal) {
+                Ok(w) => Json(w).into_response(),
+                Err(e) => {
+                    tracing::error!(error = %format!("{e:#}"), "whoami expression failed");
+                    AuthError::Internal("whoami expression failed".into()).into_response()
+                }
+            })
+        })
     }
+
+    /// The unauthenticated routes, [`CONFIG_PATH`] and [`WHOAMI_PATH`], to
+    /// merge into a service's router outside the [`middleware`].
+    pub fn routes<S: Clone + Send + Sync + 'static>(self: &Arc<Self>) -> Router<S> {
+        let (g1, g2) = (self.clone(), self.clone());
+        Router::new()
+            .route(CONFIG_PATH, get(move || async move { g1.config_response() }))
+            .route(
+                WHOAMI_PATH,
+                get(move |h: HeaderMap| async move { g2.whoami_response(&h).await }),
+            )
+    }
+}
+
+/// The `request` span of a request (see the module docs).
+fn span(method: &Method, path: &str, (user, session): (&str, &str)) -> tracing::Span {
+    tracing::info_span!("request", %method, path = %path, user = %user, session = %session)
+}
+
+/// Log the final `request` line of a response.
+fn logged(r: Response) -> Response {
+    tracing::info!(status = r.status().as_u16(), "request");
+    r
+}
+
+/// Log a rejected request and respond with the error.
+fn rejected(method: &Method, path: &str, e: AuthError) -> Response {
+    let status = e.status().as_u16();
+    if e.status().is_server_error() {
+        tracing::error!(%method, path = %path, status, error = %e, "request rejected");
+    } else {
+        tracing::info!(%method, path = %path, status, error = %e, "request rejected");
+    }
+    e.into_response()
 }
 
 impl IntoResponse for AuthError {
@@ -163,24 +215,9 @@ pub async fn middleware(State(guard): State<Arc<Guard>>, mut req: Request, next:
     let path = req.uri().path().to_string();
     let caller = match guard.check(req.headers(), &method, &path).await {
         Ok(c) => c,
-        Err(e) => {
-            let status = e.status().as_u16();
-            if e.status().is_server_error() {
-                tracing::error!(%method, path = %path, status, error = %e, "request rejected");
-            } else {
-                tracing::info!(%method, path = %path, status, error = %e, "request rejected");
-            }
-            return e.into_response();
-        }
+        Err(e) => return rejected(&method, &path, e),
     };
-    let (user, session) = caller.log_identity();
-    let span = tracing::info_span!("request", %method, path = %path, user = %user, session = %session);
+    let span = span(&method, &path, caller.log_identity());
     req.extensions_mut().insert(caller);
-    async move {
-        let r = next.run(req).await;
-        tracing::info!(status = r.status().as_u16(), "request");
-        r
-    }
-    .instrument(span)
-    .await
+    async move { logged(next.run(req).await) }.instrument(span).await
 }

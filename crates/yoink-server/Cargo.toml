@@ -10,7 +10,6 @@ readme.workspace = true
 [dependencies]
 yoink-api.workspace = true
 yoink-purl.workspace = true
-nfi-auth.workspace = true
 nfi-auth-server.workspace = true
 anyhow.workspace = true
 serde.workspace = true
@@ -23,6 +22,7 @@ futures.workspace = true
 axum.workspace = true
 
 [dev-dependencies]
+nfi-auth.workspace = true
 yoink = { path = "../yoink" }
 nfi = { path = "../nfi" }
 nfi-test-support.workspace = true

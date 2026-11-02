@@ -65,6 +65,9 @@ async fn public_api() {
     assert_eq!(me.additional_info["groups"], json!(["nfi"]));
     assert_eq!(me.additional_info["iss"], idp.issuer());
     assert_eq!(get(u(WHOAMI_PATH), None).await.status(), 401);
+    // Whoami does not go through the policy.
+    let me: Whoami = get(u(WHOAMI_PATH), Some(&outsider)).await.json().await.unwrap();
+    assert_eq!(me.username, "2");
 
     // The admin listener is open, and advertises no OIDC.
     assert_eq!(
@@ -176,6 +179,7 @@ async fn admin_token_with_oidc_public() {
     assert_eq!(get(u("/admin/v1/jobs"), Some(&alice)).await.status(), 401);
     assert_eq!(get(u("/admin/v1/jobs"), Some("s3cret")).await.status(), 200);
     assert_eq!(get(u(CONFIG_PATH), None).await.status(), 404);
+    assert_eq!(get(u(WHOAMI_PATH), Some("s3cret")).await.status(), 404);
 }
 
 #[test]

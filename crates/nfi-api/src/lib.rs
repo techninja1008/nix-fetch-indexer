@@ -8,6 +8,34 @@ use std::collections::BTreeMap;
 
 pub const DEFAULT_SYSTEM: &str = "x86_64-linux";
 
+// ---------- routes ----------
+
+/// GET, [`SearchQuery`] -> [`SearchResponse`].
+pub const SEARCH_PATH: &str = "/v1/search";
+/// GET `{PACKAGES_PATH}/<attr>`, [`PackageParams`] -> [`PackageInfo`].
+pub const PACKAGES_PATH: &str = "/v1/packages";
+/// POST [`BulkRequest`] -> [`BulkResponse`].
+pub const BULK_PATH: &str = "/v1/lookup/bulk";
+/// POST a derivation graph, [`MinimiseParams`] -> [`MinimiseResponse`].
+pub const MINIMISE_PATH: &str = "/v1/minimise";
+/// GET, [`ReleasesParams`] -> `Vec<`[`ReleaseInfo`]`>`.
+pub const RELEASES_PATH: &str = "/v1/releases";
+/// POST a bundle ([`IngestParams`]) or an [`IngestUrlRequest`] ->
+/// [`JobCreated`]; the job's result is an [`IngestReport`].
+pub const ADMIN_INGEST_PATH: &str = "/admin/v1/ingest";
+/// GET, [`ListParams`] -> `Vec<`[`JobInfo`]`>`; GET `{ADMIN_JOBS_PATH}/<id>`
+/// -> [`JobInfo`].
+pub const ADMIN_JOBS_PATH: &str = "/admin/v1/jobs";
+/// [`RELEASES_PATH`] on the admin listener.
+pub const ADMIN_RELEASES_PATH: &str = "/admin/v1/releases";
+/// POST [`PruneRequest`] -> [`JobCreated`]; the job's result is a
+/// [`PruneReport`].
+pub const ADMIN_PRUNE_PATH: &str = "/admin/v1/prune";
+/// POST -> [`JobCreated`]; the job's result is `{"search_documents": n}`.
+pub const ADMIN_REINDEX_PATH: &str = "/admin/v1/reindex";
+/// POST -> [`JobCreated`]; the job's result is a [`CheckReport`].
+pub const ADMIN_CHECK_PATH: &str = "/admin/v1/check";
+
 // ---------- search ----------
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -89,6 +117,15 @@ pub struct OutputInfo {
     pub cached: bool,
 }
 
+/// Query parameters of [`PACKAGES_PATH`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PackageParams {
+    pub commit: String,
+    /// Default [`DEFAULT_SYSTEM`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PackageInfo {
     pub attr: String,
@@ -166,6 +203,16 @@ pub struct BulkResponse {
 
 // ---------- minimise ----------
 
+/// Query parameters of [`MINIMISE_PATH`].
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct MinimiseParams {
+    /// A derivation name matching this many indexed paths or more is too
+    /// common for a [`CLOSE_MISS`] warning; server default when `None`, 0
+    /// disables the check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_miss_threshold: Option<u64>,
+}
+
 /// Result of a minimise query.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MinimiseResponse {
@@ -210,6 +257,16 @@ pub const CLOSE_MISS: &str = "close_miss";
 
 // ---------- releases ----------
 
+/// Query parameters of [`RELEASES_PATH`] and [`ADMIN_RELEASES_PATH`].
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ReleasesParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    /// List each evaluation's errors, not only their count.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub errors: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReleaseInfo {
     pub name: String,
@@ -244,6 +301,15 @@ pub struct EvalInfo {
 
 // ---------- admin ----------
 
+/// Query parameters of an upload to [`ADMIN_INGEST_PATH`].
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct IngestParams {
+    /// Closure type to read a version 2 bundle (which predates closure
+    /// types) as; default `store-paths`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v2_closure_type: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IngestUrlRequest {
     pub url: String,
@@ -274,6 +340,14 @@ impl PruneRequest {
     pub fn is_empty(&self) -> bool {
         self.releases.is_empty() && self.commits.is_empty() && self.channels.is_empty()
     }
+}
+
+/// Query parameters of [`ADMIN_JOBS_PATH`].
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ListParams {
+    /// Default 50, at most 1000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -308,6 +382,43 @@ pub struct JobInfo {
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
     pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Result of an ingest job.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct IngestReport {
+    pub releases: Vec<String>,
+    /// `<release> <closure type>` for each closure ingested.
+    pub closures: Vec<String>,
+    pub store_paths: usize,
+    /// Store paths not previously in the database.
+    pub new_store_paths: usize,
+    pub references: usize,
+    pub missing: usize,
+    pub packages: usize,
+    pub outpaths: usize,
+    pub programs: usize,
+    /// `<release> <eval type>` for each evaluation ingested.
+    pub evals: Vec<String>,
+    pub eval_errors: usize,
+    /// Search documents updated; absent without search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_documents: Option<usize>,
+}
+
+/// Result of a prune job.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PruneReport {
+    /// Releases removed entirely.
+    pub releases: Vec<String>,
+    /// `<release> <closure type>` for closures removed from kept releases.
+    pub closures: Vec<String>,
+    pub store_paths_removed: u64,
+    pub packages_removed: u64,
+    /// Search documents after rebuilding the search index; absent without
+    /// search or when no release was removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_documents: Option<usize>,
 }
 
 /// One kind of index inconsistency found by a consistency check.

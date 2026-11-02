@@ -335,7 +335,7 @@ Both listeners are open by default. Optionally, callers log in with OIDC (the de
 | method | path | description |
 |---|---|---|
 | GET | `/auth/v1/config` | `{"issuer", "client_id", "scopes", "anonymous"}` for CLIs to log in with (`anonymous`: requests without a token are served too); 404 when the listener doesn't use OIDC |
-| GET | `/auth/v1/whoami` | `{"username", "session", "additional_info"}` of the caller (`additional_info`: the whoami expression's map, by default the token's claims); 401 when not logged in, 404 when the listener doesn't use OIDC |
+| GET | `/auth/v1/whoami` | `{"username", "session", "additional_info"}` of the caller (`additional_info`: the whoami expression's map, by default the token's claims), whether or not the authorisation policy admits them; 401 when not logged in, 404 when the listener doesn't use OIDC |
 
 ### Public API
 

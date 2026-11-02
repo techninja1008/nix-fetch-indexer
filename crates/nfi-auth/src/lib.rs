@@ -8,6 +8,8 @@
 //! client (`nfi-auth-client`). Services advertise their OIDC settings at
 //! [`CONFIG_PATH`] so that a CLI only needs the service URL to log in.
 
+pub mod oidc;
+
 use serde::{Deserialize, Serialize};
 
 /// Where a service advertises its [`AuthConfig`] (unauthenticated GET; 404

@@ -1,5 +1,5 @@
-//! HTTP routes: auth discovery, whoami and the mirror stream. Requests are
-//! authenticated and logged by `nfi_auth_server::middleware`.
+//! HTTP routes: auth discovery, whoami and the mirror stream. Mirror
+//! requests are authenticated and logged by `nfi_auth_server::middleware`.
 
 use crate::job::Update;
 use crate::{Auth, Mirror};
@@ -9,7 +9,7 @@ use axum::middleware;
 use axum::response::sse::{KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Extension, Json, Router};
+use axum::{Json, Router};
 use futures::{Stream, StreamExt};
 use nfi_auth_server::{AuthError, Caller, Vars};
 use std::collections::HashSet;
@@ -49,17 +49,14 @@ fn error(status: StatusCode, msg: impl Into<String>) -> Response {
 
 pub fn router(state: State) -> Router {
     let guard = state.auth.guard.clone();
-    let g = guard.clone();
-    let whoami =
-        move |c: Option<Extension<Caller>>| async move { g.whoami_response(c.as_ref().map(|c| &c.0)) };
-    let g = guard.clone();
-    let config = move || async move { g.config_response() };
     Router::new()
         .route(MIRROR_PATH, post(mirror))
-        .route(nfi_auth::WHOAMI_PATH, get(whoami))
-        .layer(middleware::from_fn_with_state(guard, nfi_auth_server::middleware))
+        .layer(middleware::from_fn_with_state(
+            guard.clone(),
+            nfi_auth_server::middleware,
+        ))
         .route("/healthz", get(|| async { "ok" }))
-        .route(nfi_auth::CONFIG_PATH, get(config))
+        .merge(guard.routes())
         .with_state(state)
 }
 

@@ -2,31 +2,23 @@
 //! caches per-callsite interest, so tests logging concurrently without a
 //! subscriber could hide these lines.
 
+use axum::Router;
 use axum::routing::get;
-use axum::{Extension, Router};
 use nfi_auth::{CONFIG_PATH, WHOAMI_PATH};
-use nfi_auth_server::{Authenticator, Caller, Expr, Guard, OidcSettings, middleware};
+use nfi_auth_server::{Authenticator, Expr, Guard, OidcSettings, middleware};
 use nfi_test_support::MockIdp;
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 
-/// Serve `guard` like the services do: `/x` and whoami behind the
-/// middleware, config and `/healthz` outside it.
+/// Serve `guard` like the services do: `/x` behind the middleware,
+/// `/healthz` and the guard's routes outside it.
 async fn serve(guard: Guard) -> String {
     let guard = Arc::new(guard);
-    let (g1, g2) = (guard.clone(), guard.clone());
-    let app =
-        Router::new()
-            .route("/x", get(|| async { "x" }))
-            .route(
-                WHOAMI_PATH,
-                get(move |c: Option<Extension<Caller>>| async move {
-                    g1.whoami_response(c.as_ref().map(|c| &c.0))
-                }),
-            )
-            .layer(axum::middleware::from_fn_with_state(guard, middleware))
-            .route("/healthz", get(|| async { "ok" }))
-            .route(CONFIG_PATH, get(move || async move { g2.config_response() }));
+    let app = Router::new()
+        .route("/x", get(|| async { "x" }))
+        .layer(axum::middleware::from_fn_with_state(guard.clone(), middleware))
+        .route("/healthz", get(|| async { "ok" }))
+        .merge(guard.routes());
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", l.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
@@ -104,6 +96,7 @@ async fn request_log() {
     get_(format!("{u}/x"), Some(&mallory)).await;
     get_(format!("{u}/x"), None).await;
     get_(format!("{u}{WHOAMI_PATH}"), Some(&alice)).await;
+    get_(format!("{u}{WHOAMI_PATH}"), Some("garbage")).await;
     get_(format!("{u}{CONFIG_PATH}"), None).await;
 
     let lines = log.lines();
@@ -126,6 +119,9 @@ async fn request_log() {
     let l = find(&["whoami expression failed"]);
     assert!(l.contains(" ERROR ") && l.contains("user=alice"), "{l}");
     find(&["path=/auth/v1/whoami user=alice", "request status=500"]);
+    // Whoami is outside the middleware but logs its rejections too.
+    let l = find(&["request rejected", "path=/auth/v1/whoami", "status=401"]);
+    assert!(l.contains("error=invalid token"), "{l}");
     // Config is outside the middleware: not logged.
     assert!(!lines.iter().any(|l| l.contains(CONFIG_PATH)), "{lines:#?}");
 }

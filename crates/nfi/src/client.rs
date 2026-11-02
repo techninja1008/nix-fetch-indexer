@@ -62,63 +62,61 @@ impl Client {
     // ----- public -----
 
     pub async fn search(&self, q: &SearchQuery) -> Result<SearchResponse> {
-        self.send(self.req(reqwest::Method::GET, "/v1/search").query(q))
+        self.send(self.req(reqwest::Method::GET, SEARCH_PATH).query(q))
             .await
     }
 
     pub async fn package(&self, attr: &str, commit: &str, system: Option<&str>) -> Result<PackageInfo> {
-        let mut q = vec![("commit", commit)];
-        if let Some(s) = system {
-            q.push(("system", s));
-        }
+        let q = PackageParams {
+            commit: commit.into(),
+            system: system.map(str::to_string),
+        };
         self.send(
-            self.req(reqwest::Method::GET, &format!("/v1/packages/{attr}"))
+            self.req(reqwest::Method::GET, &format!("{PACKAGES_PATH}/{attr}"))
                 .query(&q),
         )
         .await
     }
 
     pub async fn bulk(&self, req: &BulkRequest) -> Result<BulkResponse> {
-        self.send(self.req(reqwest::Method::POST, "/v1/lookup/bulk").json(req))
+        self.send(self.req(reqwest::Method::POST, BULK_PATH).json(req))
             .await
     }
 
-    /// `close_miss_threshold`: see `close_miss_warnings` in nfi-service
-    /// (server default when `None`, 0 disables).
+    /// `close_miss_threshold`: see [`MinimiseParams`].
     pub async fn minimise(
         &self,
         graph: &drv::ReducedGraph,
         close_miss_threshold: Option<u64>,
     ) -> Result<MinimiseResponse> {
-        let mut rb = self.req(reqwest::Method::POST, "/v1/minimise");
-        if let Some(t) = close_miss_threshold {
-            rb = rb.query(&[("close_miss_threshold", t)]);
-        }
-        self.send(rb.json(graph)).await
+        let q = MinimiseParams { close_miss_threshold };
+        self.send(
+            self.req(reqwest::Method::POST, MINIMISE_PATH)
+                .query(&q)
+                .json(graph),
+        )
+        .await
     }
 
     /// Indexed releases, optionally only those in `channel`; `errors` also
     /// lists each evaluation's errors, not only their count.
     pub async fn releases(&self, channel: Option<&str>, errors: bool) -> Result<Vec<ReleaseInfo>> {
-        self.releases_at("/v1/releases", channel, errors).await
+        self.releases_at(RELEASES_PATH, channel, errors).await
     }
 
     async fn releases_at(&self, path: &str, channel: Option<&str>, errors: bool) -> Result<Vec<ReleaseInfo>> {
-        let mut rb = self.req(reqwest::Method::GET, path);
-        if let Some(c) = channel {
-            rb = rb.query(&[("channel", c)]);
-        }
-        if errors {
-            rb = rb.query(&[("errors", "true")]);
-        }
-        self.send(rb).await
+        let q = ReleasesParams {
+            channel: channel.map(str::to_string),
+            errors,
+        };
+        self.send(self.req(reqwest::Method::GET, path).query(&q)).await
     }
 
     // ----- admin -----
 
     /// [`Client::releases`] through the admin listener.
     pub async fn admin_releases(&self, channel: Option<&str>, errors: bool) -> Result<Vec<ReleaseInfo>> {
-        self.releases_at("/admin/v1/releases", channel, errors).await
+        self.releases_at(ADMIN_RELEASES_PATH, channel, errors).await
     }
 
     /// Upload a bundle; `v2_closure_type` is the closure type to read a
@@ -130,12 +128,13 @@ impl Client {
         let len = f.metadata().await?.len();
         let stream = tokio_util::io::ReaderStream::with_capacity(f, 1 << 20);
         let body = reqwest::Body::wrap_stream(stream);
-        let mut rb = self.req(reqwest::Method::POST, "/admin/v1/ingest");
-        if let Some(t) = v2_closure_type {
-            rb = rb.query(&[("v2_closure_type", t)]);
-        }
+        let q = IngestParams {
+            v2_closure_type: v2_closure_type.map(str::to_string),
+        };
         self.send(
-            rb.header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            self.req(reqwest::Method::POST, ADMIN_INGEST_PATH)
+                .query(&q)
+                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
                 .header(reqwest::header::CONTENT_LENGTH, len)
                 .body(body),
         )
@@ -144,7 +143,7 @@ impl Client {
 
     pub async fn ingest_url(&self, url: &str, v2_closure_type: Option<&str>) -> Result<JobCreated> {
         self.send(
-            self.req(reqwest::Method::POST, "/admin/v1/ingest")
+            self.req(reqwest::Method::POST, ADMIN_INGEST_PATH)
                 .json(&IngestUrlRequest {
                     url: url.into(),
                     v2_closure_type: v2_closure_type.map(str::to_string),
@@ -154,31 +153,30 @@ impl Client {
     }
 
     pub async fn job(&self, id: i64) -> Result<JobInfo> {
-        self.send(self.req(reqwest::Method::GET, &format!("/admin/v1/jobs/{id}")))
+        self.send(self.req(reqwest::Method::GET, &format!("{ADMIN_JOBS_PATH}/{id}")))
             .await
     }
 
     pub async fn jobs(&self, limit: usize) -> Result<Vec<JobInfo>> {
-        self.send(
-            self.req(reqwest::Method::GET, "/admin/v1/jobs")
-                .query(&[("limit", limit)]),
-        )
-        .await
+        let q = ListParams {
+            limit: Some(limit.try_into().unwrap_or(i64::MAX)),
+        };
+        self.send(self.req(reqwest::Method::GET, ADMIN_JOBS_PATH).query(&q))
+            .await
     }
 
     pub async fn prune(&self, req: &PruneRequest) -> Result<JobCreated> {
-        self.send(self.req(reqwest::Method::POST, "/admin/v1/prune").json(req))
+        self.send(self.req(reqwest::Method::POST, ADMIN_PRUNE_PATH).json(req))
             .await
     }
 
     pub async fn reindex(&self) -> Result<JobCreated> {
-        self.send(self.req(reqwest::Method::POST, "/admin/v1/reindex"))
+        self.send(self.req(reqwest::Method::POST, ADMIN_REINDEX_PATH))
             .await
     }
 
     /// Queue a consistency check of the closure index.
     pub async fn check(&self) -> Result<JobCreated> {
-        self.send(self.req(reqwest::Method::POST, "/admin/v1/check"))
-            .await
+        self.send(self.req(reqwest::Method::POST, ADMIN_CHECK_PATH)).await
     }
 }
