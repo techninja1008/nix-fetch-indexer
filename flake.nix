@@ -3,14 +3,9 @@
 
   # Channel tarball (as used by the default `nixpkgs` registry entry).
   inputs.nixpkgs.url = "https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz";
-  inputs.crane.url = "github:ipetkov/crane";
 
   outputs =
-    {
-      self,
-      nixpkgs,
-      crane,
-    }:
+    { self, nixpkgs }:
     let
       systems = [
         "x86_64-linux"
@@ -25,13 +20,16 @@
       packages = forAll (
         pkgs:
         let
-          workspace = pkgs.callPackage ./nix/package.nix { craneLib = crane.mkLib pkgs; };
+          workspace = pkgs.callPackage ./nix/package.nix { };
           bins = {
-            inherit (workspace) nfi yoink;
-            nfi-admin = workspace.nfi_admin;
-            nfi-indexer = workspace.nfi_indexer;
-            nfi-service = workspace.nfi_service;
-            yoink-service = workspace.yoink_service;
+            inherit (workspace)
+              nfi
+              nfi-admin
+              nfi-indexer
+              nfi-service
+              yoink
+              yoink-service
+              ;
           };
           mkImage = pkgs.callPackage ./nix/images/mk-image.nix { };
           # Each image takes its binary as an argument, so e.g.
@@ -46,6 +44,7 @@
         {
           default = workspace;
           nix-fetch-indexer = workspace;
+          generate-cargo-nix = pkgs.callPackage ./nix/generate-cargo-nix.nix { };
         }
         // bins
         // linuxOnly pkgs {
@@ -63,9 +62,9 @@
         in
         {
           build = workspace;
-          # The full test suite (unit + integration).
-          tests = workspace.tests;
         }
+        # Each crate's tests (unit + integration), e.g. `test-nfi-service`.
+        // pkgs.lib.mapAttrs' (name: pkgs.lib.nameValuePair "test-${name}") workspace.tests
       );
 
       devShells = forAll (pkgs: {

@@ -31,6 +31,7 @@ Supporting libraries:
 ## Building
 
 ```sh
+nix run .#generate-cargo-nix   # once after cloning, see below
 nix build            # all binaries
 nix flake check      # also runs the full test suite, including integration tests
 nix build .#nfi      # a single binary
@@ -39,13 +40,21 @@ nix develop          # cargo, clippy, postgresql, meilisearch, nix-eval-jobs
 cargo build --release
 ```
 
-The packages live in [`nix/`](nix) and are loaded with `callPackage`. The workspace is built with [crane](https://github.com/ipetkov/crane): third-party dependencies are compiled in a separate derivation (`.#default.cargoArtifacts`) that is only rebuilt when `Cargo.toml` or `Cargo.lock` change, and the tests (`.#default.tests`) are a separate derivation, so a code change only recompiles the workspace's own crates before the binaries and images are ready. Each image takes its binary as an argument, so another build can be swapped in with `.override`:
+The packages live in [`nix/`](nix) and are loaded with `callPackage`. The workspace is built with [crate2nix](https://github.com/nix-community/crate2nix): every crate, third-party or from the workspace, is its own derivation, so a change only rebuilds the crates it touches and the crates that depend on them. Each workspace crate's tests are a separate check (e.g. `.#checks.x86_64-linux.test-nfi-service`) that runs them with [cargo-nextest](https://nexte.st), so binaries and images don't wait for them. The crate graph, `nix/Cargo.nix`, is generated from `Cargo.lock` and is not checked in. Generate it after cloning, and again after changing dependencies or workspace members:
+
+```sh
+nix run .#generate-cargo-nix
+```
+
+Flakes only see files that git knows about, so the generator records the (gitignored) file as intent-to-add: it shows as `A` in `git status` but its contents are not staged. Don't commit it, e.g. with `git commit -a`. Because the file is not in the repository, the flake can't be built straight from GitHub (`nix build github:...`); build from a checkout.
+
+Each image takes its binary as an argument, so another build can be swapped in with `.override`:
 
 ```nix
 nfi.packages.x86_64-linux.nfi-service-image.override { nfi-service = my-nfi-service; }
 ```
 
-Any package whose `meta.mainProgram` is set works. Each binary is its own output of the workspace package (`out` links to all of them), so an image only contains its own binary.
+Any package whose `meta.mainProgram` is set works. Each binary is its own package (the default package links to all of them), so an image only contains its own binary.
 
 ## Indexing
 
