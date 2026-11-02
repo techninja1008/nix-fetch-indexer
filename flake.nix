@@ -80,14 +80,12 @@
           default = workspace;
           nix-fetch-indexer = workspace;
           generate-cargo-nix = pkgs.callPackage ./nix/generate-cargo-nix.nix { };
-        }
-        // bins
-        // {
           # OCI images (load with `docker load < result`).
           nfi-service-image = image "nfi-service";
           yoink-service-image = image "yoink-service";
           nfi-indexer-image = image "nfi-indexer";
         }
+        // bins
       );
 
       checks = forAll (
