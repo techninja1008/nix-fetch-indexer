@@ -88,7 +88,11 @@ async fn other_refresh_errors_keep_the_refresh_token() {
     assert!(format!("{e:#}").contains("temporarily_unavailable"), "{e:#}");
     assert_eq!(kept().as_deref(), Some("rt-y"));
     idp.set_refresh_error(Some("invalid_client"));
-    assert!(creds(&idp, &store).current().await.is_err());
+    let e = creds(&idp, &store).current().await.unwrap_err();
+    assert!(
+        format!("{e:#}").contains("refreshing the login") && format!("{e:#}").contains("invalid_client"),
+        "{e:#}"
+    );
     assert_eq!(kept().as_deref(), Some("rt-y"));
     idp.set_refresh_error(None);
 
@@ -100,6 +104,56 @@ async fn other_refresh_errors_keep_the_refresh_token() {
 
     assert!(creds(&idp, &store).token(false).await.unwrap().is_some());
     assert_eq!(idp.refreshes(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn logout_waits_for_a_refresh() {
+    let idp = MockIdp::start("cli").await;
+    let d = tempfile::tempdir().unwrap();
+    let store = TokenStore::at(d.path());
+    plant(&idp, &store, "rt-z");
+    // The refresh holds the lock while the provider answers (100 ms); a
+    // logout meanwhile waits for it, so the refreshed login is not saved
+    // back after the logout removed it.
+    let (a, b) = (creds(&idp, &store), creds(&idp, &store));
+    let (refreshed, logged_out) = tokio::join!(a.token(false), async {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        b.logout().await
+    });
+    assert!(refreshed.unwrap().is_some());
+    assert_eq!(logged_out.unwrap(), Some(vec![]));
+    assert_eq!(idp.refreshes(), 1);
+    assert!(store.token(idp.issuer(), idp.client_id()).unwrap().is_none());
+    assert_eq!(creds(&idp, &store).current().await.unwrap(), None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn login_falls_back_to_the_device_flow() {
+    let idp = MockIdp::start("cli").await;
+    let evil = Impostor::start(&idp).await;
+    let d = tempfile::tempdir().unwrap();
+    let store = TokenStore::at(d.path());
+
+    // Refreshing the cached login fails (not `invalid_grant`): a warning,
+    // then a device login.
+    plant(&idp, &store, "rt-w");
+    idp.set_refresh_error(Some("server_error"));
+    let c = creds_for(evil.url(), &store);
+    assert_eq!(c.login(false).await.unwrap().username, "mallory");
+    assert_eq!(idp.device_logins(), 1);
+    let t = store.token(idp.issuer(), idp.client_id()).unwrap().unwrap();
+    assert_eq!(t.refresh_token.as_deref(), Some("rt-dev-0"));
+    assert!(creds_for(evil.url(), &store).current().await.unwrap().is_some());
+    idp.set_refresh_error(None);
+
+    // A service rejecting the new login (the provider has no whoami): its
+    // record is removed, the provider login kept.
+    let e = creds(&idp, &store).login(true).await.unwrap_err();
+    assert!(format!("{e:#}").contains("rejected the new login"), "{e:#}");
+    assert_eq!(idp.device_logins(), 2);
+    assert_eq!(creds(&idp, &store).current().await.unwrap(), None);
+    assert!(store.token(idp.issuer(), idp.client_id()).unwrap().is_some());
+    assert!(creds_for(evil.url(), &store).current().await.unwrap().is_some());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -133,6 +187,14 @@ async fn cached_login_is_only_sent_to_urls_logged_in_to() {
     assert_eq!(c.current().await.unwrap(), None);
     assert!(matches!(c.whoami().await.unwrap(), Identity::NotAuthenticated));
     assert!(evil.bearers().is_empty());
+
+    // Logging out of it removes nothing: it was not logged in.
+    assert_eq!(c.logout().await.unwrap(), None);
+    assert!(store.token(idp.issuer(), idp.client_id()).unwrap().is_some());
+    assert_eq!(
+        creds(&idp, &store).token(false).await.unwrap(),
+        Some(alice.clone())
+    );
 
     // Logging in there on purpose uses the provider login and records the
     // URL, without a new device login.

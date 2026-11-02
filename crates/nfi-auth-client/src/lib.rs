@@ -90,14 +90,26 @@ fn remove(path: &Path) -> Result<bool> {
     }
 }
 
-/// Create `dir` (and its parents) accessible by the owner only.
+/// Create `dir` (and its parents) accessible by the owner only. An
+/// existing `dir` of ours (older versions made it 0755) is made so too.
 fn create_dir(dir: &Path) -> Result<()> {
     let mut b = std::fs::DirBuilder::new();
     b.recursive(true);
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
     b.create(dir)
-        .with_context(|| format!("creating {}", dir.display()))
+        .with_context(|| format!("creating {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let m = std::fs::metadata(dir).with_context(|| format!("reading {}", dir.display()))?;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if m.uid() == unsafe { libc::geteuid() } && m.mode() & 0o777 != 0o700 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("setting the mode of {}", dir.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// The on-disk token cache.
@@ -137,11 +149,17 @@ impl TokenStore {
             .join(format!("{}.json", digest(&[url.trim_end_matches('/')])))
     }
 
+    /// Create the store's directories (see [`create_dir`]).
+    fn create_dirs(&self) -> Result<()> {
+        create_dir(&self.dir)?;
+        create_dir(&self.urls_dir())
+    }
+
     /// Write atomically; the temporary file is created with mode 0600.
-    fn write<T: Serialize>(path: &Path, v: &T) -> Result<()> {
+    fn write<T: Serialize>(&self, path: &Path, v: &T) -> Result<()> {
         use std::io::Write;
         let dir = path.parent().expect("has a parent");
-        create_dir(dir)?;
+        self.create_dirs()?;
         let mut f = tempfile::NamedTempFile::new_in(dir)?;
         f.write_all(&serde_json::to_vec_pretty(v)?)?;
         f.persist(path)
@@ -154,7 +172,7 @@ impl TokenStore {
     }
 
     pub fn save_token(&self, t: &StoredToken) -> Result<()> {
-        Self::write(&self.token_path(&t.issuer, &t.client_id), t)
+        self.write(&self.token_path(&t.issuer, &t.client_id), t)
     }
 
     pub fn remove_token(&self, issuer: &str, client_id: &str) -> Result<bool> {
@@ -169,7 +187,7 @@ impl TokenStore {
             issuer: issuer.into(),
             client_id: client_id.into(),
         };
-        Self::write(&self.url_path(url), &r)
+        self.write(&self.url_path(url), &r)
     }
 
     /// The provider login `url` was logged in with, if any.
@@ -211,7 +229,7 @@ impl TokenStore {
     /// released when the file is dropped.
     fn lock(&self, issuer: &str, client_id: &str) -> Result<std::fs::File> {
         let path = self.token_path(issuer, client_id).with_extension("lock");
-        create_dir(&self.dir)?;
+        self.create_dirs()?;
         let f = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -274,7 +292,11 @@ pub struct Credentials {
     token_hint: &'static str,
     /// `None` when there is nowhere to cache tokens (no HOME).
     store: Option<TokenStore>,
+    /// For the service.
     http: reqwest::Client,
+    /// For the provider: never follows redirects, which would replay a
+    /// refresh token or device code to wherever they point.
+    idp: reqwest::Client,
     discovered: OnceCell<Option<AuthConfig>>,
     current: Mutex<Option<String>>,
     noted_expiry: AtomicBool,
@@ -289,11 +311,8 @@ impl Credentials {
             explicit,
             token_hint,
             store: TokenStore::default_location().ok(),
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(60))
-                .user_agent(concat!("nfi-auth/", env!("CARGO_PKG_VERSION")))
-                .build()
-                .expect("building the HTTP client"),
+            http: client(reqwest::redirect::Policy::default()),
+            idp: client(reqwest::redirect::Policy::none()),
             discovered: OnceCell::new(),
             current: Mutex::new(None),
             noted_expiry: AtomicBool::new(false),
@@ -387,46 +406,68 @@ impl Credentials {
 
     /// Log in: unless `force`, keep a cached provider login the service
     /// accepts (even one made for another URL: the user chose to log in
-    /// here); otherwise run the device flow. Either way the URL is recorded
-    /// as logged in. Returns who the service sees.
+    /// here; if using it fails, with a warning); otherwise run the device
+    /// flow. Either way the URL is recorded as logged in. Returns who the
+    /// service sees.
     pub async fn login(&self, force: bool) -> Result<Whoami> {
         let cfg = self
             .config()
             .await?
             .with_context(|| format!("{} does not use OIDC login", self.url))?;
-        if !force
-            && let Some(store) = &self.store
-            && let Login::Usable(t) = self.provider(store, cfg).await?
-            && let Identity::User(w) = self.ask(Some(&t)).await?
-        {
-            store.record_url(&self.url, &cfg.issuer, &cfg.client_id)?;
-            self.remember(t);
-            return Ok(w);
+        if !force && let Some(store) = &self.store {
+            match self.reuse(store, cfg).await {
+                Ok(Some((t, w))) => {
+                    store.record_url(&self.url, &cfg.issuer, &cfg.client_id)?;
+                    self.remember(t);
+                    return Ok(w);
+                }
+                Ok(None) => {}
+                Err(e) => eprintln!("warning: not using the cached login: {e:#}"),
+            }
         }
         let t = self.device(cfg).await?;
         match self.ask(Some(&t)).await? {
             Identity::User(w) => Ok(w),
-            _ => bail!("{} rejected the new login", self.url),
+            _ => {
+                // Keep the provider login, but stop sending it here.
+                *self.current.lock().unwrap() = None;
+                if let Some(store) = &self.store {
+                    remove(&store.url_path(&self.url))?;
+                }
+                bail!("{} rejected the new login", self.url)
+            }
         }
+    }
+
+    /// The cached provider login and who the service sees with it, if it
+    /// accepts it.
+    async fn reuse(&self, store: &TokenStore, cfg: &AuthConfig) -> Result<Option<(String, Whoami)>> {
+        let Login::Usable(t) = self.provider(store, cfg).await? else {
+            return Ok(None);
+        };
+        Ok(match self.ask(Some(&t)).await? {
+            Identity::User(w) => Some((t, w)),
+            _ => None,
+        })
     }
 
     /// Log out of the service: forget the provider login it was logged in
     /// with, which also logs out of every other URL logged in with it.
-    /// `None` if it was not logged in, else those other URLs. Works offline
-    /// unless the URL has no record (then its settings are fetched, if
-    /// possible).
+    /// `None` if it was not logged in (it has no record: nothing is
+    /// removed), else those other URLs. Works offline.
     pub async fn logout(&self) -> Result<Option<Vec<String>>> {
         *self.current.lock().unwrap() = None;
         let Some(store) = &self.store else {
             return Ok(None);
         };
-        let (issuer, client_id) = match store.url_login(&self.url)? {
-            Some(r) => (r.issuer, r.client_id),
-            None => match self.config().await {
-                Ok(Some(c)) => (c.issuer.clone(), c.client_id.clone()),
-                _ => return Ok(None),
-            },
+        let Some(UrlLogin {
+            issuer, client_id, ..
+        }) = store.url_login(&self.url)?
+        else {
+            return Ok(None);
         };
+        // Not while another process refreshes it, which would save it again.
+        let _lock = self.lock(store, &issuer, &client_id).await?;
         let urls = store.urls(&issuer, &client_id)?;
         for u in &urls {
             remove(&store.url_path(u))?;
@@ -490,9 +531,9 @@ impl Credentials {
         Ok(l)
     }
 
-    /// Take the lock for refreshing or replacing the provider login.
-    async fn lock(&self, store: &TokenStore, cfg: &AuthConfig) -> Result<std::fs::File> {
-        let (s, i, c) = (store.clone(), cfg.issuer.clone(), cfg.client_id.clone());
+    /// Take the lock for refreshing, replacing or removing a provider login.
+    async fn lock(&self, store: &TokenStore, issuer: &str, client_id: &str) -> Result<std::fs::File> {
+        let (s, i, c) = (store.clone(), issuer.to_string(), client_id.to_string());
         tokio::task::spawn_blocking(move || s.lock(&i, &c)).await?
     }
 
@@ -507,7 +548,7 @@ impl Credentials {
             }) => return Ok(Login::Expired),
             Some(_) => {}
         }
-        let _lock = self.lock(store, cfg).await?;
+        let _lock = self.lock(store, &cfg.issuer, &cfg.client_id).await?;
         // Another process may have refreshed it meanwhile.
         let Some(t) = store.token(&cfg.issuer, &cfg.client_id)? else {
             return Ok(Login::Missing);
@@ -543,7 +584,7 @@ impl Credentials {
             .as_ref()
             .context("no token cache: set HOME, XDG_CACHE_HOME or NFI_TOKEN_CACHE")?;
         let t = self.device_login(cfg).await?;
-        let _lock = self.lock(store, cfg).await?;
+        let _lock = self.lock(store, &cfg.issuer, &cfg.client_id).await?;
         store.save_token(&t)?;
         store.record_url(&self.url, &cfg.issuer, &cfg.client_id)?;
         Ok(self.remember(t.id_token))
@@ -579,7 +620,7 @@ impl Credentials {
             issuer.trim_end_matches('/')
         );
         let r = self
-            .http
+            .idp
             .get(&u)
             .send()
             .await
@@ -596,7 +637,7 @@ impl Credentials {
         form: &[(&str, &str)],
     ) -> Result<Result<TokenResponse, TokenError>> {
         let r = self
-            .http
+            .idp
             .post(endpoint)
             .header(reqwest::header::ACCEPT, "application/json")
             .form(form)
@@ -660,7 +701,7 @@ impl Credentials {
         };
         let scope = cfg.scopes.join(" ");
         let r = self
-            .http
+            .idp
             .post(dev_ep)
             .header(reqwest::header::ACCEPT, "application/json")
             .form(&[("client_id", cfg.client_id.as_str()), ("scope", &scope)])
@@ -718,6 +759,15 @@ impl Credentials {
             }
         }
     }
+}
+
+fn client(redirect: reqwest::redirect::Policy) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .user_agent(concat!("nfi-auth/", env!("CARGO_PKG_VERSION")))
+        .redirect(redirect)
+        .build()
+        .expect("building the HTTP client")
 }
 
 /// `invalid_grant` or `invalid_grant: description`.
@@ -827,6 +877,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Directories made by older versions (0755) are made 0700.
+    #[cfg(unix)]
+    #[test]
+    fn store_dirs_are_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let s = TokenStore::at(d.path().join("t"));
+        let mode = |p: PathBuf| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        for dir in [s.dir.clone(), s.urls_dir()] {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        s.record_url("http://a", "i", "c").unwrap();
+        assert_eq!((mode(s.dir.clone()), mode(s.urls_dir())), (0o700, 0o700));
     }
 
     #[test]

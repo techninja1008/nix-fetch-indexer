@@ -225,9 +225,16 @@ async fn interactive_login_and_monitor() {
         o.text
     );
     assert_eq!(s.idp.device_logins(), 1);
-    let o = yoink_tty(&s.url, d.path(), &["logout".into()]).await;
+    // The NFI URL is the same service: logged out once, not reported twice.
+    let o = yoink_tty(
+        &s.url,
+        d.path(),
+        &["logout".into(), "--nfi-url".into(), format!("{}/", s.url)],
+    )
+    .await;
     assert_eq!(o.code, Some(0), "{}", o.text);
     assert!(o.text.contains("logged out of"), "{}", o.text);
+    assert!(!o.text.contains("not logged in"), "{}", o.text);
     // Logged out, `whoami` reports it rather than logging in.
     let o = yoink_tty(&s.url, d.path(), &["whoami".into()]).await;
     assert_eq!(o.code, Some(1), "{}", o.text);

@@ -120,10 +120,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Some(Cmd::Logout) => {
             let (mut done, mut ok) = (Vec::new(), true);
             for u in [url.clone(), nfi_url.clone()].into_iter().flatten() {
-                // Already logged out with the first URL's provider login.
+                // The first URL, or logged out with its provider login.
                 if done.iter().any(|d: &String| d == u.trim_end_matches('/')) {
                     continue;
                 }
+                done.push(u.trim_end_matches('/').to_string());
                 match nfi::logout(&Credentials::new("yoink", &u, None, ""), &u).await {
                     Ok(others) => done.extend(others),
                     Err(e) => {

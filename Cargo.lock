@@ -2026,6 +2026,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "hex",
+ "libc",
  "nfi-auth",
  "nfi-test-support",
  "reqwest",
