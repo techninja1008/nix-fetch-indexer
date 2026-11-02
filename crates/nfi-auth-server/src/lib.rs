@@ -11,10 +11,10 @@
 //! - `user`: `{"username": string, "session": string or null}`.
 //! - whatever else the service documents, e.g. `request`.
 
-use crate::AuthConfig;
 use anyhow::{Context as _, Result, bail};
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
+use nfi_auth::AuthConfig;
 use serde::Deserialize;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -180,8 +180,8 @@ impl Principal {
         v
     }
 
-    pub fn whoami(&self) -> crate::Whoami {
-        crate::Whoami {
+    pub fn whoami(&self) -> nfi_auth::Whoami {
+        nfi_auth::Whoami {
             username: self.username.clone(),
             session: self.session.clone(),
         }
@@ -200,6 +200,21 @@ pub struct OidcSettings {
     pub username: Option<Expr>,
     /// Optional credential or session id of the principal, for logs.
     pub session: Option<Expr>,
+}
+
+impl OidcSettings {
+    /// Settings for `issuer` and `client_id`, with every other field at its
+    /// default.
+    pub fn new(issuer: &str, client_id: &str) -> Self {
+        OidcSettings {
+            issuer: issuer.into(),
+            client_id: client_id.into(),
+            audience: None,
+            scopes: vec![],
+            username: None,
+            session: None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -257,12 +272,13 @@ impl Authenticator {
         })
     }
 
-    /// The settings advertised at [`crate::CONFIG_PATH`].
+    /// The settings advertised at [`nfi_auth::CONFIG_PATH`].
     pub fn config(&self) -> AuthConfig {
         AuthConfig {
             issuer: self.issuer.clone(),
             client_id: self.client_id.clone(),
             scopes: self.scopes.clone(),
+            anonymous: false,
         }
     }
 

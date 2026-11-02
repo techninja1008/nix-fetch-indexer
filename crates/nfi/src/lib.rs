@@ -1,10 +1,12 @@
-//! Support code for the `nfi` query CLI.
+//! Support code for the `nfi` query CLI, and its API client.
 
 pub mod auth;
+pub mod client;
+pub mod http;
 
 use anyhow::{Context, Result, bail};
-use nfi_api::BulkItem;
 use nfi_api::drv::ReducedGraph;
+use nfi_api::{BulkItem, EvalInfo, ReleaseInfo};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use std::io::Write;
@@ -128,7 +130,7 @@ pub fn derivation_graph(nix: &str, installables: &[String]) -> Result<ReducedGra
     }
     let v: serde_json::Value =
         serde_json::from_slice(&out.stdout).context("parsing nix derivation show output")?;
-    ReducedGraph::from_json(&v)
+    nfi_drv::reduce(&v)
 }
 
 /// Read a derivation graph (raw `nix derivation show` JSON or reduced) from
@@ -140,7 +142,7 @@ pub fn read_graph(path: &str) -> Result<ReducedGraph> {
         std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?
     };
     let v: serde_json::Value = serde_json::from_str(&text).with_context(|| format!("parsing {path}"))?;
-    ReducedGraph::from_json(&v)
+    nfi_drv::reduce(&v)
 }
 
 /// Parse a bulk item: `attr@commit[@system]` or whitespace-separated
@@ -183,6 +185,54 @@ pub fn read_items(path: &str, system: Option<&str>, outputs: &Option<Vec<String>
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .map(|l| parse_item(l, system, outputs))
         .collect()
+}
+
+/// The error count of `e`, falling back to the listed errors (services
+/// that predate `error_count`).
+pub fn error_count(e: &EvalInfo) -> Option<u64> {
+    e.error_count
+        .or_else(|| e.errors.as_ref().map(|e| e.len() as u64))
+}
+
+/// A human-readable table of releases, one per line after a header; listed
+/// errors follow their release, one evaluation per line.
+pub fn releases_table(rels: &[ReleaseInfo]) -> String {
+    let mut out = format!(
+        "{:<40} {:<18} {:<12} {:<42} {:<28} EVALS\n",
+        "RELEASE", "CHANNEL", "SERIES", "COMMIT", "DATASETS"
+    );
+    for r in rels {
+        // e.g. `helpers[direct,full] (2 errors)`, `store-paths`.
+        let evals: Vec<String> = r
+            .evals
+            .iter()
+            .map(|e| {
+                let mut s = e.eval_type.clone();
+                if e.closures.iter().any(|c| !c.is_empty()) {
+                    s += &format!("[{}]", e.closures.join(","));
+                }
+                if let Some(n) = error_count(e) {
+                    s += &format!(" ({n} errors)");
+                }
+                s
+            })
+            .collect();
+        out += &format!(
+            "{:<40} {:<18} {:<12} {:<42} {:<28} {}\n",
+            r.name,
+            r.channel,
+            r.series,
+            r.commit,
+            r.datasets.join(","),
+            evals.join(", ")
+        );
+        for e in &r.evals {
+            if let Some(errors) = e.errors.as_ref().filter(|e| !e.is_empty()) {
+                out += &format!("    {} errors: {}\n", e.eval_type, errors.join(" "));
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -229,5 +279,34 @@ mod tests {
         assert!(load_config(Some(&d.path().join("missing.toml"))).is_err());
         std::fs::write(&p, "bogus = 1\n").unwrap();
         assert!(load_config(Some(&p)).is_err());
+    }
+
+    #[test]
+    fn releases_table_counts_and_lists_errors() {
+        let eval = |errors: Option<Vec<&str>>| EvalInfo {
+            eval_type: "helpers".into(),
+            closures: vec!["direct".into()],
+            error_count: Some(2),
+            errors: errors.map(|e| e.into_iter().map(String::from).collect()),
+        };
+        let mut r = ReleaseInfo {
+            name: "nixos-25.05.1.aaaa".into(),
+            commit: "a".repeat(40),
+            channel: "nixos-25.05".into(),
+            series: "25.05".into(),
+            url: None,
+            datasets: vec!["closure".into()],
+            evals: vec![eval(None)],
+            indexed_at: chrono::DateTime::UNIX_EPOCH,
+        };
+        let t = releases_table(std::slice::from_ref(&r));
+        assert_eq!(t.lines().count(), 2, "{t}");
+        assert!(t.contains("helpers[direct] (2 errors)"), "{t}");
+        r.evals = vec![eval(Some(vec!["a@x86_64-linux", "b@aarch64-linux"]))];
+        let t = releases_table(&[r]);
+        assert!(
+            t.ends_with("    helpers errors: a@x86_64-linux b@aarch64-linux\n"),
+            "{t}"
+        );
     }
 }

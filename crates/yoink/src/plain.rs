@@ -81,7 +81,7 @@ impl Plain {
                     i.name,
                     s.phase_name(i),
                     format::readout(&p),
-                    p.percent()
+                    format::percent(&p)
                 ))
             })
             .collect()

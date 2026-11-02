@@ -6,8 +6,8 @@
 //! cache also remembers which [`AuthConfig`] each service URL advertised, so
 //! a cached token is sent without asking the service first.
 
-use crate::AuthConfig;
 use anyhow::{Context, Result, bail};
+use nfi_auth::AuthConfig;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::path::{Path, PathBuf};
@@ -29,7 +29,7 @@ pub struct StoredToken {
 impl StoredToken {
     /// Whether the ID token is still usable (unknown expiry counts as usable).
     pub fn is_fresh(&self) -> bool {
-        crate::jwt_expiry(&self.id_token).is_none_or(|exp| exp > now() + EXPIRY_MARGIN_SECS)
+        jwt_expiry(&self.id_token).is_none_or(|exp| exp > now() + EXPIRY_MARGIN_SECS)
     }
 }
 
@@ -229,7 +229,7 @@ impl Session {
 
     /// The auth settings a service advertises; `None` if it has no OIDC.
     pub async fn discover(&self, url: &str) -> Result<Option<AuthConfig>> {
-        let u = format!("{}{}", service_key(url), crate::CONFIG_PATH);
+        let u = format!("{}{}", service_key(url), nfi_auth::CONFIG_PATH);
         let r = self
             .http
             .get(&u)
@@ -522,6 +522,17 @@ pub fn interactive() -> bool {
     std::io::stderr().is_terminal()
 }
 
+/// Read the unverified `exp` claim of a JWT (seconds since the epoch).
+pub fn jwt_expiry(token: &str) -> Option<i64> {
+    use base64::Engine;
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    v.get("exp")?.as_i64()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,6 +555,7 @@ mod tests {
             issuer: "i".into(),
             client_id: "c".into(),
             scopes: vec!["openid".into()],
+            anonymous: false,
         };
         s.save_service("http://svc/", &c).unwrap();
         assert_eq!(s.service("http://svc").unwrap(), Some(c));
@@ -555,5 +567,14 @@ mod tests {
         }
         assert!(s.remove_token("i", "c").unwrap());
         assert!(!s.remove_token("i", "c").unwrap());
+    }
+
+    #[test]
+    fn expiry() {
+        use base64::Engine;
+        let enc = |s: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s);
+        let t = format!("{}.{}.sig", enc("{}"), enc(r#"{"exp":1234,"sub":"x"}"#));
+        assert_eq!(super::jwt_expiry(&t), Some(1234));
+        assert_eq!(super::jwt_expiry("garbage"), None);
     }
 }

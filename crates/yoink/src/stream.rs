@@ -1,12 +1,13 @@
 //! Drives the mirror request: streams events, and re-posts the PURLs still
 //! without a result whenever the stream ends early.
 
+use crate::client::{Client, EventStream};
 use crate::state::Conn;
+use nfi::http::HttpError;
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 use yoink_api::Event;
-use yoink_api::client::{Client, EventStream, HttpError};
 
 /// Reconnect delays: exponential from [`Backoff::FIRST`], capped at
 /// [`Backoff::MAX`]; give up after [`Backoff::GIVE_UP`] without progress.
@@ -61,7 +62,7 @@ fn describe(e: &anyhow::Error) -> String {
 /// Where to get a fresh token before reconnecting, when the token came from
 /// the login cache (ID tokens can expire during a long pull).
 pub struct Refresh {
-    pub session: nfi_auth::client::Session,
+    pub session: nfi_auth_client::Session,
     pub url: String,
 }
 

@@ -35,10 +35,25 @@ pub async fn gc(tx: &mut Transaction<'_, Postgres>) -> Result<(u64, u64)> {
     Ok((paths, packages))
 }
 
+/// The first commit of `req` that is not a valid commit prefix, if any.
+/// Commits select releases by prefix, so an empty one would select them all.
+pub fn invalid_commit(req: &PruneRequest) -> Option<&str> {
+    req.commits
+        .iter()
+        .map(String::as_str)
+        .find(|c| !is_commit_prefix(c))
+}
+
+/// Whether `s` is a non-empty string of hex digits (either case), usable as
+/// a commit prefix.
+pub fn is_commit_prefix(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 pub async fn prune(pool: &PgPool, req: &PruneRequest) -> Result<PruneReport> {
     // Commits become `LIKE` prefix patterns: an empty one would match every
     // release, and `%`/`_` would act as wildcards.
-    if let Some(c) = req.invalid_commit() {
+    if let Some(c) = invalid_commit(req) {
         bail!("invalid commit {c:?}: expected a non-empty hex commit prefix");
     }
     let types = req
@@ -140,4 +155,21 @@ pub async fn prune(pool: &PgPool, req: &PruneRequest) -> Result<PruneReport> {
         store_paths_removed: paths,
         packages_removed: packages,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prune_request_rejects_non_hex_commits() {
+        let req = |c: &str| PruneRequest {
+            commits: vec!["abc123".into(), c.into()],
+            ..Default::default()
+        };
+        assert_eq!(invalid_commit(&req("DEADbeef")), None);
+        for bad in ["", "%", "ab_c", "abc%", " abc", "xyz"] {
+            assert_eq!(invalid_commit(&req(bad)), Some(bad));
+        }
+    }
 }

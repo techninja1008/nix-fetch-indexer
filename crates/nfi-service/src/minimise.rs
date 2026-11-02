@@ -1,6 +1,7 @@
 //! Minimise planning: which cached paths are useful for building a graph.
 
-use crate::drv::{ReducedDrv, ReducedGraph};
+use nfi_api::drv::{ReducedDrv, ReducedGraph};
+use nfi_api::{CLOSE_MISS, UNINDEXED_NIXPKGS, Warning};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -112,7 +113,7 @@ impl<'g> Planner<'g> {
 
     /// The paths of the graph that are not known yet.
     pub fn remaining(&self) -> BTreeSet<String> {
-        let mut s = self.graph.all_paths();
+        let mut s = nfi_drv::all_paths(self.graph);
         s.retain(|p| !self.known.contains_key(p));
         s
     }
@@ -190,8 +191,6 @@ impl<'g> Planner<'g> {
     }
 }
 
-pub const UNINDEXED_NIXPKGS: &str = "unindexed_nixpkgs";
-
 /// Whether a derivation path is a final standard environment
 /// (`<hash>-stdenv-linux.drv` / `<hash>-stdenv-darwin.drv`, not a bootstrap stage).
 fn is_stdenv_drv(drv: &str) -> bool {
@@ -205,7 +204,7 @@ fn is_stdenv_drv(drv: &str) -> bool {
 /// revision that is not indexed (or with overlays/config that change
 /// stdenv). Only stdenvs the plan needs are considered: one beneath a cached
 /// path does not matter.
-pub fn anchor_warnings(plan: &Plan) -> Vec<crate::Warning> {
+pub fn anchor_warnings(plan: &Plan) -> Vec<Warning> {
     // Every needed final stdenv is reported: graphs can legitimately mix
     // several nixpkgs instances, and each unindexed one deserves a warning.
     let uncached: Vec<String> = plan
@@ -217,7 +216,7 @@ pub fn anchor_warnings(plan: &Plan) -> Vec<crate::Warning> {
     if uncached.is_empty() {
         return Vec::new();
     }
-    vec![crate::Warning {
+    vec![Warning {
         code: UNINDEXED_NIXPKGS.into(),
         message: format!(
             "the standard environment ({}) is not in the index: this graph was most likely evaluated from a \
@@ -233,7 +232,6 @@ pub fn anchor_warnings(plan: &Plan) -> Vec<crate::Warning> {
     }]
 }
 
-pub const CLOSE_MISS: &str = "close_miss";
 /// Default `close_miss_threshold`: names shared by this many indexed paths
 /// or more are too generic (e.g. `source`) to suggest anything.
 pub const DEFAULT_CLOSE_MISS_THRESHOLD: u64 = 100;
@@ -252,11 +250,7 @@ pub fn drv_name(drv: &str) -> &str {
 /// indexed. `indexed` gives the number of indexed paths with a name; names
 /// matching `threshold` or more paths (and 0, which disables the check) are
 /// ignored.
-pub fn close_miss_warnings(
-    plan: &Plan,
-    indexed: impl Fn(&str) -> u64,
-    threshold: u64,
-) -> Vec<crate::Warning> {
+pub fn close_miss_warnings(plan: &Plan, indexed: impl Fn(&str) -> u64, threshold: u64) -> Vec<Warning> {
     if threshold == 0 {
         return Vec::new();
     }
@@ -274,7 +268,7 @@ pub fn close_miss_warnings(
         .take(5)
         .map(|(d, n)| format!("{} ({n} indexed)", drv_name(d)))
         .collect();
-    vec![crate::Warning {
+    vec![Warning {
         code: CLOSE_MISS.into(),
         message: format!(
             "{} derivation(s) to build look like indexed paths with a different hash, e.g. {}: they are probably \
@@ -342,7 +336,7 @@ pub fn roots(hits: &BTreeSet<String>, edges: &[(String, String)]) -> Vec<String>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::drv::{ReducedDrv, ReducedGraph};
+    use nfi_api::drv::{ReducedDrv, ReducedGraph};
 
     fn drv(outs: &[(&str, Option<&str>)], inputs: &[(&str, &[&str])], srcs: &[&str]) -> ReducedDrv {
         ReducedDrv {
@@ -548,7 +542,7 @@ mod tests {
             ),
         );
         for g in [graph(), fetching, several] {
-            let paths: Vec<String> = g.all_paths().into_iter().collect();
+            let paths: Vec<String> = nfi_drv::all_paths(&g).into_iter().collect();
             for mask in 0..1u32 << paths.len() {
                 let cached = |p: &str| {
                     paths

@@ -1,35 +1,10 @@
 //! HTTP client for the query service (public and admin APIs).
 
-use crate::*;
+use crate::http::check;
 use anyhow::{Context, Result};
+use nfi_api::*;
 use std::path::Path;
 use std::time::Duration;
-
-/// A non-success HTTP response from the service.
-#[derive(Debug)]
-pub struct HttpError {
-    pub status: u16,
-    pub message: String,
-}
-
-impl std::fmt::Display for HttpError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match reqwest::StatusCode::from_u16(self.status) {
-            Ok(s) => write!(f, "HTTP {s}: {}", self.message),
-            Err(_) => write!(f, "HTTP {}: {}", self.status, self.message),
-        }
-    }
-}
-
-impl std::error::Error for HttpError {}
-
-impl HttpError {
-    /// Whether `e` is (or wraps) a 401 response.
-    pub fn is_unauthorized(e: &anyhow::Error) -> bool {
-        e.chain()
-            .any(|c| c.downcast_ref::<HttpError>().is_some_and(|h| h.status == 401))
-    }
-}
 
 #[derive(Clone)]
 pub struct Client {
@@ -72,18 +47,7 @@ impl Client {
             .send()
             .await
             .with_context(|| format!("connecting to {}", self.base))?;
-        let status = resp.status();
-        let bytes = resp.bytes().await?;
-        if !status.is_success() {
-            let msg = serde_json::from_slice::<ErrorBody>(&bytes)
-                .map(|e| e.error)
-                .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).into_owned());
-            return Err(HttpError {
-                status: status.as_u16(),
-                message: msg,
-            }
-            .into());
-        }
+        let bytes = check(resp).await?.bytes().await?;
         serde_json::from_slice(&bytes).context("decoding response")
     }
 
@@ -116,8 +80,8 @@ impl Client {
             .await
     }
 
-    /// `close_miss_threshold`: see `minimise::close_miss_warnings` (server
-    /// default when `None`, 0 disables).
+    /// `close_miss_threshold`: see `close_miss_warnings` in nfi-service
+    /// (server default when `None`, 0 disables).
     pub async fn minimise(
         &self,
         graph: &drv::ReducedGraph,

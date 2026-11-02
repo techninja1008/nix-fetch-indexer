@@ -22,11 +22,15 @@ See [DESIGN.md](DESIGN.md) for the full design.
 Supporting libraries:
 
 - `nfi-interchange`: the bundle format.
-- `nfi-api`: shared API types, the derivation-graph reducer, the minimise planner and an HTTP client.
+- `nfi-api`: shared API types (types only).
+- `nfi-drv`: the derivation-graph reducer.
 - `nfi-embedded-postgres`, `nfi-embedded-meilisearch`: supervised child-process PostgreSQL and Meilisearch for single-node mode.
 - `nfi-testenv`: ephemeral Postgres and Meilisearch for tests.
-- `nfi-auth`: OIDC token validation and CEL policies for services; device code login and the token cache for CLIs.
-- `yoink-api`, `yoink-server`, `yoink-mirror-http`: yoink's API types and client, service core (with the `Mirror` trait), and HTTP cache backend.
+- `nfi-test-support`: a mock OpenID provider and a pseudo-terminal runner for tests.
+- `nfi-auth`: authentication protocol types (types only); `nfi-auth-server`: OIDC token validation and CEL policies for services; `nfi-auth-client`: device code login and the token cache for CLIs.
+- `yoink-api`, `yoink-purl`, `yoink-server`, `yoink-mirror-http`: yoink's API types (types only), package URLs, service core (with the `Mirror` trait), and HTTP cache backend.
+
+API clients live with their CLIs: the `nfi` library has the nfi-service client, the `yoink` library the yoink client.
 
 ## Building
 

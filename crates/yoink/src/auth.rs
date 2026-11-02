@@ -1,7 +1,8 @@
 //! Tokens for the yoink and NFI services.
 
 use anyhow::Result;
-use nfi_auth::client::{Session, TokenStore};
+use nfi::http::is_unauthorized;
+use nfi_auth_client::{Session, TokenStore};
 use std::future::Future;
 
 pub const YOINK_HINT: &str = "run `yoink login` or set YOINK_TOKEN";
@@ -26,15 +27,6 @@ pub async fn bearer(
         Some(s) => s.bearer(url, explicit).await,
         None => Ok(explicit),
     }
-}
-
-/// Whether a request failed with HTTP 401.
-pub fn is_unauthorized(e: &anyhow::Error) -> bool {
-    nfi_api::client::HttpError::is_unauthorized(e)
-        || e.chain().any(|c| {
-            c.downcast_ref::<yoink_api::client::HttpError>()
-                .is_some_and(|h| h.status == 401)
-        })
 }
 
 /// Run `f` with `token`; on a 401, unless the token was `explicit`, log in

@@ -7,15 +7,15 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use nfi_auth::server::{Authenticator, Expr};
-use nfi_auth::testing::MockIdp;
+use nfi_auth_server::{Authenticator, Expr, OidcSettings};
 use nfi_interchange::nixbase32;
+use nfi_test_support::MockIdp;
 use sha2::Digest;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use yoink_api::Purl;
 use yoink_mirror_http::{Config, Credential, Endpoint, HttpMirror, NarLayout};
+use yoink_purl::Purl;
 use yoink_server::{Auth, api};
 
 type Files = Arc<Mutex<BTreeMap<String, Bytes>>>;
@@ -90,7 +90,7 @@ async fn stack(n: u8) -> Stack {
     .unwrap();
     let idp = MockIdp::start("yoink").await;
     let auth = Auth {
-        authenticator: Authenticator::new(idp.settings()).unwrap(),
+        authenticator: Authenticator::new(OidcSettings::new(idp.issuer(), idp.client_id())).unwrap(),
         request: Expr::new("true").unwrap(),
         purl: Expr::new("true").unwrap(),
     };
@@ -160,7 +160,7 @@ async fn pulls_into_the_target_cache() {
 }
 
 /// `yoink` on a pseudo-terminal with an empty token cache.
-async fn yoink_tty(url: &str, dir: &std::path::Path, args: &[String]) -> nfi_auth::testing::pty::PtyOutput {
+async fn yoink_tty(url: &str, dir: &std::path::Path, args: &[String]) -> nfi_test_support::pty::PtyOutput {
     let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_yoink"));
     c.args(args)
         .env("YOINK_URL", url)
@@ -171,7 +171,7 @@ async fn yoink_tty(url: &str, dir: &std::path::Path, args: &[String]) -> nfi_aut
         .env_remove("YOINK_TOKEN")
         .env_remove("YOINK_TOKEN_FILE")
         .env_remove("NFI_URL");
-    tokio::task::spawn_blocking(move || nfi_auth::testing::pty::run(c, 120, 40, Duration::from_secs(60)))
+    tokio::task::spawn_blocking(move || nfi_test_support::pty::run(c, 120, 40, Duration::from_secs(60)))
         .await
         .unwrap()
 }

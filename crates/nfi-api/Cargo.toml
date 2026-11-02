@@ -1,6 +1,6 @@
 [package]
 name = "nfi-api"
-description = "Shared API types and algorithms for nix-fetch-indexer"
+description = "API types shared by the nix-fetch-indexer service and CLIs"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,18 +8,7 @@ repository.workspace = true
 readme.workspace = true
 
 [dependencies]
-nfi-interchange.workspace = true
-anyhow.workspace = true
+nfi-auth.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
-hex.workspace = true
-sha2 = "0.10"
-base64 = "0.22"
-reqwest = { workspace = true, optional = true }
-futures = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
-tokio-util = { workspace = true, optional = true }
-
-[features]
-client = ["dep:reqwest", "dep:futures", "dep:tokio", "dep:tokio-util"]

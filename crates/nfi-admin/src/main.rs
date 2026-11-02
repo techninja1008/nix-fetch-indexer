@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use nfi::client::Client;
 use nfi::print_json;
-use nfi_api::client::Client;
 use nfi_api::{JobInfo, JobStatus, PruneRequest};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -236,7 +236,7 @@ async fn run(cli: Cli) -> Result<Outcome> {
         None => cli
             .token_file
             .as_deref()
-            .map(nfi_auth::client::read_token_file)
+            .map(nfi_auth_client::read_token_file)
             .transpose()?,
     };
     let login = nfi::auth::Login::new(
@@ -319,7 +319,7 @@ async fn exec(cmd: Cmd, json: bool, client: Client) -> Result<Outcome> {
             if json {
                 print_json(&rels)?;
             } else {
-                print!("{}", nfi_api::releases_table(&rels));
+                print!("{}", nfi::releases_table(&rels));
             }
             Ok(true)
         }

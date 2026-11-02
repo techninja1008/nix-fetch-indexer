@@ -319,7 +319,7 @@ pub async fn run_probes(nixpkgs: &Path, opts: &ProbeOptions) -> Result<ProbeRoot
         .args(&drvs);
         let json: serde_json::Value = serde_json::from_str(&run(c, "nix derivation show").await?)
             .context("parsing nix derivation show output")?;
-        let graph = ReducedGraph::from_json(&json)?;
+        let graph = nfi_drv::reduce(&json)?;
         let (mut nd, mut nf) = (0, 0);
         for (name, p) in &probes {
             let (direct, full) = probe_roots(&graph, p);

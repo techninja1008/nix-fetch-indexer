@@ -11,14 +11,15 @@ use axum::response::sse::{KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures::{Stream, StreamExt};
-use nfi_auth::server::{AuthError, Principal, Vars, bearer, request_var};
+use nfi_auth_server::{AuthError, Principal, Vars, bearer, request_var};
 use std::collections::HashSet;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::Instrument;
-use yoink_api::{ErrorBody, Event, LogLevel, MIRROR_PATH, MirrorRequest, Outcome, Purl};
+use yoink_api::{ErrorBody, Event, LogLevel, MIRROR_PATH, MirrorRequest, Outcome};
+use yoink_purl::Purl;
 
 /// Minimum interval between updates forwarded for one job, so fast progress
 /// reports don't flood the stream.
@@ -191,10 +192,31 @@ fn fatal(purl: &str, message: String) -> Vec<Event> {
     ]
 }
 
+/// The SSE `data:` payload of `e` (the fields without the tag).
+pub fn event_data(e: &Event) -> String {
+    let mut v = serde_json::to_value(e).expect("serialisable");
+    if let Some(o) = v.as_object_mut() {
+        o.remove("event");
+    }
+    v.to_string()
+}
+
 fn sse(e: &Event) -> axum::response::sse::Event {
     axum::response::sse::Event::default()
         .event(e.name())
-        .data(e.data())
+        .data(event_data(e))
+}
+
+/// `p` for CEL policies: `{type, namespace, name, version, qualifiers, subpath}`.
+pub fn purl_json(p: &Purl) -> serde_json::Value {
+    serde_json::json!({
+        "type": p.ty,
+        "namespace": p.namespace,
+        "name": p.name,
+        "version": p.version,
+        "qualifiers": p.qualifiers,
+        "subpath": p.subpath,
+    })
 }
 
 /// Dispatch each PURL to its job and merge the jobs' updates into one
@@ -224,7 +246,7 @@ fn events(
                         continue;
                     }
                 };
-                let mut pj = purl.to_json();
+                let mut pj = purl_json(&purl);
                 pj["raw"] = raw.clone().into();
                 vars.insert("purl".into(), pj);
                 if let Err(e) = s.auth.purl.authorize(&vars) {
@@ -266,4 +288,15 @@ fn events(
     futures::stream::once(async move { vec![phases] })
         .chain(rest)
         .flat_map(|evs| futures::stream::iter(evs.into_iter().map(|e| Ok(sse(&e)))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn purl_vars() {
+        let p = Purl::parse("pkg:maven/org.apache%2Fx/commons-io@2.6?repo=central&a=b#src/main").unwrap();
+        assert_eq!(purl_json(&p)["type"], "maven");
+    }
 }

@@ -14,12 +14,13 @@ pub use job::{Job, JobReporter, JobTable};
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use nfi_auth::server::{Authenticator, Expr, OidcSettings};
+use nfi_auth_server::{Authenticator, Expr, OidcSettings};
 use std::future::Future;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use yoink_api::{PhaseDef, Purl};
+use yoink_api::PhaseDef;
+use yoink_purl::Purl;
 
 /// A mirroring backend.
 pub trait Mirror: Send + Sync + 'static {

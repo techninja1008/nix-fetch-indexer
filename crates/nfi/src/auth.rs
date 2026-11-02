@@ -1,10 +1,11 @@
 //! Bearer tokens for the CLIs: an explicit token, else a cached OIDC login,
 //! logging in interactively after a 401.
 
+use crate::client::Client;
+use crate::http::is_unauthorized;
 use anyhow::{Context, Result};
-use nfi_api::client::{Client, HttpError};
 use nfi_auth::Whoami;
-use nfi_auth::client::{Session, TokenStore};
+use nfi_auth_client::{Session, TokenStore};
 
 pub struct Login {
     url: String,
@@ -62,7 +63,7 @@ impl Login {
         let client = self.client().await?;
         let sent = client.has_token();
         let e = match f(client).await {
-            Err(e) if HttpError::is_unauthorized(&e) && self.explicit.is_none() => e,
+            Err(e) if is_unauthorized(&e) && self.explicit.is_none() => e,
             r => return r,
         };
         let token = match &self.session {

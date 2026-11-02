@@ -13,7 +13,12 @@ readme = "README.md"
 nfi-interchange = { path = "crates/nfi-interchange" }
 nfi-api = { path = "crates/nfi-api" }
 nfi-auth = { path = "crates/nfi-auth" }
+nfi-auth-client = { path = "crates/nfi-auth-client" }
+nfi-auth-server = { path = "crates/nfi-auth-server" }
+nfi-test-support = { path = "crates/nfi-test-support" }
+nfi-drv = { path = "crates/nfi-drv" }
 yoink-api = { path = "crates/yoink-api" }
+yoink-purl = { path = "crates/yoink-purl" }
 yoink-server = { path = "crates/yoink-server" }
 yoink-mirror-http = { path = "crates/yoink-mirror-http" }
 anyhow = "1"

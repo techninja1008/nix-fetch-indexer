@@ -12,17 +12,22 @@ A single Cargo workspace:
 | `nfi-interchange` | lib | Interchange bundle data model, CBOR + compression codec, JSON codec, merge/split/filter |
 | `nfi-indexer` | bin | Indexers (`index --targets`: closure types `store-paths`, `helpers:direct` and `helpers:full`, `packages`, `outpaths`, `programs`), plus offline bundle tooling (`merge`, `split`, `filter`, `convert`, `inspect`) |
 | `nfi-service` | bin | Query service (axum HTTP/JSON, Postgres, Meilisearch) |
-| `nfi` | bin | Query CLI (non-administrative endpoints, release list, fetch hook, flake-ref resolution) |
+| `nfi` | bin | Query CLI (non-administrative endpoints, release list, fetch hook, flake-ref resolution); its library has the service's API client |
 | `nfi-admin` | bin | Admin CLI (ingest, list releases, prune, reindex, job status) |
 | `nfi-embedded-postgres` | lib | Supervised child-process PostgreSQL for single-node mode (`--embedded-postgres`) |
 | `nfi-embedded-meilisearch` | lib | Supervised child-process Meilisearch for single-node mode (`--embedded-meilisearch`) |
-| `nfi-api` | lib | Shared request/response types for the service and CLIs |
-| `nfi-auth` | lib | OIDC ID token validation, CEL claim extraction and authorisation (services); device code login and the token cache (CLIs) |
-| `yoink-api` | lib | yoink API types: PURLs, mirror stream events, SSE client |
+| `nfi-api` | lib | Shared request/response types for the service and CLIs (types only) |
+| `nfi-drv` | lib | Derivation graph reduction (`nix derivation show` to the reduced graph minimise takes) |
+| `nfi-auth` | lib | Authentication protocol types: the advertised OIDC settings, whoami, error bodies (types only) |
+| `nfi-auth-server` | lib | OIDC ID token validation, CEL claim extraction and authorisation (services) |
+| `nfi-auth-client` | lib | Device code login and the token cache (CLIs) |
+| `nfi-test-support` | lib | Test helpers: a mock OpenID provider, a pseudo-terminal runner |
+| `yoink-api` | lib | yoink API types: mirror requests and stream events (types only) |
+| `yoink-purl` | lib | Package URLs and the store paths they name |
 | `yoink-server` | lib | Core of the yoink service: arguments, tracing, auth, the mirror API, jobs and the `Mirror` trait |
 | `yoink-mirror-http` | lib | `Mirror` backend copying from one HTTP binary cache to another |
 | `yoink-service` | bin | The yoink service: `yoink-server` with the HTTP backend wired in |
-| `yoink` | bin | yoink CLI: resolve flakes through `nfi`, mirror their closures, show progress |
+| `yoink` | bin | yoink CLI: resolve flakes through `nfi`, mirror their closures, show progress; its library has the yoink API client |
 
 Packaging uses Nix flake packages for all binaries, plus a dev shell.
 OCI images for the service are built with Nix `dockerTools`. There is no Dockerfile.
@@ -301,7 +306,7 @@ A store path's references never change, so they are written only once, when the 
 
 Commands: `ingest <file|url>...`, `jobs [id]`, `releases`, `prune --release/--commit/--channel`, `reindex`, all with `--wait` support.
 
-## Authentication (`nfi-auth`)
+## Authentication (`nfi-auth`, `nfi-auth-server`, `nfi-auth-client`)
 
 OIDC is optional on `nfi-service` and required on `yoink-service`.
 

@@ -1,17 +1,10 @@
 //! HTTP client for the yoink service.
 
-use crate::{ErrorBody, Event, MIRROR_PATH, MirrorRequest};
 use anyhow::{Context, Result};
 use futures::stream::{BoxStream, StreamExt};
+use nfi::http::check;
 use std::time::Duration;
-
-/// A non-success HTTP response.
-#[derive(Debug, thiserror::Error)]
-#[error("HTTP {status}: {message}")]
-pub struct HttpError {
-    pub status: u16,
-    pub message: String,
-}
+use yoink_api::{Event, MIRROR_PATH, MirrorRequest};
 
 /// The service sends a keep-alive comment every 15 s; a stream silent for
 /// this long is considered dead.
@@ -55,22 +48,6 @@ impl Client {
         }
     }
 
-    async fn check(&self, resp: reqwest::Response) -> Result<reqwest::Response> {
-        let status = resp.status();
-        if status.is_success() {
-            return Ok(resp);
-        }
-        let bytes = resp.bytes().await.unwrap_or_default();
-        let message = serde_json::from_slice::<ErrorBody>(&bytes)
-            .map(|e| e.error)
-            .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).into_owned());
-        Err(HttpError {
-            status: status.as_u16(),
-            message,
-        }
-        .into())
-    }
-
     /// GET a JSON document.
     pub async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
         let r = self
@@ -78,7 +55,7 @@ impl Client {
             .send()
             .await
             .with_context(|| format!("connecting to {}", self.base))?;
-        Ok(self.check(r).await?.json().await?)
+        Ok(check(r).await?.json().await?)
     }
 
     /// Start mirroring `purls` and stream the events. The stream ends when
@@ -93,7 +70,7 @@ impl Client {
             .send()
             .await
             .with_context(|| format!("connecting to {}", self.base))?;
-        let r = self.check(r).await?;
+        let r = check(r).await?;
         let mut parser = SseParser::default();
         let s = r
             .bytes_stream()
@@ -104,7 +81,7 @@ impl Client {
                         .feed(&b)
                         .into_iter()
                         .filter_map(|(name, data)| {
-                            Event::from_sse(&name, &data)
+                            from_sse(&name, &data)
                                 .map(|r| r.with_context(|| format!("decoding {name} event")))
                         })
                         .collect(),
@@ -113,6 +90,21 @@ impl Client {
             .flat_map(futures::stream::iter);
         Ok(s.boxed())
     }
+}
+
+/// Parse an SSE event; `None` for event names this version doesn't know.
+pub fn from_sse(name: &str, data: &str) -> Option<serde_json::Result<Event>> {
+    if !matches!(name, "phases" | "status" | "log" | "result") {
+        return None;
+    }
+    let mut v: serde_json::Value = match serde_json::from_str(data) {
+        Ok(v) => v,
+        Err(e) => return Some(Err(e)),
+    };
+    if let Some(o) = v.as_object_mut() {
+        o.insert("event".into(), name.into());
+    }
+    Some(serde_json::from_value(v))
 }
 
 /// Incremental Server-Sent Events parser.

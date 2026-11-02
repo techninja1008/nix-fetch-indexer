@@ -8,18 +8,19 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures::StreamExt;
-use nfi_auth::server::{Authenticator, Expr};
-use nfi_auth::testing::MockIdp;
+use nfi_auth_server::{Authenticator, Expr, OidcSettings};
 use nfi_interchange::nixbase32;
+use nfi_test_support::MockIdp;
 use sha2::Digest;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use yoink_api::client::Client;
-use yoink_api::{Event, LogLevel, Outcome, Purl};
+use yoink::client::Client;
+use yoink_api::{Event, LogLevel, Outcome};
 use yoink_mirror_http::narinfo::Signer;
 use yoink_mirror_http::{Config, Credential, Endpoint, HttpMirror, NarLayout};
+use yoink_purl::Purl;
 use yoink_server::{Auth, api};
 
 #[derive(Default)]
@@ -146,7 +147,7 @@ async fn start(target: Cache, prefix: &str, f: impl FnOnce(&mut Config)) -> Env 
     let mirror = HttpMirror::new(cfg).await.unwrap();
     let idp = MockIdp::start("yoink").await;
     let auth = Auth {
-        authenticator: Authenticator::new(idp.settings()).unwrap(),
+        authenticator: Authenticator::new(OidcSettings::new(idp.issuer(), idp.client_id())).unwrap(),
         request: Expr::new("true").unwrap(),
         purl: Expr::new("true").unwrap(),
     };

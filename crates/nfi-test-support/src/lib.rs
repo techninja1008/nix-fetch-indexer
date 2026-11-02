@@ -6,7 +6,6 @@
 #[cfg(unix)]
 pub mod pty;
 
-use crate::server::OidcSettings;
 use axum::Router;
 use axum::extract::{Form, State};
 use axum::response::{IntoResponse, Response};
@@ -80,18 +79,6 @@ impl MockIdp {
 
     pub fn client_id(&self) -> &str {
         &self.inner.client_id
-    }
-
-    /// Settings for a service trusting this provider.
-    pub fn settings(&self) -> OidcSettings {
-        OidcSettings {
-            issuer: self.inner.issuer.clone(),
-            client_id: self.inner.client_id.clone(),
-            audience: None,
-            scopes: vec![],
-            username: None,
-            session: None,
-        }
     }
 
     /// Sign an ID token with `claims`, filling in `iss`, `aud`, `iat` and

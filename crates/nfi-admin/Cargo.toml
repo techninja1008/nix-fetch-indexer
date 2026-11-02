@@ -8,8 +8,8 @@ repository.workspace = true
 readme.workspace = true
 
 [dependencies]
-nfi-api = { workspace = true, features = ["client"] }
-nfi-auth = { workspace = true, features = ["client"] }
+nfi-api.workspace = true
+nfi-auth-client.workspace = true
 nfi = { path = "../nfi" }
 anyhow.workspace = true
 serde_json.workspace = true
@@ -18,7 +18,9 @@ tokio.workspace = true
 clap.workspace = true
 
 [dev-dependencies]
-nfi-auth = { workspace = true, features = ["testing"] }
+nfi-auth.workspace = true
+nfi-auth-server.workspace = true
+nfi-test-support.workspace = true
 nfi-service = { path = "../nfi-service" }
 reqwest.workspace = true
 nfi-testenv = { path = "../nfi-testenv" }

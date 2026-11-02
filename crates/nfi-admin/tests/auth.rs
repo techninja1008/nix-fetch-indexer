@@ -1,9 +1,9 @@
 //! The admin CLI against an OIDC-protected admin listener.
 
-use nfi_auth::client::{StoredToken, TokenStore};
-use nfi_auth::server::{Authenticator, Expr};
-use nfi_auth::testing::MockIdp;
+use nfi_auth_client::{StoredToken, TokenStore};
+use nfi_auth_server::{Authenticator, Expr, OidcSettings};
 use nfi_service::auth::{AdminAuth, ServiceAuth};
+use nfi_test_support::MockIdp;
 use serde_json::json;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -38,7 +38,7 @@ fn run(bin: &str, dir: &Path, env: &[(&str, &str)], args: &[&str]) -> Out {
 async fn tokens() {
     let idp = MockIdp::start("nfi").await;
     let auth = ServiceAuth {
-        oidc: Some(Authenticator::new(idp.settings()).unwrap()),
+        oidc: Some(Authenticator::new(OidcSettings::new(idp.issuer(), idp.client_id())).unwrap()),
         allow_anonymous: false,
         main_authz: Expr::new("true").unwrap(),
         admin: AdminAuth::Oidc(Expr::new("user.username == 'root'").unwrap()),

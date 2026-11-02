@@ -227,7 +227,7 @@ impl Counts {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use yoink_api::Purl;
+    use yoink_purl::Purl;
 
     pub fn purl(n: u8, name: &str) -> String {
         let h = format!("{n}xy6xjvbl4bm3pq4w6p2b6vfffw4vi9b");

@@ -104,7 +104,7 @@ struct OidcArgs {
 }
 
 fn service_auth(admin_token_file: Option<&Path>, o: &OidcArgs) -> Result<ServiceAuth> {
-    use nfi_auth::server::{Authenticator, Expr, OidcSettings, read_trimmed};
+    use nfi_auth_server::{Authenticator, Expr, OidcSettings, read_trimmed};
     let oidc = match (&o.oidc_issuer, &o.oidc_client_id) {
         (Some(issuer), Some(client_id)) => Some(Authenticator::new(OidcSettings {
             issuer: issuer.clone(),

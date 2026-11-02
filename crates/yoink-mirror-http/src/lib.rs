@@ -28,7 +28,8 @@ use sha2::Digest;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use yoink_api::{NixTarget, PhaseDef, Purl, Unit};
+use yoink_api::{PhaseDef, Unit};
+use yoink_purl::{NixTarget, Purl};
 use yoink_server::{Job, JobReporter, JobTable, Mirror};
 
 pub const QUEUED: &str = "queued";

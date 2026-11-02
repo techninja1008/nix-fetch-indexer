@@ -1,14 +1,15 @@
 //! `yoink <TARGET>...`: resolve targets to PURLs, start the mirror request
 //! and monitor it until every PURL has a result.
 
-use crate::auth::{NFI_HINT, YOINK_HINT, bearer, is_unauthorized, with_login};
+use crate::auth::{NFI_HINT, YOINK_HINT, bearer, with_login};
 use crate::plain::{Plain, summary};
 use crate::state::{Conn, PlanSummary, State};
 use crate::stream::{Msg, Refresh, drive};
 use crate::targets::{Target, classify, closure_purls, dedupe};
 use crate::tui;
 use anyhow::{Context, Result, bail};
-use nfi_auth::client::Session;
+use nfi::http::is_unauthorized;
+use nfi_auth_client::Session;
 use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -44,7 +45,7 @@ async fn resolve_flakes(
     let cmt = o.close_miss_threshold;
     let r = with_login(session, &nfi_url, &mut token, explicit, NFI_HINT, |t| {
         let (graph, url) = (&graph, &nfi_url);
-        async move { nfi_api::client::Client::new(url, t)?.minimise(graph, cmt).await }
+        async move { nfi::client::Client::new(url, t)?.minimise(graph, cmt).await }
     })
     .await
     .context("minimising against NFI")?;
@@ -123,7 +124,7 @@ pub async fn pull(o: PullOptions) -> Result<ExitCode> {
     if token.is_none() {
         bail!("{} requires authentication; {YOINK_HINT}", o.url);
     }
-    let mut client = yoink_api::client::Client::new(&o.url, token.clone())?;
+    let mut client = crate::client::Client::new(&o.url, token.clone())?;
     let mut first = client.mirror(&purls).await;
     if let Err(e) = &first
         && !explicit

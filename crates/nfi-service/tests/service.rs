@@ -209,7 +209,7 @@ async fn ingest_lookup_bulk_minimise_prune() {
     cl.sort();
     assert_eq!(m.closure, cl);
     // The reduced form gives the same answer.
-    let reduced = nfi_api::drv::ReducedGraph::from_json(&graph).unwrap();
+    let reduced = nfi_drv::reduce(&graph).unwrap();
     let (_, m2): (u16, MinimiseResponse) = c
         .post("/v1/minimise", &serde_json::to_value(&reduced).unwrap())
         .await;

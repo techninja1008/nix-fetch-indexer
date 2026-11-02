@@ -11,7 +11,6 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use nfi_api::drv::ReducedGraph;
 use nfi_api::*;
 use serde::Deserialize;
 
@@ -75,7 +74,7 @@ pub fn admin_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-fn admin_oidc(s: &AppState) -> Option<&nfi_auth::server::Authenticator> {
+fn admin_oidc(s: &AppState) -> Option<&nfi_auth_server::Authenticator> {
     match s.auth.admin {
         AdminAuth::Oidc(_) => s.auth.oidc.as_ref(),
         _ => None,
@@ -145,7 +144,7 @@ async fn bulk(State(s): State<AppState>, Json(req): Json<BulkRequest>) -> R<Bulk
 
 #[derive(Deserialize)]
 struct MinimiseParams {
-    /// See `nfi_api::minimise::close_miss_warnings`; 0 disables the check.
+    /// See `minimise::close_miss_warnings`; 0 disables the check.
     close_miss_threshold: Option<u64>,
 }
 
@@ -163,14 +162,13 @@ async fn minimise(
             "Expected request with `Content-Type: application/json`",
         ));
     }
-    let graph =
-        ReducedGraph::from_slice(&body).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let graph = nfi_drv::parse(&body).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     if graph.derivations.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "no derivations in request"));
     }
     let threshold = p
         .close_miss_threshold
-        .unwrap_or(nfi_api::minimise::DEFAULT_CLOSE_MISS_THRESHOLD);
+        .unwrap_or(crate::minimise::DEFAULT_CLOSE_MISS_THRESHOLD);
     Ok(Json(query::minimise(&s.pool, &graph, threshold).await?))
 }
 
@@ -321,7 +319,7 @@ async fn prune(State(s): State<AppState>, Json(req): Json<PruneRequest>) -> Resu
             "specify releases, commits or channels to prune",
         ));
     }
-    if let Some(c) = req.invalid_commit() {
+    if let Some(c) = crate::prune::invalid_commit(&req) {
         return Err(err(
             StatusCode::BAD_REQUEST,
             format!("invalid commit {c:?}: expected a non-empty hex commit prefix"),

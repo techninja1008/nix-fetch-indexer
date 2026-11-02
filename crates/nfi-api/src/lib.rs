@@ -1,11 +1,8 @@
-//! Request/response types shared by the query service and CLIs, plus the
-//! derivation-graph reduction and minimise planning algorithms.
+//! Request/response types shared by the query service and CLIs.
 
-#[cfg(feature = "client")]
-pub mod client;
 pub mod drv;
-pub mod minimise;
 
+pub use nfi_auth::ErrorBody;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -205,6 +202,12 @@ pub struct Warning {
     pub paths: Vec<String>,
 }
 
+/// [`Warning::code`]: the graph was most likely evaluated from a nixpkgs
+/// revision that is not indexed.
+pub const UNINDEXED_NIXPKGS: &str = "unindexed_nixpkgs";
+/// [`Warning::code`]: derivations to build whose name matches indexed paths.
+pub const CLOSE_MISS: &str = "close_miss";
+
 // ---------- releases ----------
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -239,56 +242,6 @@ pub struct EvalInfo {
     pub errors: Option<Vec<String>>,
 }
 
-impl EvalInfo {
-    /// The error count, falling back to the listed errors (services that
-    /// predate `error_count`).
-    pub fn error_count(&self) -> Option<u64> {
-        self.error_count
-            .or_else(|| self.errors.as_ref().map(|e| e.len() as u64))
-    }
-}
-
-/// A human-readable table of releases, one per line after a header; listed
-/// errors follow their release, one evaluation per line.
-pub fn releases_table(rels: &[ReleaseInfo]) -> String {
-    let mut out = format!(
-        "{:<40} {:<18} {:<12} {:<42} {:<28} EVALS\n",
-        "RELEASE", "CHANNEL", "SERIES", "COMMIT", "DATASETS"
-    );
-    for r in rels {
-        // e.g. `helpers[direct,full] (2 errors)`, `store-paths`.
-        let evals: Vec<String> = r
-            .evals
-            .iter()
-            .map(|e| {
-                let mut s = e.eval_type.clone();
-                if e.closures.iter().any(|c| !c.is_empty()) {
-                    s += &format!("[{}]", e.closures.join(","));
-                }
-                if let Some(n) = e.error_count() {
-                    s += &format!(" ({n} errors)");
-                }
-                s
-            })
-            .collect();
-        out += &format!(
-            "{:<40} {:<18} {:<12} {:<42} {:<28} {}\n",
-            r.name,
-            r.channel,
-            r.series,
-            r.commit,
-            r.datasets.join(","),
-            evals.join(", ")
-        );
-        for e in &r.evals {
-            if let Some(errors) = e.errors.as_ref().filter(|e| !e.is_empty()) {
-                out += &format!("    {} errors: {}\n", e.eval_type, errors.join(" "));
-            }
-        }
-    }
-    out
-}
-
 // ---------- admin ----------
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -321,21 +274,6 @@ impl PruneRequest {
     pub fn is_empty(&self) -> bool {
         self.releases.is_empty() && self.commits.is_empty() && self.channels.is_empty()
     }
-
-    /// The first commit that is not a valid commit prefix, if any. Commits
-    /// select releases by prefix, so an empty one would select them all.
-    pub fn invalid_commit(&self) -> Option<&str> {
-        self.commits
-            .iter()
-            .map(String::as_str)
-            .find(|c| !is_commit_prefix(c))
-    }
-}
-
-/// Whether `s` is a non-empty string of hex digits (either case), usable as
-/// a commit prefix.
-pub fn is_commit_prefix(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -399,55 +337,4 @@ pub struct CheckReport {
     pub eval_errors: u64,
     /// Only kinds with at least one occurrence are listed.
     pub issues: Vec<CheckIssue>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ErrorBody {
-    pub error: String,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn releases_table_counts_and_lists_errors() {
-        let eval = |errors: Option<Vec<&str>>| EvalInfo {
-            eval_type: "helpers".into(),
-            closures: vec!["direct".into()],
-            error_count: Some(2),
-            errors: errors.map(|e| e.into_iter().map(String::from).collect()),
-        };
-        let mut r = ReleaseInfo {
-            name: "nixos-25.05.1.aaaa".into(),
-            commit: "a".repeat(40),
-            channel: "nixos-25.05".into(),
-            series: "25.05".into(),
-            url: None,
-            datasets: vec!["closure".into()],
-            evals: vec![eval(None)],
-            indexed_at: chrono::DateTime::UNIX_EPOCH,
-        };
-        let t = releases_table(std::slice::from_ref(&r));
-        assert_eq!(t.lines().count(), 2, "{t}");
-        assert!(t.contains("helpers[direct] (2 errors)"), "{t}");
-        r.evals = vec![eval(Some(vec!["a@x86_64-linux", "b@aarch64-linux"]))];
-        let t = releases_table(&[r]);
-        assert!(
-            t.ends_with("    helpers errors: a@x86_64-linux b@aarch64-linux\n"),
-            "{t}"
-        );
-    }
-
-    #[test]
-    fn prune_request_rejects_non_hex_commits() {
-        let req = |c: &str| PruneRequest {
-            commits: vec!["abc123".into(), c.into()],
-            ..Default::default()
-        };
-        assert_eq!(req("DEADbeef").invalid_commit(), None);
-        for bad in ["", "%", "ab_c", "abc%", " abc", "xyz"] {
-            assert_eq!(req(bad).invalid_commit(), Some(bad));
-        }
-    }
 }

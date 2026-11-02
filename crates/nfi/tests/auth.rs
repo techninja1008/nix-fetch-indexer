@@ -1,10 +1,10 @@
 //! The query CLI against an OIDC-protected service: explicit tokens, cached
 //! logins and the hint shown when a login is needed.
 
-use nfi_auth::client::{StoredToken, TokenStore};
-use nfi_auth::server::{Authenticator, Expr};
-use nfi_auth::testing::MockIdp;
+use nfi_auth_client::{StoredToken, TokenStore};
+use nfi_auth_server::{Authenticator, Expr, OidcSettings};
 use nfi_service::auth::{AdminAuth, ServiceAuth};
+use nfi_test_support::MockIdp;
 use serde_json::json;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -39,7 +39,7 @@ fn run(bin: &str, dir: &Path, env: &[(&str, &str)], args: &[&str]) -> Out {
 async fn tokens() {
     let idp = MockIdp::start("nfi").await;
     let auth = ServiceAuth {
-        oidc: Some(Authenticator::new(idp.settings()).unwrap()),
+        oidc: Some(Authenticator::new(OidcSettings::new(idp.issuer(), idp.client_id())).unwrap()),
         allow_anonymous: false,
         main_authz: Expr::new("true").unwrap(),
         admin: AdminAuth::Open,
@@ -110,7 +110,7 @@ async fn tokens() {
 }
 
 /// Run `nfi` on a pseudo-terminal, so that it may prompt for a login.
-async fn nfi_tty(dir: &Path, args: &[&str]) -> nfi_auth::testing::pty::PtyOutput {
+async fn nfi_tty(dir: &Path, args: &[&str]) -> nfi_test_support::pty::PtyOutput {
     let mut c = Command::new(env!("CARGO_BIN_EXE_nfi"));
     c.args(args)
         .env("XDG_CONFIG_HOME", dir)
@@ -118,7 +118,7 @@ async fn nfi_tty(dir: &Path, args: &[&str]) -> nfi_auth::testing::pty::PtyOutput
         .env_remove("NFI_TOKEN")
         .env_remove("NFI_TOKEN_FILE");
     tokio::task::spawn_blocking(move || {
-        nfi_auth::testing::pty::run(c, 100, 30, std::time::Duration::from_secs(60))
+        nfi_test_support::pty::run(c, 100, 30, std::time::Duration::from_secs(60))
     })
     .await
     .unwrap()
@@ -128,7 +128,7 @@ async fn nfi_tty(dir: &Path, args: &[&str]) -> nfi_auth::testing::pty::PtyOutput
 async fn interactive_login() {
     let idp = MockIdp::start("nfi").await;
     let auth = ServiceAuth {
-        oidc: Some(Authenticator::new(idp.settings()).unwrap()),
+        oidc: Some(Authenticator::new(OidcSettings::new(idp.issuer(), idp.client_id())).unwrap()),
         allow_anonymous: false,
         main_authz: Expr::new("true").unwrap(),
         admin: AdminAuth::Open,

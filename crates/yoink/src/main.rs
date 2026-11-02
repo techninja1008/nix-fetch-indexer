@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{ArgAction, Args, Parser, Subcommand};
 use nfi_auth::Whoami;
-use nfi_auth::client::{Session, TokenStore, explicit};
+use nfi_auth_client::{Session, TokenStore, explicit};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use yoink::auth::{NFI_HINT, YOINK_HINT, bearer, with_login};
@@ -75,12 +75,12 @@ enum Cmd {
     Whoami,
 }
 
-fn prompt(p: &nfi_auth::client::DevicePrompt) {
+fn prompt(p: &nfi_auth_client::DevicePrompt) {
     eprintln!("{p}");
 }
 
 async fn whoami(url: &str, token: Option<String>) -> Result<Whoami> {
-    yoink_api::client::Client::new(url, token)?
+    yoink::client::Client::new(url, token)?
         .get_json(nfi_auth::WHOAMI_PATH)
         .await
 }

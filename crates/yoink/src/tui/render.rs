@@ -34,7 +34,7 @@ pub fn status_text(s: &State, item: &Item) -> (String, Style) {
         None => match (&item.phase, item.progress) {
             (None, _) => ("    ".into(), Style::new()),
             (Some(_), Some(p)) => (
-                format!("{}{:>3}", s.phase_abbrev(item), p.percent()),
+                format!("{}{:>3}", s.phase_abbrev(item), format::percent(&p)),
                 Style::new().fg(Color::Cyan),
             ),
             (Some(_), None) => (
@@ -243,7 +243,7 @@ fn logs(f: &mut Frame, app: &mut App, item: Option<usize>, area: Rect) {
                 None => {
                     let p = it
                         .progress
-                        .map(|p| format!(" {} ({}%)", format::readout(&p), p.percent()));
+                        .map(|p| format!(" {} ({}%)", format::readout(&p), format::percent(&p)));
                     format!("{}{}", s.phase_name(it), p.unwrap_or_default())
                 }
             };

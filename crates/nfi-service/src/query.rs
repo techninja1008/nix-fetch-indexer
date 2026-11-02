@@ -1,5 +1,6 @@
 //! Lookup, bulk lookup and minimise queries.
 
+use crate::prune::is_commit_prefix;
 use anyhow::Result;
 use nfi_api::drv::ReducedGraph;
 use nfi_api::*;
@@ -188,7 +189,7 @@ pub async fn minimise(
     graph: &ReducedGraph,
     close_miss_threshold: u64,
 ) -> Result<MinimiseResponse> {
-    use nfi_api::minimise as m;
+    use crate::minimise as m;
     // Look up only the paths the plan consults, in rounds: nothing beneath a
     // hit needs looking up, and that is most of a graph built on an indexed
     // release.
@@ -235,7 +236,7 @@ pub async fn minimise(
         |n| indexed.get(n).copied().unwrap_or(0),
         close_miss_threshold,
     ));
-    let roots = nfi_api::minimise::roots(&plan.hits, &edges);
+    let roots = m::roots(&plan.hits, &edges);
     let (nar_size, file_size) = sizes(&nodes);
     Ok(MinimiseResponse {
         requested: plan.requested,

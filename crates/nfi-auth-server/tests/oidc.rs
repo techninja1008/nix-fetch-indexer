@@ -1,12 +1,12 @@
-use nfi_auth::client::{Session, TokenStore};
-use nfi_auth::server::{AuthError, Authenticator, Expr, OidcSettings};
-use nfi_auth::testing::MockIdp;
+use nfi_auth_client::{Session, TokenStore};
+use nfi_auth_server::{AuthError, Authenticator, Expr, OidcSettings};
+use nfi_test_support::MockIdp;
 use serde_json::json;
 
 #[tokio::test]
 async fn validates_tokens() {
     let idp = MockIdp::start("cli").await;
-    let mut s = idp.settings();
+    let mut s = OidcSettings::new(idp.issuer(), idp.client_id());
     s.session = Some(Expr::new("claims.sid").unwrap());
     let a = Authenticator::new(s).unwrap();
     let p = a
@@ -43,7 +43,7 @@ async fn validates_tokens() {
     ));
 
     // A username expression yielding nothing forbids the token.
-    let mut s = idp.settings();
+    let mut s = OidcSettings::new(idp.issuer(), idp.client_id());
     s.username = Some(Expr::new("has(claims.email) ? claims.email : null").unwrap());
     let a = Authenticator::new(s).unwrap();
     assert!(matches!(
@@ -71,7 +71,7 @@ async fn unreachable_provider() {
 #[tokio::test]
 async fn device_login_and_refresh() {
     let idp = MockIdp::start("cli").await;
-    let a = Authenticator::new(idp.settings()).unwrap();
+    let a = Authenticator::new(OidcSettings::new(idp.issuer(), idp.client_id())).unwrap();
     let d = tempfile::tempdir().unwrap();
     let session = Session::new(TokenStore::at(d.path())).unwrap();
     let cfg = a.config();

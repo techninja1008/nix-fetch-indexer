@@ -1,13 +1,13 @@
 //! OIDC authentication and CEL authorisation of both listeners.
 
-use nfi_auth::server::{Authenticator, Expr};
-use nfi_auth::testing::MockIdp;
 use nfi_auth::{AuthConfig, CONFIG_PATH, WHOAMI_PATH, Whoami};
+use nfi_auth_server::{Authenticator, Expr, OidcSettings};
 use nfi_service::auth::{AdminAuth, ServiceAuth};
+use nfi_test_support::MockIdp;
 use serde_json::json;
 
 fn auth(idp: &MockIdp, allow_anonymous: bool, admin: AdminAuth) -> ServiceAuth {
-    let mut s = idp.settings();
+    let mut s = OidcSettings::new(idp.issuer(), idp.client_id());
     s.session = Some(Expr::new("has(claims.sid) ? claims.sid : null").unwrap());
     ServiceAuth {
         oidc: Some(Authenticator::new(s).unwrap()),

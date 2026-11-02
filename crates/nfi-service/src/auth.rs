@@ -6,7 +6,7 @@
 //! - Admin API: open, a fixed bearer token, or OIDC with the admin policy.
 //!
 //! Policies are CEL expressions over `claims`, `user` and `request`
-//! (`{"method", "path"}`); see `nfi_auth::server`.
+//! (`{"method", "path"}`); see `nfi_auth_server`.
 
 use axum::Json;
 use axum::extract::{Request, State};
@@ -14,7 +14,7 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use nfi_api::ErrorBody;
-use nfi_auth::server::{AuthError, Authenticator, Expr, Principal, Vars, bearer, request_var, token_matches};
+use nfi_auth_server::{AuthError, Authenticator, Expr, Principal, Vars, bearer, request_var, token_matches};
 use std::sync::Arc;
 use tracing::Instrument;
 

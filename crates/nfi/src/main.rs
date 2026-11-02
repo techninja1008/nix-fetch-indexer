@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
+use nfi::client::Client;
 use nfi::*;
-use nfi_api::client::Client;
 use nfi_api::drv::ReducedGraph;
 use nfi_api::{BulkRequest, ItemStatus, SearchQuery};
 use std::path::PathBuf;
@@ -170,7 +170,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         .clone()
         .or(cfg.url.clone())
         .unwrap_or_else(|| "http://localhost:8080".into());
-    let token = nfi_auth::client::explicit(cli.token_file.as_deref(), "NFI_TOKEN")?;
+    let token = nfi_auth_client::explicit(cli.token_file.as_deref(), "NFI_TOKEN")?;
     let login = auth::Login::new("nfi", "set NFI_TOKEN or --token-file", &url, token)?;
     match &cli.cmd {
         Cmd::Login { force } => {
@@ -245,10 +245,10 @@ fn gather(cmd: &Cmd, cfg: &Config) -> Result<Input> {
             let mut graph = ReducedGraph::default();
             if !installables.is_empty() {
                 let nix = nix.clone().or(cfg.nix.clone()).unwrap_or_else(|| "nix".into());
-                graph.merge(derivation_graph(&nix, installables)?);
+                nfi_drv::merge(&mut graph, derivation_graph(&nix, installables)?);
             }
             for f in files {
-                graph.merge(read_graph(f)?);
+                nfi_drv::merge(&mut graph, read_graph(f)?);
             }
             Ok(Input::Graph(graph))
         }
@@ -316,7 +316,7 @@ async fn exec(cmd: Cmd, input: &Input, json: bool, cfg: &Config, client: Client)
             if json {
                 print_json(&rels)?;
             } else {
-                print!("{}", nfi_api::releases_table(&rels));
+                print!("{}", nfi::releases_table(&rels));
             }
             Ok(ExitCode::SUCCESS)
         }

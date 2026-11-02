@@ -14,25 +14,14 @@
 //! re-posting the same PURLs attaches to the jobs still running, so a
 //! client recovers from a dropped stream by posting again.
 
-pub mod purl;
-
-#[cfg(feature = "client")]
-pub mod client;
-
+pub use nfi_auth::ErrorBody;
 use serde::{Deserialize, Serialize};
-
-pub use purl::{NixTarget, Purl, PurlError};
 
 pub const MIRROR_PATH: &str = "/v1/mirror";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MirrorRequest {
     pub purls: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ErrorBody {
-    pub error: String,
 }
 
 /// A phase a job can be in. Phases describe work in progress; a finished
@@ -70,17 +59,6 @@ pub struct Progress {
     pub max: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit: Option<Unit>,
-}
-
-impl Progress {
-    /// Whole percent, 0 to 100 (0 when `max` is 0).
-    pub fn percent(&self) -> u8 {
-        if self.max == 0 {
-            0
-        } else {
-            ((self.current.min(self.max) as u128 * 100) / self.max as u128) as u8
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -149,81 +127,10 @@ impl Event {
         }
     }
 
-    /// The SSE `data:` payload (the fields without the tag).
-    pub fn data(&self) -> String {
-        let mut v = serde_json::to_value(self).expect("serialisable");
-        if let Some(o) = v.as_object_mut() {
-            o.remove("event");
-        }
-        v.to_string()
-    }
-
-    /// Parse an SSE event; `None` for event names this version doesn't know.
-    pub fn from_sse(name: &str, data: &str) -> Option<serde_json::Result<Event>> {
-        if !matches!(name, "phases" | "status" | "log" | "result") {
-            return None;
-        }
-        let mut v: serde_json::Value = match serde_json::from_str(data) {
-            Ok(v) => v,
-            Err(e) => return Some(Err(e)),
-        };
-        if let Some(o) = v.as_object_mut() {
-            o.insert("event".into(), name.into());
-        }
-        Some(serde_json::from_value(v))
-    }
-
     pub fn purl(&self) -> Option<&str> {
         match self {
             Event::Phases { .. } => None,
             Event::Status { purl, .. } | Event::Log { purl, .. } | Event::Result { purl, .. } => Some(purl),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sse_roundtrip() {
-        let evs = [
-            Event::Phases {
-                phases: vec![PhaseDef::new("q", "Queued", 'Q')],
-            },
-            Event::Status {
-                purl: "pkg:nix/x".into(),
-                phase: "q".into(),
-                progress: Some(Progress {
-                    current: 1,
-                    max: 4,
-                    unit: Some(Unit::Bytes),
-                }),
-            },
-            Event::Log {
-                purl: "pkg:nix/x".into(),
-                level: LogLevel::Warning,
-                message: "retrying".into(),
-            },
-            Event::Result {
-                purl: "pkg:nix/x".into(),
-                outcome: Outcome::Fatal,
-            },
-        ];
-        for e in evs {
-            let d = e.data();
-            assert!(!d.contains("\"event\""), "{d}");
-            assert_eq!(Event::from_sse(e.name(), &d).unwrap().unwrap(), e);
-        }
-        assert!(Event::from_sse("future", "{}").is_none());
-        assert_eq!(
-            Progress {
-                current: 1,
-                max: 3,
-                unit: None
-            }
-            .percent(),
-            33
-        );
     }
 }

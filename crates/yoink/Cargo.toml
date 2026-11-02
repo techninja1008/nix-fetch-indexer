@@ -12,9 +12,10 @@ name = "yoink"
 path = "src/main.rs"
 
 [dependencies]
-yoink-api = { workspace = true, features = ["client"] }
-nfi-api = { workspace = true, features = ["client"] }
-nfi-auth = { workspace = true, features = ["client"] }
+yoink-api.workspace = true
+yoink-purl.workspace = true
+nfi-auth.workspace = true
+nfi-auth-client.workspace = true
 nfi = { path = "../nfi" }
 anyhow.workspace = true
 serde.workspace = true
@@ -22,6 +23,7 @@ serde_json.workspace = true
 tokio.workspace = true
 clap.workspace = true
 futures.workspace = true
+reqwest.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 
@@ -30,6 +32,7 @@ tempfile.workspace = true
 axum.workspace = true
 yoink-server.workspace = true
 yoink-mirror-http.workspace = true
-nfi-auth = { workspace = true, features = ["testing"] }
+nfi-auth-server.workspace = true
+nfi-test-support.workspace = true
 nfi-interchange.workspace = true
 sha2.workspace = true
