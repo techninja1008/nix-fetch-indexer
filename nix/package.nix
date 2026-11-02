@@ -51,44 +51,49 @@ let
     }).crates;
   crate = name: workspaceCrates.${name};
 
-  # Each binary is a package of its own, wrapped with these on its PATH, so a
-  # consumer (e.g. an image) only pulls in the binary it uses.
-  bins =
-    lib.mapAttrs
-      (
-        name: path:
-        runCommand name
-          {
-            nativeBuildInputs = [ makeWrapper ];
-            meta = meta // {
-              mainProgram = name;
-            };
-          }
-          (
-            if path == [ ] then
-              ''
-                mkdir -p $out/bin
-                ln -s ${crate name}/bin/${name} $out/bin/${name}
-              ''
-            else
-              ''
-                makeWrapper ${crate name}/bin/${name} $out/bin/${name} \
-                  --suffix PATH : ${lib.makeBinPath path}
-              ''
-          )
-      )
-      {
-        nfi = [ nix ];
-        nfi-admin = [ ];
-        nfi-indexer = [ nix-eval-jobs ];
-        # For --embedded-postgres / --embedded-meilisearch (single-node mode).
-        nfi-service = [
-          postgresql
-          meilisearch
-        ];
-        yoink = [ nix ];
-        yoink-service = [ ];
-      };
+  # Extra PATH entries for the binaries that run other programs.
+  runtimePath = {
+    nfi = [ nix ];
+    nfi-indexer = [ nix-eval-jobs ];
+    # For --embedded-postgres / --embedded-meilisearch (single-node mode).
+    nfi-service = [
+      postgresql
+      meilisearch
+    ];
+    yoink = [ nix ];
+  };
+
+  # Every binary target in the workspace, as crate2nix lists them, is a package
+  # of its own, so a consumer (e.g. an image) only pulls in the binary it uses.
+  bins = lib.listToAttrs (
+    lib.concatMap (
+      member:
+      map (
+        { name, ... }:
+        lib.nameValuePair name (
+          runCommand name
+            {
+              nativeBuildInputs = [ makeWrapper ];
+              meta = meta // {
+                mainProgram = name;
+              };
+            }
+            (
+              if runtimePath ? ${name} then
+                ''
+                  makeWrapper ${crate member}/bin/${name} $out/bin/${name} \
+                    --suffix PATH : ${lib.makeBinPath runtimePath.${name}}
+                ''
+              else
+                ''
+                  mkdir -p $out/bin
+                  ln -s ${crate member}/bin/${name} $out/bin/${name}
+                ''
+            )
+        )
+      ) (cargoNix.internal.crates.${member}.crateBin or [ ])
+    ) (lib.attrNames cargoNix.workspaceMembers)
+  );
 
   # Each workspace crate's tests (unit + integration), run separately with
   # nextest.
@@ -280,11 +285,19 @@ let
     license = lib.licenses.mit;
   };
 in
+assert lib.assertMsg (lib.all (name: bins ? ${name}) (
+  lib.attrNames runtimePath
+)) "runtimePath names a binary the workspace doesn't have";
 symlinkJoin {
   name = "nix-fetch-indexer-${(lib.importTOML ../Cargo.toml).workspace.package.version}";
   paths = lib.attrValues bins;
-  passthru = bins // {
-    inherit cargoNix cargoMetadata tests;
+  passthru = {
+    inherit
+      bins
+      cargoNix
+      cargoMetadata
+      tests
+      ;
   };
   meta = meta // {
     mainProgram = "nfi";
