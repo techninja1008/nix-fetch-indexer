@@ -2073,6 +2073,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "libc",
+ "nfi-embedded-postgres",
  "tempfile",
  "tracing",
 ]
@@ -2178,6 +2179,7 @@ name = "nfi-testenv"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "nfi-embedded-postgres",
  "nfi-interchange",
  "nfi-service",
  "reqwest",

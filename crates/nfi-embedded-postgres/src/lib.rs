@@ -57,7 +57,8 @@ pub struct EmbeddedPostgres {
     pub major_version: u32,
 }
 
-fn which(name: &str) -> Option<PathBuf> {
+/// The first file called `name` in a directory on the PATH.
+pub fn which(name: &str) -> Option<PathBuf> {
     std::env::var_os("PATH")?
         .to_str()?
         .split(':')
@@ -65,7 +66,10 @@ fn which(name: &str) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Locate the PostgreSQL server binaries.
+/// Locate the PostgreSQL server binaries: `explicit` if given, else the
+/// first directory holding all of them among `pg_config --bindir`, the
+/// directory of `postgres` on the PATH and the newest
+/// `/usr/lib/postgresql/<major>/bin`.
 pub fn find_bin_dir(explicit: Option<&Path>) -> Result<PathBuf> {
     let has_all = |d: &Path| {
         ["initdb", "postgres", "pg_isready", "createdb", "psql"]
@@ -135,21 +139,15 @@ fn postmaster_pid(pgdata: &Path) -> Option<u32> {
         .ok()
 }
 
-/// PID of a live postmaster for this cluster (a stale pid file is ignored).
-fn running_postmaster(pgdata: &Path) -> Option<u32> {
-    let pid = postmaster_pid(pgdata)?;
-    // SAFETY: signal 0 only checks for existence.
-    (unsafe { libc::kill(pid as libc::pid_t, 0) } == 0).then_some(pid)
-}
-
-fn is_root() -> bool {
+/// Whether this process runs as root (PostgreSQL refuses to).
+pub fn is_root() -> bool {
     // SAFETY: geteuid has no preconditions.
     unsafe { libc::geteuid() == 0 }
 }
 
 /// Configure the child to receive `signal` when its parent thread exits and
 /// to run in its own process group (so terminal signals reach only us).
-fn supervise(cmd: &mut Command, signal: libc::c_int) {
+pub fn supervise(cmd: &mut Command, signal: libc::c_int) {
     cmd.process_group(0);
     #[cfg(target_os = "linux")]
     unsafe {
@@ -257,12 +255,8 @@ impl EmbeddedPostgres {
             true
         };
 
-        if let Some(pid) = running_postmaster(&pgdata) {
-            bail!(
-                "PostgreSQL (pid {pid}) is already running on {}; is another nfi-service using it?",
-                pgdata.display()
-            );
-        }
+        // If another server runs on this cluster, PostgreSQL's own lock file
+        // makes ours exit with an error (reported below).
         restrict_permissions(&pgdata)?;
 
         let mut cmd = Command::new(bin.join("postgres"));

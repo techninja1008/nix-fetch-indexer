@@ -448,6 +448,7 @@ async fn main() -> Result<()> {
             if let Some(e) = error {
                 return Err(e);
             }
+            let merged = merged.map_err(anyhow::Error::msg)?;
             merged.validate().map_err(anyhow::Error::msg)?;
             write_out(&merged, &out).map(|_| ())
         }

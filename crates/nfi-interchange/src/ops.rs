@@ -77,21 +77,7 @@ impl ClosureBuilder {
     /// Index of the closure of `eval` (a bundle eval index) with the given
     /// closure type name, adding it if absent.
     pub fn ensure_closure(&mut self, eval: usize, closure_type: &str) -> usize {
-        let eval = eval as u32;
-        match self
-            .closures
-            .iter()
-            .position(|c| c.eval == eval && c.closure_type == closure_type)
-        {
-            Some(i) => i,
-            None => {
-                self.closures.push(Closure {
-                    eval,
-                    closure_type: closure_type.to_string(),
-                });
-                self.closures.len() - 1
-            }
-        }
+        crate::model::ensure_closure(&mut self.closures, eval as u32, closure_type)
     }
 
     pub fn closures(&self) -> &[Closure] {
@@ -231,6 +217,28 @@ pub struct EvalErrorsBuilder {
 }
 
 impl EvalErrorsBuilder {
+    /// Record that an evaluation's errors are known (it may have none).
+    pub fn cover(&mut self, eval: usize) {
+        self.section.evals.set(eval);
+    }
+
+    /// Record a failed attribute in an evaluation, covering it.
+    pub fn add(&mut self, attr: &str, system: &str, eval: usize) {
+        self.cover(eval);
+        let k = (attr.to_string(), system.to_string());
+        match self.index.get(&k) {
+            Some(&i) => self.section.errors[i].evals.set(eval),
+            None => {
+                self.index.insert(k, self.section.errors.len());
+                self.section.errors.push(EvalError {
+                    attr: attr.to_string(),
+                    system: system.to_string(),
+                    evals: Bitset::single(eval),
+                });
+            }
+        }
+    }
+
     /// Add a section, remapping eval indices (evaluations mapped to `None`
     /// are dropped).
     pub fn extend_section(&mut self, section: &EvalErrorsSection, remap: &dyn Fn(usize) -> Option<usize>) {
@@ -360,8 +368,10 @@ fn program_key(p: &Program) -> (String, String, String) {
 }
 
 /// Merge `inputs` into a single bundle: union of release tables (by name),
-/// union of entries (by key) with OR-ed release bits.
-pub fn merge(inputs: impl IntoIterator<Item = Bundle>) -> Bundle {
+/// union of entries (by key) with OR-ed release bits. Each input must pass
+/// [`Bundle::validate`]; the first that does not is reported (counting from
+/// 1) and nothing is merged.
+pub fn merge(inputs: impl IntoIterator<Item = Bundle>) -> Result<Bundle, String> {
     let mut out = Bundle::default();
     let mut closure: Option<ClosureBuilder> = None;
     let mut packages: Option<Dedup<_, Package>> = None;
@@ -369,7 +379,10 @@ pub fn merge(inputs: impl IntoIterator<Item = Bundle>) -> Bundle {
     let mut programs: Option<Dedup<_, Program>> = None;
     let mut eval_errors: Option<EvalErrorsBuilder> = None;
 
-    for input in inputs {
+    for (n, input) in inputs.into_iter().enumerate() {
+        input
+            .validate()
+            .map_err(|e| format!("merge input {}: {e}", n + 1))?;
         let map: Vec<usize> = input
             .releases
             .iter()
@@ -430,7 +443,7 @@ pub fn merge(inputs: impl IntoIterator<Item = Bundle>) -> Bundle {
     out.eval_errors = eval_errors.map(EvalErrorsBuilder::finish);
     sort_evals(&mut out);
     normalize(&mut out);
-    out
+    Ok(out)
 }
 
 /// Sort the evaluation table by release and eval type, so that merging is

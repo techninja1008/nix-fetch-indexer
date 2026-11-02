@@ -11,6 +11,7 @@ readme.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 libc.workspace = true
+nfi-embedded-postgres = { path = "../nfi-embedded-postgres" }
 
 [dev-dependencies]
 tempfile.workspace = true

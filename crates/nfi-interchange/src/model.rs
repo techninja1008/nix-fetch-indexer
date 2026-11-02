@@ -234,21 +234,30 @@ pub struct ClosureSection {
 
 impl ClosureSection {
     pub fn closure_index(&self, eval: u32, closure_type: &str) -> Option<usize> {
-        self.closures
-            .iter()
-            .position(|c| c.eval == eval && c.closure_type == closure_type)
+        closure_index(&self.closures, eval, closure_type)
     }
 
     /// Index of the closure, adding it to the table if absent.
     pub fn ensure_closure(&mut self, eval: u32, closure_type: &str) -> usize {
-        self.closure_index(eval, closure_type).unwrap_or_else(|| {
-            self.closures.push(Closure {
-                eval,
-                closure_type: closure_type.to_string(),
-            });
-            self.closures.len() - 1
-        })
+        ensure_closure(&mut self.closures, eval, closure_type)
     }
+}
+
+fn closure_index(closures: &[Closure], eval: u32, closure_type: &str) -> Option<usize> {
+    closures
+        .iter()
+        .position(|c| c.eval == eval && c.closure_type == closure_type)
+}
+
+/// Index of the closure in a closure table, adding it if absent.
+pub(crate) fn ensure_closure(closures: &mut Vec<Closure>, eval: u32, closure_type: &str) -> usize {
+    closure_index(closures, eval, closure_type).unwrap_or_else(|| {
+        closures.push(Closure {
+            eval,
+            closure_type: closure_type.to_string(),
+        });
+        closures.len() - 1
+    })
 }
 
 /// An attribute that failed to evaluate. Evaluation is deterministic, so the
@@ -270,25 +279,6 @@ pub struct EvalErrorsSection {
     /// an evaluation not covered, the bundle says nothing about errors.
     pub evals: Bitset,
     pub errors: Vec<EvalError>,
-}
-
-impl EvalErrorsSection {
-    /// Record a failed attribute in an evaluation, covering it.
-    pub fn add_error(&mut self, attr: &str, system: &str, eval: usize) {
-        self.evals.set(eval);
-        match self
-            .errors
-            .iter_mut()
-            .find(|e| e.attr == attr && e.system == system)
-        {
-            Some(e) => e.evals.set(eval),
-            None => self.errors.push(EvalError {
-                attr: attr.to_string(),
-                system: system.to_string(),
-                evals: Bitset::single(eval),
-            }),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

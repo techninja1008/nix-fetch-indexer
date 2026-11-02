@@ -712,18 +712,18 @@ async fn closure_types_ingest_minimise_and_prune() {
 fn eval_errors_bundle() -> Bundle {
     let base = bundle();
     let mut b = Bundle::default();
-    let mut e = EvalErrorsSection::default();
+    let mut e = EvalErrorsBuilder::default();
     for (i, r) in base.releases.iter().enumerate() {
         let mut r = r.clone();
         r.datasets = vec![Dataset::EvalErrors];
         let ri = b.ensure_release(r);
         let ev = b.ensure_eval(ri as u32, "helpers");
-        e.add_error("fetchhg", "x86_64-linux", ev);
+        e.add("fetchhg", "x86_64-linux", ev);
         if i == 0 {
-            e.add_error("fetchsvn", "aarch64-linux", ev);
+            e.add("fetchsvn", "aarch64-linux", ev);
         }
     }
-    b.eval_errors = Some(e);
+    b.eval_errors = Some(e.finish());
     b.validate().unwrap();
     b
 }
@@ -910,4 +910,185 @@ async fn closure_types_migration_keeps_ids() {
     .await
     .unwrap();
     assert!(id > 7, "{id}");
+}
+
+/// A fresh, migrated database without a service (so no worker claims jobs).
+async fn job_pool() -> Option<sqlx::PgPool> {
+    let url = nfi_testenv::fresh_database().await?;
+    Some(nfi_service::connect(&url, 5).await.unwrap())
+}
+
+/// Queue an ingest job with a staged upload and claim it.
+async fn claim_staged_job(pool: &sqlx::PgPool) -> nfi_service::jobs::Claim {
+    let id: i64 = sqlx::query_scalar("INSERT INTO jobs (kind) VALUES ('ingest') RETURNING id")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO job_blob_chunks (job_id, seq, data) VALUES ($1, 0, 'bundle')")
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    let job = nfi_service::jobs::claim(pool, "host-1", Duration::from_secs(120))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.id, id);
+    job
+}
+
+/// Another worker reclaims the job (with the same worker name, as in
+/// containers where every replica is pid 1).
+async fn reclaim(pool: &sqlx::PgPool, id: i64) {
+    sqlx::query("UPDATE jobs SET claim_id = gen_random_uuid() WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// (status, progress, result, blob chunks) of a job.
+async fn job_state(pool: &sqlx::PgPool, id: i64) -> (String, Option<String>, Option<Value>, i64) {
+    sqlx::query_as(
+        "SELECT status, progress, result, (SELECT count(*) FROM job_blob_chunks WHERE job_id = id)
+           FROM jobs WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// A worker whose job was reclaimed can't overwrite the job's result or
+/// progress, nor delete its staged upload; the new claim can.
+#[tokio::test]
+async fn reclaimed_job_is_fenced() {
+    use nfi_service::jobs;
+    let Some(pool) = job_pool().await else { return };
+    let old = claim_staged_job(&pool).await;
+    reclaim(&pool, old.id).await;
+    assert!(!jobs::touch(&pool, &old, Some("stale")).await.unwrap());
+    assert!(
+        !jobs::finish(&pool, &old, &Ok(json!({"from": "old"})), None)
+            .await
+            .unwrap()
+    );
+    let err: anyhow::Result<Value> = Err(anyhow::anyhow!("old worker failed"));
+    assert!(!jobs::finish(&pool, &old, &err, Some("stale")).await.unwrap());
+    assert_eq!(job_state(&pool, old.id).await, ("running".into(), None, None, 1));
+
+    // The current claim records its result and drops the upload.
+    sqlx::query("UPDATE jobs SET heartbeat_at = now() - interval '1 hour' WHERE id = $1")
+        .bind(old.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let new = jobs::claim(&pool, "host-1", Duration::from_secs(120))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(new.id, old.id);
+    assert!(jobs::touch(&pool, &new, Some("working")).await.unwrap());
+    assert!(
+        jobs::finish(&pool, &new, &Ok(json!({"from": "new"})), None)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        job_state(&pool, new.id).await,
+        ("succeeded".into(), None, Some(json!({"from": "new"})), 0)
+    );
+    // The old claim stays fenced off after the job finished.
+    assert!(
+        !jobs::finish(&pool, &old, &Ok(json!({"from": "old"})), None)
+            .await
+            .unwrap()
+    );
+    assert_eq!(job_state(&pool, old.id).await.2, Some(json!({"from": "new"})));
+}
+
+/// When the keep-alive notices the job was reclaimed, the running job is
+/// cancelled and nothing is recorded.
+#[tokio::test]
+async fn reclaimed_job_is_cancelled() {
+    use nfi_service::jobs;
+    let Some(pool) = job_pool().await else { return };
+    let job = claim_staged_job(&pool).await;
+    let id = job.id;
+    let (reached_tx, reached) = tokio::sync::oneshot::channel();
+    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    struct OnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for OnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let guard = OnDrop(dropped.clone());
+    let p2 = pool.clone();
+    let run = tokio::spawn(async move {
+        jobs::execute(&p2, job, |_, progress| async move {
+            let _guard = guard;
+            progress.set("step 1".into());
+            reached_tx.send(()).unwrap();
+            std::future::pending::<anyhow::Result<Value>>().await
+        })
+        .await
+    });
+    reached.await.unwrap();
+    reclaim(&pool, id).await;
+    // The next progress write (within a second) finds the claim gone.
+    let recorded = tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("job was not cancelled")
+        .unwrap();
+    assert!(!recorded);
+    assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(job_state(&pool, id).await, ("running".into(), None, None, 1));
+}
+
+/// Progress is published while a job runs and cleared when it succeeds; no
+/// late progress write overwrites that.
+#[tokio::test]
+async fn progress_cleared_after_job_finishes() {
+    use nfi_service::jobs;
+    let Some(pool) = job_pool().await else { return };
+    let job = claim_staged_job(&pool).await;
+    let id = job.id;
+    let p2 = pool.clone();
+    let recorded = jobs::execute(&pool, job, |_, progress| async move {
+        progress.set("step 1".into());
+        let mut seen = None;
+        for _ in 0..50 {
+            seen = job_state(&p2, id).await.1;
+            if seen.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(seen.as_deref(), Some("step 1"));
+        // Pending when the job ends: must not be written after the result.
+        progress.set("step 2".into());
+        Ok(json!({"ok": true}))
+    })
+    .await;
+    assert!(recorded);
+    let after = job_state(&pool, id).await;
+    assert_eq!(after, ("succeeded".into(), None, Some(json!({"ok": true})), 0));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(job_state(&pool, id).await, after);
+
+    // A failed job keeps its latest progress, including one still pending.
+    let job = claim_staged_job(&pool).await;
+    let id = job.id;
+    let recorded = jobs::execute(&pool, job, |_, progress| async move {
+        progress.set("decoding".into());
+        anyhow::bail!("bad bundle")
+    })
+    .await;
+    assert!(recorded);
+    let (status, progress, _, blobs) = job_state(&pool, id).await;
+    assert_eq!(
+        (status.as_str(), progress.as_deref(), blobs),
+        ("failed", Some("decoding"), 0)
+    );
 }

@@ -4,7 +4,8 @@
 //! Services are found via environment variables or the PATH:
 //! - `NFI_TEST_DATABASE_URL`: use an existing Postgres server (admin URL)
 //!   instead of spawning one. Otherwise `NFI_TEST_PG_BINDIR`, `pg_config
-//!   --bindir`, or `/usr/lib/postgresql/*/bin` must provide `initdb`/`postgres`.
+//!   --bindir`, the directory of `postgres` on the PATH, or the newest
+//!   `/usr/lib/postgresql/*/bin` must provide the server binaries.
 //! - `NFI_TEST_MEILI_URL`: use an existing Meilisearch. Otherwise
 //!   `NFI_TEST_MEILI_BIN` or `meilisearch` on the PATH is spawned.
 //!
@@ -61,46 +62,19 @@ fn watchdog(pid: u32, signal: &str) {
         .spawn();
 }
 
-/// Directory with the PostgreSQL server binaries used by tests.
+/// Directory with the PostgreSQL server binaries used by tests:
+/// `NFI_TEST_PG_BINDIR`, else as found by
+/// [`nfi_embedded_postgres::find_bin_dir`].
 pub fn pg_bindir() -> Option<PathBuf> {
     if let Ok(d) = std::env::var("NFI_TEST_PG_BINDIR") {
         return Some(d.into());
     }
-    if let Ok(out) = Command::new("pg_config").arg("--bindir").output() {
-        let d = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
-        if d.join("initdb").exists() {
-            return Some(d);
-        }
-    }
-    if let Ok(entries) = std::fs::read_dir("/usr/lib/postgresql") {
-        let mut dirs: Vec<PathBuf> = entries
-            .filter_map(|e| e.ok())
-            .map(|e| e.path().join("bin"))
-            .collect();
-        dirs.sort();
-        if let Some(d) = dirs.into_iter().rev().find(|d| d.join("initdb").exists()) {
-            return Some(d);
-        }
-    }
-    which("initdb").and_then(|p| p.parent().map(Path::to_path_buf))
-}
-
-fn which(name: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH")?
-        .to_str()?
-        .split(':')
-        .map(|d| Path::new(d).join(name))
-        .find(|p| p.is_file())
+    nfi_embedded_postgres::find_bin_dir(None).ok()
 }
 
 /// Whether the tests run as root (PostgreSQL refuses to).
-pub fn is_root() -> bool {
-    Command::new("id")
-        .arg("-u")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
-        .unwrap_or(false)
-}
+pub use nfi_embedded_postgres::is_root;
+use nfi_embedded_postgres::which;
 
 fn start_postgres(dir: &Path) -> Result<String> {
     let bindir = pg_bindir().context("postgres binaries not found")?;
