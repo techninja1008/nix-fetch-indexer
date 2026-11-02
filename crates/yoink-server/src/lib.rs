@@ -13,8 +13,10 @@ pub mod job;
 pub use job::{Job, JobReporter, JobTable};
 
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
-use nfi_auth_server::{Authenticator, Expr, Guard, OidcSettings};
+use clap::builder::Resettable;
+use clap::{Args, Command, Parser, Subcommand};
+use nfi_auth_server::{Authenticator, Expr, Guard};
+use nfi_service_common::{OidcArgs, init_tracing, shutdown_signal};
 use std::future::Future;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -66,31 +68,8 @@ pub struct ServerArgs {
     /// Listen address.
     #[arg(long, env = "YOINK_LISTEN", default_value = "0.0.0.0:8090")]
     pub listen: String,
-    /// OpenID provider issuer URL. ID tokens it issues to --oidc-client-id
-    /// are accepted as bearer tokens.
-    #[arg(long, env = "YOINK_OIDC_ISSUER")]
-    pub oidc_issuer: String,
-    /// Client id CLIs log in as (advertised to them).
-    #[arg(long, env = "YOINK_OIDC_CLIENT_ID")]
-    pub oidc_client_id: String,
-    /// Expected token audience [default: the client id].
-    #[arg(long, env = "YOINK_OIDC_AUDIENCE")]
-    pub oidc_audience: Option<String>,
-    /// Scopes CLIs request [default: openid,profile,offline_access].
-    #[arg(long, env = "YOINK_OIDC_SCOPES", value_delimiter = ',')]
-    pub oidc_scopes: Vec<String>,
-    /// File with a CEL expression giving the username from `claims`
-    /// [default: preferred_username, else sub].
-    #[arg(long, env = "YOINK_OIDC_USERNAME_CEL_FILE")]
-    pub oidc_username_cel_file: Option<PathBuf>,
-    /// File with a CEL expression giving a credential or session id from
-    /// `claims` (e.g. `claims.sid`), for logs.
-    #[arg(long, env = "YOINK_OIDC_SESSION_CEL_FILE")]
-    pub oidc_session_cel_file: Option<PathBuf>,
-    /// File with a CEL expression over `claims` and `user` giving the map
-    /// whoami reports as `additional_info` [default: claims].
-    #[arg(long, env = "YOINK_OIDC_WHOAMI_CEL_FILE")]
-    pub oidc_whoami_cel_file: Option<PathBuf>,
+    #[command(flatten)]
+    pub oidc: OidcArgs,
     /// File with a CEL expression (vars: claims, user, request) that must be
     /// true for every API request [default: true].
     #[arg(long, env = "YOINK_AUTHZ_CEL_FILE")]
@@ -114,19 +93,39 @@ struct Cli<B: Subcommand> {
     backend: B,
 }
 
+/// Name the OIDC flags' environment variables `YOINK_OIDC_*`, require the
+/// issuer and client id, and describe the flags as they apply here.
+fn server_command(cmd: Command) -> Command {
+    OidcArgs::env(cmd, "YOINK_")
+        .mut_arg("oidc_issuer", |a| {
+            // Required, so its `requires` is moot (and would reorder the usage line).
+            a.required(true).requires(Resettable::Reset).help(
+                "OpenID provider issuer URL. ID tokens it issues to --oidc-client-id are accepted as bearer tokens",
+            )
+        })
+        .mut_arg("oidc_client_id", |a| {
+            a.required(true)
+                .help("Client id CLIs log in as (advertised to them)")
+        })
+        .mut_arg("oidc_audience", |a| {
+            a.help("Expected token audience [default: the client id]")
+        })
+        .mut_arg("oidc_username_cel_file", |a| {
+            a.help("File with a CEL expression giving the username from `claims` [default: preferred_username, else sub]")
+        })
+        .mut_arg("oidc_session_cel_file", |a| {
+            a.help("File with a CEL expression giving a credential or session id from `claims` (e.g. `claims.sid`), for logs")
+        })
+}
+
 impl ServerArgs {
     /// Read the expressions and start the authenticator (fetching the
     /// provider's keys; see `Authenticator::start`).
     pub async fn auth(&self) -> Result<Auth> {
-        let settings = OidcSettings::from_files(
-            &self.oidc_issuer,
-            &self.oidc_client_id,
-            self.oidc_audience.clone(),
-            self.oidc_scopes.clone(),
-            self.oidc_username_cel_file.as_deref(),
-            self.oidc_session_cel_file.as_deref(),
-            self.oidc_whoami_cel_file.as_deref(),
-        )?;
+        let settings = self
+            .oidc
+            .settings()?
+            .context("--oidc-issuer and --oidc-client-id are required")?;
         let request = Expr::from_file_or(self.authz_cel_file.as_deref(), "true")?;
         let purl = Expr::from_file_or(self.purl_authz_cel_file.as_deref(), "true")?;
         Ok(Auth::new(Authenticator::start(settings).await?, request, purl))
@@ -142,12 +141,8 @@ where
     F: FnOnce(B) -> Fut,
     Fut: Future<Output = Result<Arc<dyn Mirror>>>,
 {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
-    let cli = Cli::<B>::parse();
+    init_tracing("info");
+    let cli: Cli<B> = nfi_service_common::parse(server_command);
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
@@ -192,15 +187,4 @@ async fn run(args: ServerArgs, mirror: impl Future<Output = Result<Arc<dyn Mirro
         }
     }
     Ok(())
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = tokio::signal::ctrl_c();
-    let mut term =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
-    tokio::select! {
-        _ = ctrl_c => {}
-        _ = term.recv() => {}
-    }
-    tracing::info!("shutting down");
 }

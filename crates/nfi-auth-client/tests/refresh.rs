@@ -16,9 +16,7 @@ fn creds_for(url: &str, store: &TokenStore) -> Credentials {
 /// An expired login for the provider's URL, with a refresh token the
 /// provider has not seen.
 fn plant(idp: &MockIdp, store: &TokenStore, refresh_token: &str) {
-    store
-        .record_url(idp.issuer(), idp.issuer(), idp.client_id())
-        .unwrap();
+    store.record_url(idp.issuer(), &idp.auth_config()).unwrap();
     store
         .save_token(&StoredToken {
             issuer: idp.issuer().into(),
@@ -172,7 +170,7 @@ async fn cached_login_is_only_sent_to_urls_logged_in_to() {
         })
         .unwrap();
     store
-        .record_url(&format!("{}/", idp.issuer()), idp.issuer(), idp.client_id())
+        .record_url(&format!("{}/", idp.issuer()), &idp.auth_config())
         .unwrap();
     assert_eq!(
         creds(&idp, &store).token(false).await.unwrap(),
@@ -180,10 +178,9 @@ async fn cached_login_is_only_sent_to_urls_logged_in_to() {
     );
 
     // A URL never logged in to that claims the same provider and client
-    // gets nothing: no token, no whoami token, and the hint.
+    // gets nothing: no token, no whoami token.
     let c = creds_for(evil.url(), &store);
-    let e = c.token(false).await.unwrap_err();
-    assert!(format!("{e:#}").contains("run `t login`"), "{e:#}");
+    assert_eq!(c.token(false).await.unwrap(), None);
     assert_eq!(c.current().await.unwrap(), None);
     assert!(matches!(c.whoami().await.unwrap(), Identity::NotAuthenticated));
     assert!(evil.bearers().is_empty());
@@ -207,7 +204,7 @@ async fn cached_login_is_only_sent_to_urls_logged_in_to() {
     // Logging out of one logs out of all, offline (an unreachable URL works:
     // its record says which login it used), reporting the others.
     let gone = "http://127.0.0.1:9";
-    store.record_url(gone, idp.issuer(), idp.client_id()).unwrap();
+    store.record_url(gone, &idp.auth_config()).unwrap();
     let mut others = creds_for(gone, &store).logout().await.unwrap().unwrap();
     others.sort();
     let mut expected = vec![idp.issuer().to_string(), evil.url().to_string()];
@@ -218,4 +215,66 @@ async fn cached_login_is_only_sent_to_urls_logged_in_to() {
     assert_eq!(creds(&idp, &store).current().await.unwrap(), None);
     assert_eq!(creds(&idp, &store).logout().await.unwrap(), None);
     assert_eq!(evil.bearers().len(), 1);
+}
+
+/// The service's settings are only fetched to log in and after a 401: a URL
+/// logged in to uses those recorded then, one never logged in to gets no
+/// token (until a 401 says it needs one).
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_are_fetched_only_to_log_in_and_after_a_401() {
+    let idp = MockIdp::start("cli").await;
+    let evil = Impostor::start(&idp).await;
+    let d = tempfile::tempdir().unwrap();
+    let store = TokenStore::at(d.path());
+    plant(&idp, &store, "rt-s");
+
+    // Recorded: the token (refreshed), whoami, and a hint naming `login`.
+    let c = creds(&idp, &store);
+    assert!(c.token(false).await.unwrap().is_some());
+    assert!(c.current().await.unwrap().is_some());
+    assert!(c.hint().contains("run `t login`"), "{}", c.hint());
+    // Not recorded: no token, whoami without one, and a generic hint.
+    let c = creds_for(evil.url(), &store);
+    assert_eq!(c.token(true).await.unwrap(), None);
+    assert!(matches!(c.whoami().await.unwrap(), Identity::NotAuthenticated));
+    assert_eq!(c.hint(), "authentication required: set T_TOKEN");
+    assert_eq!(idp.config_fetches(), 0);
+    assert!(evil.bearers().is_empty());
+
+    // After a 401 the settings are fetched (once), which the hint uses.
+    // (Logging in again needs a terminal: tests may have one.)
+    if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        assert_eq!(c.relogin().await.unwrap(), None);
+        assert!(c.hint().contains("run `t login`"), "{}", c.hint());
+        assert_eq!(idp.config_fetches(), 1);
+    }
+
+    // `login` fetches them, and records them for the URL.
+    let c = creds_for(evil.url(), &store);
+    assert_eq!(c.login(false).await.unwrap().username, "mallory");
+    let fetched = idp.config_fetches();
+    let c = creds_for(evil.url(), &store);
+    assert!(c.token(false).await.unwrap().is_some());
+    assert_eq!(idp.config_fetches(), fetched);
+}
+
+/// A record written by an older version (without the settings) is completed
+/// from the service once, if it still names the same provider login.
+#[tokio::test(flavor = "multi_thread")]
+async fn old_records_are_completed_once() {
+    let idp = MockIdp::start("cli").await;
+    let d = tempfile::tempdir().unwrap();
+    let store = TokenStore::at(d.path());
+    plant(&idp, &store, "rt-o");
+    let urls = d.path().join("urls");
+    let f = std::fs::read_dir(&urls).unwrap().next().unwrap().unwrap().path();
+    let old = json!({"url": idp.issuer(), "issuer": idp.issuer(), "client_id": idp.client_id()});
+    std::fs::write(&f, old.to_string()).unwrap();
+    assert!(creds(&idp, &store).token(false).await.unwrap().is_some());
+    assert!(creds(&idp, &store).token(false).await.unwrap().is_some());
+    assert_eq!(idp.config_fetches(), 1);
+    // Naming another provider login: as if never logged in to.
+    let other = json!({"url": idp.issuer(), "issuer": idp.issuer(), "client_id": "other"});
+    std::fs::write(&f, other.to_string()).unwrap();
+    assert_eq!(creds(&idp, &store).token(false).await.unwrap(), None);
 }

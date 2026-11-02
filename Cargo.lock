@@ -2153,6 +2153,7 @@ dependencies = [
  "nfi-embedded-meilisearch",
  "nfi-embedded-postgres",
  "nfi-interchange",
+ "nfi-service-common",
  "nfi-test-support",
  "nfi-testenv",
  "reqwest",
@@ -2164,6 +2165,17 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tower-http",
+ "tracing",
+]
+
+[[package]]
+name = "nfi-service-common"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "nfi-auth-server",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]
@@ -4943,13 +4955,13 @@ dependencies = [
  "nfi-auth",
  "nfi-auth-client",
  "nfi-auth-server",
+ "nfi-service-common",
  "nfi-test-support",
  "reqwest",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "yoink",
  "yoink-api",
  "yoink-purl",

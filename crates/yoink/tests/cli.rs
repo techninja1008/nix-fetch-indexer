@@ -106,6 +106,7 @@ async fn yoink(url: &str, token: Option<&str>, args: &[String]) -> (i32, String)
         .env_remove("YOINK_TOKEN")
         .env_remove("YOINK_TOKEN_FILE")
         .env_remove("NFI_URL")
+        .env_remove("NFI_ALLOW_INSECURE")
         .stdin(std::process::Stdio::null());
     if let Some(t) = token {
         c.env("YOINK_TOKEN", t);
@@ -202,4 +203,17 @@ async fn authentication() {
     let (code, err) = yoink(&url, Some("tok"), &["hello@1.0".into()]).await;
     assert_eq!(code, 1);
     assert!(err.contains("not yet supported"), "{err}");
+}
+
+/// A token is not sent over plain HTTP to a host other than loopback unless
+/// allowed: the command fails before any request (192.0.2.1 is unroutable).
+#[tokio::test]
+async fn insecure_url_is_refused() {
+    let (code, err) = yoink("http://192.0.2.1", Some("tok"), &[purl(0, "a")]).await;
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("refusing to use credentials with http://192.0.2.1")
+            && err.contains("--allow-insecure or set NFI_ALLOW_INSECURE=1"),
+        "{err}"
+    );
 }

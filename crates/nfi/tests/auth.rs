@@ -24,6 +24,7 @@ fn run(bin: &str, dir: &Path, env: &[(&str, &str)], args: &[&str]) -> Out {
         .env_remove("NFI_TOKEN_FILE")
         .env_remove("NFI_ADMIN_TOKEN")
         .env_remove("NFI_ADMIN_TOKEN_FILE")
+        .env_remove("NFI_ALLOW_INSECURE")
         .envs(env.iter().copied())
         .stdin(Stdio::null())
         .output()
@@ -56,12 +57,16 @@ async fn tokens() {
 
     let url = svc.public_url.as_str();
 
-    // Not logged in, and no terminal to log in from: the command stops
-    // before sending anything.
+    // Never logged in, and no terminal to log in from: the request is sent
+    // without a token, and its 401 gets the hint (the service's settings,
+    // fetched after it, say it uses login).
     let o = nfi(&[], &["releases"]);
     assert_eq!(o.code, 1);
-    assert!(o.stderr.contains("run `nfi login`"), "{}", o.stderr);
-    assert!(!o.stderr.contains("401"), "{}", o.stderr);
+    assert!(
+        o.stderr.contains("run `nfi login`") && o.stderr.contains("401"),
+        "{}",
+        o.stderr
+    );
     let o = nfi(&[], &["whoami"]);
     assert_eq!(
         (o.code, o.stdout.trim()),
@@ -122,7 +127,7 @@ async fn tokens() {
     let o = nfi(&[], &["whoami"]);
     assert_eq!(o.code, 1, "{}", o.stdout);
     for u in [url, "http://127.0.0.1:9"] {
-        store.record_url(u, idp.issuer(), idp.client_id()).unwrap();
+        store.record_url(u, &idp.auth_config()).unwrap();
     }
     let o = nfi(&[], &["whoami"]);
     assert!(o.stdout.starts_with(&format!("{url}: bob\n")), "{}", o.stderr);
@@ -210,8 +215,9 @@ async fn interactive_login() {
     assert!(!o.text.contains("To log in"), "{}", o.text);
     assert_eq!(idp.device_logins(), 0);
 
-    // On a terminal, a command needing a login logs in first, even with
-    // stdin piped (the device flow only uses stderr).
+    // On a terminal, a command needing a login logs in once the service
+    // rejects it (it was never logged in to, so nothing says it needs one
+    // before), even with stdin piped (the device flow only uses stderr).
     let o = sh_tty(
         d.path(),
         &[("URL", url)],
@@ -315,7 +321,7 @@ async fn cached_login_not_sent_to_other_urls() {
         })
         .unwrap();
     store
-        .record_url("http://nfi.example", idp.issuer(), idp.client_id())
+        .record_url("http://nfi.example", &idp.auth_config())
         .unwrap();
     let url = evil.url();
 
@@ -352,4 +358,107 @@ async fn cached_login_not_sent_to_other_urls() {
     let sent = evil.bearers();
     assert_eq!(sent.len(), 1);
     assert_ne!(sent[0], cached);
+}
+
+/// The service's settings are not fetched by commands to a URL logged in
+/// to (its record has them), nor to one never logged in to until a 401.
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_fetched_only_after_a_401() {
+    let idp = MockIdp::start("nfi").await;
+    let evil = Impostor::start(&idp).await;
+    let d = tempfile::tempdir().unwrap();
+    let nfi = |args: &[&str]| {
+        let mut a = vec!["--url", evil.url()];
+        a.extend_from_slice(args);
+        run(env!("CARGO_BIN_EXE_nfi"), d.path(), &[], &a)
+    };
+    let o = nfi(&["whoami"]);
+    assert_eq!(o.code, 1, "{}", o.stderr);
+    assert_eq!(idp.config_fetches(), 0);
+    let o = nfi(&["releases"]);
+    assert_eq!(o.code, 1);
+    assert!(o.stderr.contains("run `nfi login`"), "{}", o.stderr);
+    assert_eq!(idp.config_fetches(), 1);
+
+    let store = TokenStore::at(d.path().join("tokens"));
+    let alice = idp.token(json!({"sub": "1", "preferred_username": "alice"}));
+    store
+        .save_token(&StoredToken {
+            issuer: idp.issuer().into(),
+            client_id: idp.client_id().into(),
+            id_token: alice.clone(),
+            refresh_token: None,
+        })
+        .unwrap();
+    store.record_url(evil.url(), &idp.auth_config()).unwrap();
+    for args in [&["releases"][..], &["whoami"]] {
+        let o = nfi(args);
+        assert_eq!(o.code, 0, "{}", o.stderr);
+    }
+    assert_eq!(idp.config_fetches(), 1);
+    assert_eq!(evil.bearers(), [alice.clone(), alice]);
+}
+
+/// A URL recorded with settings the service no longer uses (another
+/// provider): its 401 fetches the current ones, logs in with them and
+/// records them.
+#[tokio::test(flavor = "multi_thread")]
+async fn changed_settings_are_picked_up_after_a_401() {
+    let idp = MockIdp::start("nfi").await;
+    let old = MockIdp::start("old").await;
+    let auth = ServiceAuth::oidc(
+        std::sync::Arc::new(Authenticator::new(OidcSettings::new(idp.issuer(), idp.client_id())).unwrap()),
+        Expr::new("true").unwrap(),
+        false,
+        AdminAuth::Open,
+    );
+    let Some(svc) = nfi_testenv::start_service_with(auth).await else {
+        return;
+    };
+    let d = tempfile::tempdir().unwrap();
+    let url = svc.public_url.as_str();
+    let store = TokenStore::at(d.path().join("tokens"));
+    store
+        .save_token(&StoredToken {
+            issuer: old.issuer().into(),
+            client_id: old.client_id().into(),
+            id_token: old.token(json!({"sub": "1"})),
+            refresh_token: None,
+        })
+        .unwrap();
+    store.record_url(url, &old.auth_config()).unwrap();
+
+    let o = nfi_tty(d.path(), &["--url", url, "releases"]).await;
+    assert_eq!(o.code, Some(0), "{}", o.text);
+    assert_eq!(o.text.matches("To log in, open").count(), 1, "{}", o.text);
+    assert_eq!((idp.device_logins(), old.device_logins()), (1, 0));
+    // The record now names the new provider login: used without a terminal.
+    let o = run(
+        env!("CARGO_BIN_EXE_nfi"),
+        d.path(),
+        &[],
+        &["--url", url, "whoami"],
+    );
+    assert!(o.stdout.starts_with(&format!("{url}: alice\n")), "{}", o.stderr);
+}
+
+/// Tokens are not sent over plain HTTP to hosts other than loopback unless
+/// allowed: the command fails before any request (192.0.2.1 is unroutable).
+#[test]
+fn insecure_urls_are_refused() {
+    let d = tempfile::tempdir().unwrap();
+    let url = "http://192.0.2.1:8080";
+    for args in [&["releases"][..], &["whoami"]] {
+        let mut a = vec!["--url", url];
+        a.extend_from_slice(args);
+        let o = run(env!("CARGO_BIN_EXE_nfi"), d.path(), &[("NFI_TOKEN", "tok")], &a);
+        assert_eq!(o.code, 1, "{}", o.stderr);
+        assert!(
+            o.stderr
+                .contains(&format!("refusing to use credentials with {url}"))
+                && o.stderr.contains("--allow-insecure or set NFI_ALLOW_INSECURE=1"),
+            "{}",
+            o.stderr
+        );
+    }
 }

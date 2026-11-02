@@ -5,7 +5,7 @@ use nfi_interchange::*;
 use serde_json::{Value, json};
 use std::time::Duration;
 
-use nfi_testenv::{A, bundle, h, path};
+use nfi_testenv::{A, B, bundle, h, path};
 
 fn encode(b: &Bundle, format: Format) -> Vec<u8> {
     let mut v = Vec::new();
@@ -327,7 +327,7 @@ async fn ingest_lookup_bulk_minimise_prune() {
     // Prune by commit prefix removes everything else.
     let r = c
         .admin(reqwest::Method::POST, "/admin/v1/prune")
-        .json(&json!({"commits": ["aaaa"]}))
+        .json(&json!({"commits": ["aaaaaaaa"]}))
         .send()
         .await
         .unwrap();
@@ -343,6 +343,69 @@ async fn ingest_lookup_bulk_minimise_prune() {
         .await
         .unwrap();
     assert_eq!(n, 0);
+}
+
+/// Commit prefixes must have at least 8 hex digits and match at most one
+/// release; one matching none prunes nothing.
+#[tokio::test]
+async fn prune_by_unambiguous_commit_prefix() {
+    let Some(c) = setup(None).await else { return };
+    let pool = &c.svc.state.pool;
+    sqlx::raw_sql(&format!(
+        "INSERT INTO releases (name, commit, channel, series) VALUES
+           ('r1', 'abcdef01{a}', 'nixos-25.05', '25.05'),
+           ('r2', 'abcdef01{b}', 'nixos-25.05', '25.05'),
+           ('r3', 'abcdef02{a}', 'nixos-25.05', '25.05')",
+        a = &A[8..],
+        b = &B[8..]
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+    let names = || async {
+        sqlx::query_scalar::<_, String>("SELECT name FROM releases ORDER BY name")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    };
+    let prune = |commits: &[&str]| {
+        c.admin(reqwest::Method::POST, "/admin/v1/prune")
+            .json(&json!({ "commits": commits }))
+            .send()
+    };
+
+    let r = prune(&["abcdef0"]).await.unwrap();
+    assert_eq!(r.status(), 400);
+    let e: ErrorBody = r.json().await.unwrap();
+    assert!(e.error.contains("at least 8"), "{}", e.error);
+
+    let r = prune(&["abcdef02", "ABCDEF01"]).await.unwrap();
+    assert_eq!(r.status(), 400);
+    let e: ErrorBody = r.json().await.unwrap();
+    assert!(
+        e.error.contains("\"ABCDEF01\"") && e.error.contains("matches 2 releases"),
+        "{}",
+        e.error
+    );
+    assert_eq!(names().await, ["r1", "r2", "r3"]);
+    // The job checks again (a release may have been ingested after the
+    // request was queued).
+    let req = PruneRequest {
+        commits: vec!["abcdef01".into()],
+        ..Default::default()
+    };
+    let e = nfi_service::prune::prune(pool, &req).await.unwrap_err();
+    assert!(e.to_string().contains("matches 2 releases"), "{e}");
+    assert_eq!(names().await, ["r1", "r2", "r3"]);
+
+    for (commits, pruned) in [(["ABCDEF02"], vec!["r3"]), (["12345678"], vec![])] {
+        let r = prune(&commits).await.unwrap();
+        assert_eq!(r.status(), 202);
+        let j = c.wait_job(r.json::<JobCreated>().await.unwrap().id).await;
+        assert_eq!(j.status, JobStatus::Succeeded, "{:?}", j.error);
+        assert_eq!(j.result.unwrap()["releases"], json!(pruned));
+    }
+    assert_eq!(names().await, ["r1", "r2"]);
 }
 
 #[tokio::test]
@@ -1051,7 +1114,10 @@ async fn reclaimed_job_is_cancelled() {
         .unwrap();
     assert!(!recorded);
     assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
-    assert_eq!(job_state(&pool, id).await, ("running".into(), None, None, 1));
+    // Progress may hold a step written before the reclaim; what matters is
+    // that the old claim recorded nothing and left the blob alone.
+    let (status, _, result, blobs) = job_state(&pool, id).await;
+    assert_eq!((status.as_str(), result, blobs), ("running", None, 1));
 }
 
 /// Progress is published while a job runs and cleared when it succeeds; no

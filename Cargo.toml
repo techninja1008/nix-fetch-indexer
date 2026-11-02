@@ -16,6 +16,7 @@ nfi-auth = { path = "crates/nfi-auth" }
 nfi-auth-client = { path = "crates/nfi-auth-client" }
 nfi-auth-server = { path = "crates/nfi-auth-server" }
 nfi-test-support = { path = "crates/nfi-test-support" }
+nfi-service-common = { path = "crates/nfi-service-common" }
 nfi-drv = { path = "crates/nfi-drv" }
 yoink-api = { path = "crates/yoink-api" }
 yoink-purl = { path = "crates/yoink-purl" }

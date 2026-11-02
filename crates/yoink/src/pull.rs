@@ -27,6 +27,8 @@ pub struct PullOptions {
     pub plain: bool,
     pub verbosity: i8,
     pub close_miss_threshold: Option<u64>,
+    /// See [`Credentials::allow_insecure`].
+    pub allow_insecure: bool,
 }
 
 /// Evaluate flake references and ask NFI which cached paths they need.
@@ -77,7 +79,7 @@ pub async fn pull(o: PullOptions) -> Result<ExitCode> {
         _ if flakes.is_empty() => None,
         Some(u) => Some((
             u.as_str(),
-            Credentials::new("yoink", u, o.nfi_token.clone(), NFI_HINT),
+            Credentials::new("yoink", u, o.nfi_token.clone(), NFI_HINT).allow_insecure(o.allow_insecure),
         )),
         None => bail!(
             "flake references need the NFI service: set --nfi-url, NFI_URL or `nfi_url` in the config file"
@@ -85,7 +87,8 @@ pub async fn pull(o: PullOptions) -> Result<ExitCode> {
     };
     // Log in to both services up front, before evaluating anything and
     // before the monitor takes over the terminal.
-    let creds = Credentials::new("yoink", &o.url, o.token.clone(), YOINK_HINT);
+    let creds =
+        Credentials::new("yoink", &o.url, o.token.clone(), YOINK_HINT).allow_insecure(o.allow_insecure);
     creds.token(true).await?;
     if let Some((_, c)) = &nfi {
         c.token(true).await?;

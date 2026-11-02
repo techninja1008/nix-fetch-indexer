@@ -62,6 +62,10 @@ struct Common {
     /// which holds the token itself
     #[arg(long, env = "NFI_TOKEN_FILE", global = true)]
     nfi_token_file: Option<PathBuf>,
+    /// Allow sending tokens and logging in over plain http:// to hosts
+    /// other than loopback
+    #[arg(long, env = "NFI_ALLOW_INSECURE", global = true, value_parser = clap::builder::BoolishValueParser::new())]
+    allow_insecure: bool,
 }
 
 #[derive(Subcommand)]
@@ -88,6 +92,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     let nfi_url = cli.common.nfi_url.clone().or(cfg.nfi_url.clone());
     let token = explicit(cli.common.token_file.as_deref(), "YOINK_TOKEN")?;
     let nfi_token = explicit(cli.common.nfi_token_file.as_deref(), "NFI_TOKEN")?;
+    let insecure = cli.common.allow_insecure;
+    let creds =
+        |u: &str, t: Option<String>, hint| Credentials::new("yoink", u, t, hint).allow_insecure(insecure);
     let need_url = || {
         url.clone()
             .context("no yoink service URL: set --url, YOINK_URL or `url` in the config file")
@@ -95,10 +102,10 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     match cli.cmd {
         Some(Cmd::Login { force }) => {
             let url = need_url()?;
-            let y = Credentials::new("yoink", &url, None, YOINK_HINT);
+            let y = creds(&url, None, YOINK_HINT);
             eprintln!("logged in to {url} as {}", describe(&y.login(force).await?));
             if let Some(n) = &nfi_url {
-                let c = Credentials::new("yoink", n, None, NFI_HINT);
+                let c = creds(n, None, NFI_HINT);
                 match c.config().await {
                     Ok(Some(cn)) => {
                         // A forced login already renewed a shared provider login.
@@ -125,7 +132,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     continue;
                 }
                 done.push(u.trim_end_matches('/').to_string());
-                match nfi::logout(&Credentials::new("yoink", &u, None, ""), &u).await {
+                match nfi::logout(&creds(&u, None, ""), &u).await {
                     Ok(others) => done.extend(others),
                     Err(e) => {
                         ok = false;
@@ -142,7 +149,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             }
             let mut ok = true;
             for (u, t, hint) in targets {
-                match nfi::whoami(&Credentials::new("yoink", &u, t, hint), &u, false).await {
+                match nfi::whoami(&creds(&u, t, hint), &u, false).await {
                     Ok(b) => ok &= b,
                     Err(e) => {
                         ok = false;
@@ -163,6 +170,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 plain: cli.plain,
                 verbosity: if cli.quiet { -1 } else { cli.verbose.min(2) as i8 },
                 close_miss_threshold: cli.close_miss_threshold,
+                allow_insecure: insecure,
             })
             .await
         }

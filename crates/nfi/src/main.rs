@@ -23,6 +23,10 @@ struct Cli {
     /// holds the token itself
     #[arg(long, env = "NFI_TOKEN_FILE", global = true)]
     token_file: Option<PathBuf>,
+    /// Allow sending tokens and logging in over plain http:// to hosts
+    /// other than loopback
+    #[arg(long, env = "NFI_ALLOW_INSECURE", global = true, value_parser = clap::builder::BoolishValueParser::new())]
+    allow_insecure: bool,
     /// Print raw JSON responses.
     #[arg(long, global = true)]
     json: bool,
@@ -178,7 +182,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         .or(cfg.url.clone())
         .unwrap_or_else(|| "http://localhost:8080".into());
     let token = nfi_auth_client::explicit(cli.token_file.as_deref(), "NFI_TOKEN")?;
-    let creds = Credentials::new("nfi", &url, token, TOKEN_HINT);
+    let creds = Credentials::new("nfi", &url, token, TOKEN_HINT).allow_insecure(cli.allow_insecure);
     match &cli.cmd {
         Cmd::Login { force } => {
             let w = creds.login(*force).await?;

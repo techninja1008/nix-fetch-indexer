@@ -1,0 +1,17 @@
+[package]
+name = "nfi-service-common"
+description = "Shared by the nfi and yoink services: tracing, shutdown signals and the OIDC flags"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+nfi-auth-server.workspace = true
+anyhow.workspace = true
+# `string`: environment variable names built at runtime (see `OidcArgs::env`).
+clap = { workspace = true, features = ["string"] }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

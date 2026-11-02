@@ -64,6 +64,8 @@ struct Inner {
     down: AtomicBool,
     /// Discovery and JWKS requests served or refused so far.
     key_fetches: AtomicUsize,
+    /// Requests for the service settings (also via an [`Impostor`]).
+    config_fetches: AtomicUsize,
 }
 
 #[derive(Clone)]
@@ -98,6 +100,7 @@ impl MockIdp {
                 jwks: Mutex::new(None),
                 down: AtomicBool::new(false),
                 key_fetches: AtomicUsize::new(0),
+                config_fetches: AtomicUsize::new(0),
             }),
         };
         let app = Router::new()
@@ -193,6 +196,22 @@ impl MockIdp {
             .then(|| (axum::http::StatusCode::SERVICE_UNAVAILABLE, "down").into_response())
     }
 
+    /// The settings it advertises like a service using it.
+    pub fn auth_config(&self) -> nfi_auth::AuthConfig {
+        nfi_auth::AuthConfig {
+            issuer: self.inner.issuer.clone(),
+            client_id: self.inner.client_id.clone(),
+            scopes: vec!["openid".into()],
+            anonymous: false,
+        }
+    }
+
+    /// Requests for [`nfi_auth::CONFIG_PATH`] so far, here and at its
+    /// [`Impostor`]s.
+    pub fn config_fetches(&self) -> usize {
+        self.inner.config_fetches.load(Ordering::SeqCst)
+    }
+
     pub fn device_logins(&self) -> usize {
         self.inner.device_logins.load(Ordering::SeqCst)
     }
@@ -221,13 +240,8 @@ async fn discovery(State(i): State<MockIdp>) -> Response {
 }
 
 async fn config(State(i): State<MockIdp>) -> Response {
-    axum::Json(nfi_auth::AuthConfig {
-        issuer: i.inner.issuer.clone(),
-        client_id: i.inner.client_id.clone(),
-        scopes: vec!["openid".into()],
-        anonymous: false,
-    })
-    .into_response()
+    i.inner.config_fetches.fetch_add(1, Ordering::SeqCst);
+    axum::Json(i.auth_config()).into_response()
 }
 
 async fn jwks(State(i): State<MockIdp>) -> Response {

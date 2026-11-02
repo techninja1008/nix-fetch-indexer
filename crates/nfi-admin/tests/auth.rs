@@ -29,6 +29,7 @@ fn run(bin: &str, dir: &Path, env: &[(&str, &str)], args: &[&str]) -> Out {
         .env_remove("NFI_TOKEN_FILE")
         .env_remove("NFI_ADMIN_TOKEN")
         .env_remove("NFI_ADMIN_TOKEN_FILE")
+        .env_remove("NFI_ALLOW_INSECURE")
         .envs(env.iter().copied())
         .stdin(Stdio::null())
         .output()
@@ -64,9 +65,7 @@ async fn tokens() {
             refresh_token: None,
         })
         .unwrap();
-    store
-        .record_url(&svc.public_url, idp.issuer(), idp.client_id())
-        .unwrap();
+    store.record_url(&svc.public_url, &idp.auth_config()).unwrap();
     let admin = |env: &[(&str, &str)], args: &[&str]| {
         let mut a = vec!["--url", svc.admin_url.as_str()];
         a.extend_from_slice(args);
@@ -187,7 +186,7 @@ async fn rejected_login_mid_command() {
             refresh_token: None,
         })
         .unwrap();
-    store.record_url(&url, idp.issuer(), idp.client_id()).unwrap();
+    store.record_url(&url, &idp.auth_config()).unwrap();
     let mut c = Command::new(env!("CARGO_BIN_EXE_nfi-admin"));
     c.args(["--url", &url, "ingest", "https://x/a.nfib", "https://x/b.nfib"])
         .env("XDG_CONFIG_HOME", d.path())
@@ -209,4 +208,25 @@ async fn rejected_login_mid_command() {
         ["https://x/a.nfib", "https://x/b.nfib"]
     );
     assert!(o.text.contains("https://x/b.nfib: job 2"), "{}", o.text);
+}
+
+/// A token is not sent over plain HTTP to a host other than loopback unless
+/// allowed: the command fails before any request (192.0.2.1 is unroutable).
+#[test]
+fn insecure_url_is_refused() {
+    let d = tempfile::tempdir().unwrap();
+    let o = run(
+        env!("CARGO_BIN_EXE_nfi-admin"),
+        d.path(),
+        &[("NFI_ADMIN_TOKEN", "tok")],
+        &["--url", "http://192.0.2.1", "jobs"],
+    );
+    assert_eq!(o.code, 1, "{}", o.stderr);
+    assert!(
+        o.stderr
+            .contains("refusing to use credentials with http://192.0.2.1")
+            && o.stderr.contains("--allow-insecure"),
+        "{}",
+        o.stderr
+    );
 }

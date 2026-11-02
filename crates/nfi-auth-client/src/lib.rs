@@ -2,9 +2,12 @@
 //!
 //! Tokens are cached per (issuer, client id) in
 //! `$XDG_CACHE_HOME/nfi/tokens/` (mode 0600), next to a record of the
-//! service URLs each was logged in to. A cached token is only sent to those
-//! URLs: every CLI talking to one of them shares the login. A service's
-//! [`AuthConfig`] is fetched once per process, never cached.
+//! service URLs each was logged in to and the [`AuthConfig`] each advertised
+//! then. A cached token is only sent to those URLs: every CLI talking to one
+//! of them shares the login. A service's settings are only fetched again by
+//! `login` and after it rejects a request (a 401). Tokens are never sent, and
+//! logins never made, over plain HTTP to hosts other than loopback unless
+//! that is explicitly allowed.
 
 pub mod http;
 
@@ -54,12 +57,31 @@ fn digest(parts: &[&str]) -> String {
     hex::encode(&h.finalize()[..16])
 }
 
-/// The provider login a service URL was logged in with.
+/// The settings a service URL advertised when it was last logged in to
+/// (so with which provider login).
 #[derive(Debug, Serialize, Deserialize)]
 struct UrlLogin {
     url: String,
     issuer: String,
     client_id: String,
+    /// `None` in records written by older versions, which held only the
+    /// provider login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scopes: Option<Vec<String>>,
+    #[serde(default)]
+    anonymous: bool,
+}
+
+impl UrlLogin {
+    /// The recorded [`AuthConfig`], unless the record predates it.
+    fn config(&self) -> Option<AuthConfig> {
+        Some(AuthConfig {
+            issuer: self.issuer.clone(),
+            client_id: self.client_id.clone(),
+            scopes: self.scopes.clone()?,
+            anonymous: self.anonymous,
+        })
+    }
 }
 
 /// Whether a corrupt cache file was reported already.
@@ -179,13 +201,16 @@ impl TokenStore {
         remove(&self.token_path(issuer, client_id))
     }
 
-    /// Record that `url` was logged in to with the provider login
-    /// (`issuer`, `client_id`): its token may be sent there.
-    pub fn record_url(&self, url: &str, issuer: &str, client_id: &str) -> Result<()> {
+    /// Record that `url`, advertising `cfg`, was logged in to with the
+    /// provider login of `cfg`: its token may be sent there, and `cfg` is
+    /// used for it until it rejects a request.
+    pub fn record_url(&self, url: &str, cfg: &AuthConfig) -> Result<()> {
         let r = UrlLogin {
             url: url.trim_end_matches('/').into(),
-            issuer: issuer.into(),
-            client_id: client_id.into(),
+            issuer: cfg.issuer.clone(),
+            client_id: cfg.client_id.clone(),
+            scopes: Some(cfg.scopes.clone()),
+            anonymous: cfg.anonymous,
         };
         self.write(&self.url_path(url), &r)
     }
@@ -194,13 +219,6 @@ impl TokenStore {
     fn url_login(&self, url: &str) -> Result<Option<UrlLogin>> {
         let r: Option<UrlLogin> = read_json(&self.url_path(url))?;
         Ok(r.filter(|r| r.url == url.trim_end_matches('/')))
-    }
-
-    /// Whether `url` was logged in to with (`issuer`, `client_id`).
-    fn is_recorded(&self, url: &str, issuer: &str, client_id: &str) -> Result<bool> {
-        Ok(self
-            .url_login(url)?
-            .is_some_and(|r| (r.issuer.as_str(), r.client_id.as_str()) == (issuer, client_id)))
     }
 
     /// The URLs logged in to with (`issuer`, `client_id`).
@@ -297,9 +315,11 @@ pub struct Credentials {
     /// For the provider: never follows redirects, which would replay a
     /// refresh token or device code to wherever they point.
     idp: reqwest::Client,
+    /// The service's settings, fetched by `login` or after a 401.
     discovered: OnceCell<Option<AuthConfig>>,
     current: Mutex<Option<String>>,
     noted_expiry: AtomicBool,
+    allow_insecure: bool,
 }
 
 impl Credentials {
@@ -316,7 +336,15 @@ impl Credentials {
             discovered: OnceCell::new(),
             current: Mutex::new(None),
             noted_expiry: AtomicBool::new(false),
+            allow_insecure: false,
         }
+    }
+
+    /// Allow sending tokens and logging in over plain HTTP to hosts other
+    /// than loopback (`--allow-insecure`).
+    pub fn allow_insecure(mut self, allow: bool) -> Self {
+        self.allow_insecure = allow;
+        self
     }
 
     /// Use `store` instead of the default token cache.
@@ -325,7 +353,8 @@ impl Credentials {
         self
     }
 
-    /// The service's auth settings (fetched once); `None` if it has no OIDC.
+    /// The service's auth settings, fetched from it (once per process; only
+    /// to log in, and after a 401); `None` if it has no OIDC.
     pub async fn config(&self) -> Result<Option<&AuthConfig>> {
         let c = self
             .discovered
@@ -347,16 +376,20 @@ impl Credentials {
         Ok(c.as_ref())
     }
 
-    /// The token for a command; logs in (if `prompt` and stderr is a
-    /// terminal) or fails with the hint when one is needed.
+    /// The token for a command, without asking the service anything: the
+    /// explicit one, else the login of a URL logged in to (refreshed if
+    /// needed). Without a usable one, a service accepting anonymous requests
+    /// gets none; otherwise this logs in (if `prompt` and stderr is a
+    /// terminal) or fails with the hint. A URL never logged in to gets none:
+    /// a 401 then tells (see [`Credentials::relogin`]).
     pub async fn token(&self, prompt: bool) -> Result<Option<String>> {
-        if let Some(t) = &self.explicit {
-            return Ok(Some(t.clone()));
+        if let Some(t) = self.explicit_token()? {
+            return Ok(Some(t));
         }
-        let Some(cfg) = self.config().await? else {
+        let Some(cfg) = self.recorded().await? else {
             return Ok(None);
         };
-        let expired = match self.stored(cfg).await? {
+        let expired = match self.stored(&cfg).await? {
             Login::Usable(t) => return Ok(Some(t)),
             Login::Missing => false,
             Login::Expired => true,
@@ -370,14 +403,8 @@ impl Credentials {
             }
             return Ok(None);
         }
-        if self.store.is_none() {
-            bail!(
-                "authentication required: set HOME or NFI_TOKEN_CACHE to log in, or {}",
-                self.token_hint
-            );
-        }
         if prompt && interactive() {
-            return self.device(cfg).await.map(Some);
+            return self.device_rediscovered().await;
         }
         bail!("{}", self.hint())
     }
@@ -385,13 +412,13 @@ impl Credentials {
     /// A usable login if there is one (refreshing it), never prompting or
     /// failing for lack of one (for `whoami`).
     pub async fn current(&self) -> Result<Option<String>> {
-        if let Some(t) = &self.explicit {
-            return Ok(Some(t.clone()));
+        if let Some(t) = self.explicit_token()? {
+            return Ok(Some(t));
         }
-        let Some(cfg) = self.config().await? else {
+        let Some(cfg) = self.recorded().await? else {
             return Ok(None);
         };
-        Ok(match self.stored(cfg).await? {
+        Ok(match self.stored(&cfg).await? {
             Login::Usable(t) => Some(t),
             Login::Missing | Login::Expired => None,
         })
@@ -414,10 +441,11 @@ impl Credentials {
             .config()
             .await?
             .with_context(|| format!("{} does not use OIDC login", self.url))?;
+        self.secure(&self.url)?;
         if !force && let Some(store) = &self.store {
             match self.reuse(store, cfg).await {
                 Ok(Some((t, w))) => {
-                    store.record_url(&self.url, &cfg.issuer, &cfg.client_id)?;
+                    store.record_url(&self.url, cfg)?;
                     self.remember(t);
                     return Ok(w);
                 }
@@ -477,30 +505,93 @@ impl Credentials {
         Ok(was.then(|| urls.into_iter().filter(|u| *u != self.url).collect()))
     }
 
-    /// After a 401: forget the token in use and log in again, if that is
-    /// possible (no explicit token, a token cache, OIDC, stderr a terminal).
+    /// After a 401: forget the token in use, fetch the service's settings
+    /// (they may have changed) and log in again if that is possible (no
+    /// explicit token, a token cache, OIDC, stderr a terminal), recording
+    /// the URL with the new settings.
     pub async fn relogin(&self) -> Result<Option<String>> {
         *self.current.lock().unwrap() = None;
-        if self.explicit.is_some() || self.store.is_none() || !interactive() {
+        if self.explicit.is_some() || self.config().await?.is_none() || self.store.is_none() || !interactive()
+        {
             return Ok(None);
         }
-        match self.config().await? {
-            Some(cfg) => self.device(cfg).await.map(Some),
-            None => Ok(None),
-        }
+        self.device_rediscovered().await
     }
 
-    /// What to do about a 401.
+    /// What to do about a 401. Suggests logging in if the service uses OIDC
+    /// as far as known (from its settings fetched after the 401, else its
+    /// record).
     pub fn hint(&self) -> String {
         if self.explicit.is_some() {
             return "the token was rejected".into();
         }
-        match self.discovered.get() {
-            Some(Some(_)) => format!(
+        let oidc = match self.discovered.get() {
+            Some(c) => c.is_some(),
+            None => self
+                .store
+                .as_ref()
+                .is_some_and(|s| s.url_login(&self.url).ok().flatten().is_some()),
+        };
+        match (oidc, &self.store) {
+            (true, Some(_)) => format!(
                 "authentication required: run `{} login` or {}",
                 self.tool, self.token_hint
             ),
-            _ => format!("authentication required: {}", self.token_hint),
+            (true, None) => format!(
+                "authentication required: set HOME or NFI_TOKEN_CACHE to log in, or {}",
+                self.token_hint
+            ),
+            (false, _) => format!("authentication required: {}", self.token_hint),
+        }
+    }
+
+    /// The explicit token, if any, unless it may not be sent to the URL.
+    fn explicit_token(&self) -> Result<Option<String>> {
+        if self.explicit.is_some() {
+            self.secure(&self.url)?;
+        }
+        Ok(self.explicit.clone())
+    }
+
+    /// Fail unless credentials may be sent to `url` (see [`insecure`]).
+    fn secure(&self, url: &str) -> Result<()> {
+        if insecure(url) && !self.allow_insecure {
+            bail!(
+                "refusing to use credentials with {url} over plain HTTP: use https, or pass \
+                 --allow-insecure or set NFI_ALLOW_INSECURE=1"
+            );
+        }
+        Ok(())
+    }
+
+    /// The settings recorded for this URL when it was logged in to, if it
+    /// was. A record from an older version, without them, is completed once
+    /// from the service if it still names the same provider login.
+    async fn recorded(&self) -> Result<Option<AuthConfig>> {
+        let Some(store) = &self.store else {
+            return Ok(None);
+        };
+        let Some(r) = store.url_login(&self.url)? else {
+            return Ok(None);
+        };
+        if let Some(c) = r.config() {
+            return Ok(Some(c));
+        }
+        Ok(match self.config().await? {
+            Some(c) if (&c.issuer, &c.client_id) == (&r.issuer, &r.client_id) => {
+                store.record_url(&self.url, c)?;
+                Some(c.clone())
+            }
+            _ => None,
+        })
+    }
+
+    /// Fetch the service's settings and run the device flow; `None` if it
+    /// does not use OIDC (any more).
+    async fn device_rediscovered(&self) -> Result<Option<String>> {
+        match self.config().await? {
+            Some(cfg) => self.device(cfg).await.map(Some),
+            None => Ok(None),
         }
     }
 
@@ -509,23 +600,19 @@ impl Credentials {
         t
     }
 
-    /// The login for this URL held in memory or the cache, refreshing it if
-    /// needed. A cached login is only used if this URL was logged in to with
-    /// it, so a service merely claiming the same provider never gets it.
+    /// The login held in memory or the cache for this URL, given the
+    /// settings recorded for it (so with the provider login it was logged in
+    /// to with: a service merely claiming the same provider never gets it),
+    /// refreshing it if needed.
     async fn stored(&self, cfg: &AuthConfig) -> Result<Login> {
-        if let Some(t) = self.current.lock().unwrap().clone()
-            && fresh(&t)
-        {
-            return Ok(Login::Usable(t));
-        }
-        let Some(store) = &self.store else {
-            return Ok(Login::Missing);
+        let held = self.current.lock().unwrap().clone();
+        let l = match (held, &self.store) {
+            (Some(t), _) if fresh(&t) => Login::Usable(t),
+            (_, None) => Login::Missing,
+            (_, Some(store)) => self.provider(store, cfg).await?,
         };
-        if !store.is_recorded(&self.url, &cfg.issuer, &cfg.client_id)? {
-            return Ok(Login::Missing);
-        }
-        let l = self.provider(store, cfg).await?;
         if let Login::Usable(t) = &l {
+            self.secure(&self.url)?;
             self.remember(t.clone());
         }
         Ok(l)
@@ -586,7 +673,7 @@ impl Credentials {
         let t = self.device_login(cfg).await?;
         let _lock = self.lock(store, &cfg.issuer, &cfg.client_id).await?;
         store.save_token(&t)?;
-        store.record_url(&self.url, &cfg.issuer, &cfg.client_id)?;
+        store.record_url(&self.url, cfg)?;
         Ok(self.remember(t.id_token))
     }
 
@@ -664,7 +751,10 @@ impl Credentials {
     /// valid (`invalid_grant`); other errors (the provider unavailable, a
     /// misconfigured client...) leave it usable later.
     async fn refresh(&self, cfg: &AuthConfig, refresh_token: &str) -> Result<Option<StoredToken>> {
+        self.secure(&self.url)?;
+        self.secure(&cfg.issuer)?;
         let md = self.metadata(&cfg.issuer).await?;
+        self.secure(&md.token_endpoint)?;
         let scope = cfg.scopes.join(" ");
         let r = self
             .token_request(
@@ -695,10 +785,14 @@ impl Credentials {
 
     /// The device authorization grant, prompting on stderr.
     async fn device_login(&self, cfg: &AuthConfig) -> Result<StoredToken> {
+        self.secure(&self.url)?;
+        self.secure(&cfg.issuer)?;
         let md = self.metadata(&cfg.issuer).await?;
         let Some(dev_ep) = &md.device_authorization_endpoint else {
             bail!("{} does not support the device authorization grant", cfg.issuer);
         };
+        self.secure(dev_ep)?;
+        self.secure(&md.token_endpoint)?;
         let scope = cfg.scopes.join(" ");
         let r = self
             .idp
@@ -815,6 +909,23 @@ fn interactive() -> bool {
     std::io::stderr().is_terminal()
 }
 
+/// Whether credentials sent to `url` would cross the network unencrypted:
+/// plain `http://` to a host other than loopback (`localhost`,
+/// 127.0.0.0/8, `::1`).
+fn insecure(url: &str) -> bool {
+    let Ok(u) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let host = u.host_str().unwrap_or_default();
+    let loopback = host == "localhost"
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|a| a.is_loopback());
+    u.scheme() == "http" && !loopback
+}
+
 /// Read the unverified `exp` claim of a JWT (seconds since the epoch).
 fn jwt_expiry(token: &str) -> Option<i64> {
     use base64::Engine;
@@ -854,19 +965,35 @@ mod tests {
         assert!(!s.remove_token("i", "c").unwrap());
 
         // URL records, keyed by the URL without a trailing slash.
-        s.record_url("http://a/", "i", "c").unwrap();
-        s.record_url("http://b", "i", "c").unwrap();
-        s.record_url("http://c", "i", "other").unwrap();
-        assert!(s.is_recorded("http://a", "i", "c").unwrap());
-        assert!(!s.is_recorded("http://c", "i", "c").unwrap());
-        assert!(!s.is_recorded("http://d", "i", "c").unwrap());
+        let cfg = |client_id: &str| AuthConfig {
+            issuer: "i".into(),
+            client_id: client_id.into(),
+            scopes: vec!["openid".into()],
+            anonymous: true,
+        };
+        s.record_url("http://a/", &cfg("c")).unwrap();
+        s.record_url("http://b", &cfg("c")).unwrap();
+        s.record_url("http://c", &cfg("other")).unwrap();
+        let recorded = |u: &str| s.url_login(u).unwrap().and_then(|r| r.config());
+        assert_eq!(recorded("http://a"), Some(cfg("c")));
+        assert_eq!(recorded("http://c"), Some(cfg("other")));
+        assert_eq!(recorded("http://d"), None);
         assert_eq!(s.urls("i", "c").unwrap(), ["http://a", "http://b"]);
+        // A record from an older version names the provider login only.
+        std::fs::write(
+            s.url_path("http://e"),
+            r#"{"url": "http://e", "issuer": "i", "client_id": "c"}"#,
+        )
+        .unwrap();
+        let old = s.url_login("http://e").unwrap().unwrap();
+        assert_eq!((old.issuer.as_str(), old.config()), ("i", None));
+        assert_eq!(s.urls("i", "c").unwrap(), ["http://a", "http://b", "http://e"]);
 
         // A corrupt file counts as missing.
         std::fs::write(s.token_path("i", "c"), "{").unwrap();
         assert!(s.token("i", "c").unwrap().is_none());
         std::fs::write(s.url_path("http://a"), "").unwrap();
-        assert!(!s.is_recorded("http://a", "i", "c").unwrap());
+        assert!(s.url_login("http://a").unwrap().is_none());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -891,8 +1018,46 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        s.record_url("http://a", "i", "c").unwrap();
+        let cfg = AuthConfig {
+            issuer: "i".into(),
+            client_id: "c".into(),
+            scopes: vec![],
+            anonymous: false,
+        };
+        s.record_url("http://a", &cfg).unwrap();
         assert_eq!((mode(s.dir.clone()), mode(s.urls_dir())), (0o700, 0o700));
+    }
+
+    #[test]
+    fn insecure_urls() {
+        for u in [
+            "http://192.0.2.1",
+            "http://nfi.example:8080/x",
+            "http://[2001:db8::1]",
+        ] {
+            assert!(insecure(u), "{u}");
+        }
+        for u in [
+            "https://nfi.example",
+            "http://localhost:8080",
+            "http://127.0.0.1",
+            "http://127.1.2.3:9",
+            "http://[::1]:80",
+        ] {
+            assert!(!insecure(u), "{u}");
+        }
+        let c = Credentials::new("t", "http://192.0.2.1/", Some("x".into()), "");
+        let e = c.explicit_token().unwrap_err().to_string();
+        assert!(
+            e.contains("http://192.0.2.1")
+                && e.contains("--allow-insecure")
+                && e.contains("NFI_ALLOW_INSECURE=1"),
+            "{e}"
+        );
+        let c = c.allow_insecure(true);
+        assert_eq!(c.explicit_token().unwrap().as_deref(), Some("x"));
+        let c = Credentials::new("t", "https://nfi.example", Some("x".into()), "");
+        assert!(c.explicit_token().is_ok());
     }
 
     #[test]

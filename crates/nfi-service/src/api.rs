@@ -257,11 +257,9 @@ async fn prune(State(s): State<AppState>, Json(req): Json<PruneRequest>) -> Resu
             "specify releases, commits or channels to prune",
         ));
     }
-    if let Some(c) = crate::prune::invalid_commit(&req) {
-        return Err(err(
-            StatusCode::BAD_REQUEST,
-            format!("invalid commit {c:?}: expected a non-empty hex commit prefix"),
-        ));
+    // The job checks again, under the write lock.
+    if let Some(e) = crate::prune::commit_error(&s.pool, &req).await? {
+        return Err(err(StatusCode::BAD_REQUEST, e));
     }
     let id = jobs::enqueue(&s.pool, "prune", serde_json::to_value(&req)?).await?;
     Ok((StatusCode::ACCEPTED, Json(JobCreated { id })).into_response())
