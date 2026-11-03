@@ -169,16 +169,6 @@ pub fn merge(g: &mut ReducedGraph, other: ReducedGraph) {
     g.derivations.extend(other.derivations);
 }
 
-/// Derivations that no other derivation in the graph depends on.
-pub fn requested(g: &ReducedGraph) -> Vec<String> {
-    let referenced: BTreeSet<&String> = g.derivations.values().flat_map(|d| d.input_drvs.keys()).collect();
-    g.derivations
-        .keys()
-        .filter(|k| !referenced.contains(k))
-        .cloned()
-        .collect()
-}
-
 /// All store paths mentioned as outputs or input sources.
 pub fn all_paths(g: &ReducedGraph) -> BTreeSet<String> {
     let mut s = BTreeSet::new();
@@ -214,10 +204,6 @@ mod tests {
         assert_eq!(
             b.input_drvs["/nix/store/mq9yfr049mwif1agr68la1sgsxw8kqpv-a.drv"],
             BTreeSet::from(["lib".to_string()])
-        );
-        assert_eq!(
-            requested(&g),
-            vec!["/nix/store/0kchj5r1l1i7k32mlwybj099flmqnw4g-b.drv"]
         );
         // Reduced form round-trips through reduce.
         let again = reduce(&serde_json::to_value(&g).unwrap()).unwrap();

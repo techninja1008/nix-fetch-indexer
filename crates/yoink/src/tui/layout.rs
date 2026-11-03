@@ -17,13 +17,24 @@ pub enum Level {
 /// Width of the status cell `[T 57]`.
 pub const STATUS_W: u16 = 6;
 
+/// Full indicators: the phase name and byte readout columns, the narrowest
+/// name and bar, and the width of the fixed parts (phase, readout and the
+/// three gaps around them).
+pub const FULL_PHASE_W: u16 = 18;
+pub const FULL_READOUT_W: u16 = 21;
+pub const FULL_NAME_MIN: u16 = 12;
+pub const FULL_BAR_MIN: u16 = 4;
+pub const FULL_FIXED_W: u16 = FULL_PHASE_W + FULL_READOUT_W + 3;
+
 impl Level {
     pub const ALL: [Level; 4] = [Level::Full, Level::Wide, Level::Short, Level::Mini];
 
     /// Narrowest cell for the level, including a one-column gap.
     fn min_cell(self) -> u16 {
         match self {
-            Level::Full => 60,
+            // Status, a gap, the fixed columns, the narrowest name and bar,
+            // and the trailing gap.
+            Level::Full => STATUS_W + 1 + FULL_FIXED_W + FULL_NAME_MIN + FULL_BAR_MIN + 1,
             Level::Wide => 40,
             // The status and at least six characters of the name.
             Level::Short => STATUS_W + 8,
@@ -153,6 +164,8 @@ mod tests {
         assert_eq!(g.max_scroll(), 71);
         // A narrow terminal never uses full lines.
         assert_eq!(Grid::choose(1, 50, 20).level, Level::Wide);
+        assert_eq!(Grid::choose(1, 65, 20).level, Level::Wide);
+        assert_eq!(Grid::choose(1, 66, 20).level, Level::Full);
         assert_eq!(Grid::choose(1, 5, 1).level, Level::Mini);
     }
 

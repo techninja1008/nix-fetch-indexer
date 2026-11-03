@@ -1,7 +1,11 @@
 name: Checks
 
-# Runs the dev shell's git hooks (see `preCommit` in flake.nix) on every file:
-# nix/Cargo.nix must match Cargo.lock, and Nix and Rust code must be formatted.
+# - pre-commit: the dev shell's git hooks (see `preCommit` in flake.nix) on
+#   every file: nix/Cargo.nix must match Cargo.lock, and Nix and Rust code
+#   must be formatted.
+# - flake-check: `nix flake check`, which builds the workspace and runs every
+#   crate's tests (the `checks` in flake.nix, one per crate).
+# - clippy: lints, with warnings as errors, in the dev shell.
 
 on:
   push:
@@ -21,3 +25,24 @@ jobs:
       - uses: cachix/install-nix-action@2126ae7fc54c9df00dd18f7f18754393182c73cd # v31.9.1
       - name: Run the git hooks on all files
         run: nix develop --command pre-commit run --all-files --show-diff-on-failure
+
+  flake-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@2126ae7fc54c9df00dd18f7f18754393182c73cd # v31.9.1
+      - name: Build and test
+        run: nix flake check -L --keep-going
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@2126ae7fc54c9df00dd18f7f18754393182c73cd # v31.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Clippy
+        run: nix develop --command cargo clippy --workspace --all-targets --locked -- -D warnings

@@ -33,6 +33,8 @@ pub struct ClosureReport {
     pub roots: usize,
     pub fetched: usize,
     pub reused: usize,
+    /// Roots recorded as missing: not in the cache, or with a closure that
+    /// isn't (some path in it is 404).
     pub missing: usize,
 }
 
@@ -51,8 +53,10 @@ pub fn parse_store_paths(xz: &[u8]) -> Result<Vec<StorePath>> {
 
 /// Index the closure of `roots` into `builder`, marking it as part of
 /// `closure` (an index into the builder's closure table). Paths already
-/// present in the builder are not fetched again; roots that are not in the
-/// cache are recorded as missing from the closure.
+/// present in the builder are not fetched again. Roots that are not in the
+/// cache, or whose closure includes (at any depth) a path that isn't, are
+/// recorded as missing from the closure instead, and their closures are
+/// not marked (paths in them that other roots reach still are).
 ///
 /// This is the walk shared by every closure type: they differ only in how
 /// their roots are collected.
@@ -69,15 +73,15 @@ pub async fn index_closure(
     };
     let bit = Bitset::single(closure);
     let mut queued: HashSet<StoreHash> = HashSet::new();
-    let mut pending: Vec<(StoreHash, String)> = Vec::new();
+    let mut pending: Vec<StoreHash> = Vec::new();
     for r in roots {
         if builder.contains(&r.hash) {
             report.reused += 1;
         } else if queued.insert(r.hash) {
-            pending.push((r.hash, r.name.clone()));
+            pending.push(r.hash);
         }
     }
-    let mut missing_roots: Vec<(StoreHash, String)> = Vec::new();
+    let mut not_found = 0usize;
     if !pending.is_empty() {
         fetcher
             .warm_up(&format!(
@@ -91,12 +95,12 @@ pub async fn index_closure(
     let total_hint = pending.len();
     loop {
         while in_flight.len() < opts.concurrency.max(1) {
-            let Some((hash, name)) = pending.pop() else { break };
+            let Some(hash) = pending.pop() else { break };
             let url = narinfo::url(&opts.cache_url, &hash);
             let f = fetcher.clone();
-            in_flight.push(async move { (hash, name, f.get_opt(&url).await) });
+            in_flight.push(async move { (hash, f.get_opt(&url).await) });
         }
-        let Some((hash, name, res)) = in_flight.next().await else {
+        let Some((hash, res)) = in_flight.next().await else {
             break;
         };
         match res? {
@@ -105,8 +109,7 @@ pub async fn index_closure(
                 let info = narinfo::parse(&text).with_context(|| format!("narinfo for {hash}"))?;
                 for r in &info.references {
                     if !builder.contains(r) && queued.insert(*r) {
-                        // Name is filled in when its narinfo arrives.
-                        pending.push((*r, String::new()));
+                        pending.push(*r);
                     }
                 }
                 builder.insert(info, &Bitset::new());
@@ -120,27 +123,26 @@ pub async fn index_closure(
                     );
                 }
             }
-            Fetched::NotFound => {
-                report.missing += 1;
-                missing_roots.push((hash, name));
-            }
+            // Left out of the builder: the roots whose closures include
+            // it are found by `mark_closure`.
+            Fetched::NotFound => not_found += 1,
         }
     }
     let secs = started.elapsed().as_secs_f64();
     tracing::info!(
         fetched = report.fetched,
+        not_found,
         secs = format!("{secs:.1}"),
-        per_sec = format!("{:.0}", (report.fetched + report.missing) as f64 / secs.max(1e-9)),
+        per_sec = format!("{:.0}", (report.fetched + not_found) as f64 / secs.max(1e-9)),
         "narinfo fetching finished"
     );
-    let root_hashes: Vec<StoreHash> = roots.iter().map(|r| r.hash).collect();
-    let missing_set: HashSet<StoreHash> = missing_roots.iter().map(|(h, _)| *h).collect();
-    builder.mark_closure(
-        root_hashes.into_iter().filter(|h| !missing_set.contains(h)),
-        closure,
-    );
-    for (h, name) in missing_roots {
-        builder.add_missing(h, &name, &bit);
+    let unmarked: HashSet<StoreHash> = builder
+        .mark_closure(roots.iter().map(|r| r.hash), closure)
+        .into_iter()
+        .collect();
+    for r in roots.iter().filter(|r| unmarked.contains(&r.hash)) {
+        builder.add_missing(r.hash, &r.name, &bit);
     }
+    report.missing = unmarked.len();
     Ok(report)
 }

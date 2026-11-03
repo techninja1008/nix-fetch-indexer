@@ -50,7 +50,7 @@ The packages live in [`nix/`](nix) and are loaded with `callPackage`. The worksp
 nix run .#generate-cargo-nix
 ```
 
-`nix develop` installs git hooks ([git-hooks.nix](https://github.com/cachix/git-hooks.nix)) that do this whenever a `Cargo.toml` or `Cargo.lock` changes, and check Nix (nixfmt) and Rust (rustfmt) formatting. CI runs the same hooks on every file, so a stale `nix/Cargo.nix` or unformatted code fails the build.
+`nix develop` installs git hooks ([git-hooks.nix](https://github.com/cachix/git-hooks.nix)) that do this whenever a `Cargo.toml` or `Cargo.lock` changes, and check Nix (nixfmt) and Rust (rustfmt) formatting. CI ([`checks.yml`](.github/workflows/checks.yml)) runs the same hooks on every file, so a stale `nix/Cargo.nix` or unformatted code fails the build; it also runs `nix flake check` (the build and every crate's tests) and `cargo clippy --workspace --all-targets -- -D warnings` in the dev shell.
 
 Each image takes its binary as an argument, so another build can be swapped in with `.override`:
 
@@ -245,9 +245,9 @@ Every replica serves queries. Every replica also runs a job worker, unless `--no
 
 **Jobs and scaling**
 
-- Jobs (ingest, prune, reindex) live in a Postgres table. Any replica can claim them with `SKIP LOCKED`, and a stale heartbeat makes a job reclaimable.
-- Uploads are staged in Postgres, so it does not matter which replica receives them.
-- Writers are serialised with an advisory lock.
+- Jobs (ingest, prune, reindex) live in a Postgres table. Any replica can claim them with `SKIP LOCKED`, and a stale heartbeat makes a job reclaimable. A job is claimed at most 3 times: if its third worker dies running it too, it fails (`abandoned after 3 attempts`) instead of taking down every replica in turn.
+- Uploads are staged in Postgres, so it does not matter which replica receives them. An upload that receives no data for 10 minutes (its client or replica died) fails and its staged data is freed.
+- Writers are serialised with an advisory lock, and search index writers (syncs after ingest and prune, rebuilds) with another.
 
 ### Single-node mode (embedded PostgreSQL and Meilisearch)
 
@@ -276,6 +276,7 @@ nfi-service --embedded-postgres /var/lib/nfi/pg --embedded-meilisearch /var/lib/
 
 - On SIGINT or SIGTERM, the service stops serving, then stops Meilisearch, then PostgreSQL.
 - On Linux the children are also signalled if the service dies.
+- If PostgreSQL or Meilisearch dies, the service logs it, stops the other and exits with an error, for its supervisor (e.g. systemd) to restart.
 
 **Combining modes**
 
@@ -325,7 +326,7 @@ Both listeners are open by default. Optionally, callers log in with OIDC (the de
 
 - `claims`: the ID token's claims.
 - `user`: `{"username": ..., "session": ...}` as extracted above.
-- `request`: `{"method": ..., "path": ...}`.
+- `request`: `{"method": ..., "path": ...}`. `path` is percent-decoded, as the routes see it (`/v1/packages/%69nternal-x` is `/v1/packages/internal-x`); a request whose path has an encoded `/` (`%2F`), invalid percent-encoding or invalid UTF-8 is rejected with 400.
 
 ```cel
 'nfi-admins' in claims.groups && request.method != 'DELETE'
@@ -336,15 +337,15 @@ Both listeners are open by default. Optionally, callers log in with OIDC (the de
 | method | path | description |
 |---|---|---|
 | GET | `/auth/v1/config` | `{"issuer", "client_id", "scopes", "anonymous"}` for CLIs to log in with (`anonymous`: requests without a token are served too); 404 when the listener doesn't use OIDC |
-| GET | `/auth/v1/whoami` | `{"username", "session", "additional_info"}` of the caller (`additional_info`: the whoami expression's map, by default the token's claims), whether or not the authorisation policy admits them; 401 when not logged in, 404 when the listener doesn't use OIDC |
+| GET | `/auth/v1/whoami` | `{"username", "session", "additional_info"}` of the caller (`additional_info`: the whoami expression's map, by default the token's claims), whether or not the authorisation policy admits them; 401 when not logged in, 404 when the listener has no authentication; on a listener with a static token, `{"username": "(token)"}` for that token (401 without it) |
 
 ### Public API
 
 | method | path | description |
 |---|---|---|
-| GET | `/v1/search?q=&attr=&pname=&version=&program=&system=&release=&channel=&series=&commit=&limit=&offset=` | Search over packages and programs |
+| GET | `/v1/search?q=&attr=&pname=&version=&program=&system=&release=&channel=&series=&commit=&limit=&offset=` | Search over packages and programs; `commit` selects a release like `/v1/packages` does (a hex prefix of at least 8 digits, any case; 400 if malformed or ambiguous, 404 if unknown) |
 | GET | `/v1/packages/{attr}?commit=&system=` | Metadata, output paths (with a `cached` flag) and programs for an attribute at a commit; the commit is a hex prefix of at least 8 digits (any case, the full hash included) that must match exactly one release: a malformed commit or a prefix matching several releases (the error names the prefix and the count) is a 400, and one matching none is a 404 |
-| POST | `/v1/lookup/bulk` | Body `{"items":[{"attr","commit","system"?,"outputs"?}]}`; returns per-item status and outputs, plus the deduplicated closure |
+| POST | `/v1/lookup/bulk` | Body `{"items":[{"attr","commit","system"?,"outputs"?}]}`, at most 10,000 items (more is a 400; split larger lookups); returns per-item status and outputs, plus the deduplicated closure |
 | POST | `/v1/minimise?close_miss_threshold=` | Body: raw `nix derivation show --recursive` JSON (legacy or v4 format) or a reduced graph `{"derivations":{drv:{outputs,inputDrvs,inputSrcs,fixed}}}` |
 | GET | `/v1/releases?channel=&errors=` | What is in the index: releases (name, commit, channel, series) with their datasets and evaluations: eval type, closure type names, and `error_count` (`null` when errors are not indexed). With `errors=true`, each evaluation with indexed errors also lists them as `errors` (`<attr>@<system>`; `nfi releases --errors`). The same as `/admin/v1/releases` |
 
@@ -403,7 +404,7 @@ The check takes about 20 s on all of `nixos-26.05`: 2.7M paths and 38M reference
 
 **Queries fail instead of returning partial results.** If a closure query reaches a dangling reference or a path in no closure, the request fails with HTTP 500 and an `index inconsistency: …` message. It doesn't return a smaller closure.
 
-**Bundles are validated.** `Bundle::validate`, which runs in the indexers and at ingest, rejects closures that aren't closed, and closures of releases without the closure dataset. Ingest doesn't store paths that belong to no closure.
+**Bundles are validated.** `Bundle::validate`, which runs in the indexers and at ingest, rejects closures that aren't closed, duplicate closure paths, release commits that aren't 40 lowercase hex digits, and closures of releases without the closure dataset. Ingest doesn't store paths that belong to no closure.
 
 ## CLIs
 
@@ -437,12 +438,12 @@ nfi logout
 NFI_TOKEN=$CI_ID_TOKEN nfi releases     # or --token-file / NFI_TOKEN_FILE
 ```
 
-- Tokens: an explicit token is sent as is, e.g. an ID token issued to CI with the service's client id as its audience. Precedence: a token on the command line (`nfi-admin --token`), then a token file (`--token-file` or its `*_TOKEN_FILE` variable), then the token variable (`NFI_TOKEN`, `NFI_ADMIN_TOKEN`, `YOINK_TOKEN`); values are trimmed and an empty variable counts as unset. Otherwise the CLI uses the cached login of a URL logged in to, refreshing it when it has less than a minute left. The service's login settings (`/auth/v1/config`, or that it has none) are fetched on the first use of a URL and cached; after that only `login` and a 401 from the service fetch them again. A URL logged in to uses the settings recorded by its login. Cached settings never make a URL receive a token: only a login there does.
-- Cache: `$XDG_CACHE_HOME/nfi/tokens` (or `$NFI_TOKEN_CACHE`, mode 0700), one login per provider and client, with a record of the service URLs it was made for. A login applies only to those URLs: the ones `login` was run for (`yoink login` records both of its URLs) and the ones a command logged in to through its prompt. The provider login is shared between them, so `nfi`, `nfi-admin` and `yoink` use one login for those URLs; a URL that was never logged in to counts as not logged in, even if it names the same provider and client. `login` there reuses the provider login if that service accepts it (no new device flow) and records the URL; `--force` always runs the device flow. `logout` needs no network: it removes the provider login and its URLs, so it also logs out of the other URLs using that login, and says which; for a URL that was never logged in to it removes nothing and says so. If reusing the provider login fails (e.g. the provider is unavailable), `login` warns and runs the device flow; a service that rejects a new login is no longer recorded as logged in (the provider login is kept). A corrupt cache file counts as missing.
+- Tokens: an explicit token is sent as is, e.g. an ID token issued to CI with the service's client id as its audience. Precedence: a token file (`--token-file` or its `*_TOKEN_FILE` variable), then the token variable (`NFI_TOKEN`, `NFI_ADMIN_TOKEN`, `YOINK_TOKEN`); values are trimmed and an empty variable counts as unset. Otherwise the CLI uses the cached login of a URL logged in to, refreshing it when it has less than a minute left. The service's login settings (`/auth/v1/config`, or that it has none) are fetched on the first use of a URL and cached; after that only `login` and a 401 from the service fetch them again. A URL logged in to uses the settings recorded by its login. Cached settings never make a URL receive a token: only a login there does.
+- Cache: `$XDG_CACHE_HOME/nfi/tokens` (or `$NFI_TOKEN_CACHE`, mode 0700; an existing directory, or its `urls` or `settings` subdirectory, that is not owned by you or that others may access is refused, not changed), one login per provider and client, with a record of the service URLs it was made for. A login applies only to those URLs: the ones `login` was run for (`yoink login` records both of its URLs) and the ones a command logged in to through its prompt. The provider login is shared between them, so `nfi`, `nfi-admin` and `yoink` use one login for those URLs; a URL that was never logged in to counts as not logged in, even if it names the same provider and client. When a URL without a record names the provider and client of a cached login, `login` there, or a command needing a login, asks on the terminal (`/dev/tty`, never stdin) `Use your login for <urls> to log in to <url>? [y/N]`: yes checks the login with the service's whoami and records the URL (no new device flow); no runs the device flow. Without a terminal the login is never reused: the command fails and says to run `login` on a terminal (or `login --force`). `login` on a URL already logged in reuses its login without asking; `--force` always runs the device flow. `logout` needs no network: it removes the provider login and its URLs, so it also logs out of the other URLs using that login, and says which; for a URL that was never logged in to it removes nothing and says so. If reusing the provider login fails (e.g. the provider is unavailable), `login` warns and runs the device flow; a service that rejects a new login, or whose whoami fails for it, is no longer recorded as logged in (the provider login is kept). A corrupt cache file counts as missing.
 - Prompting: when a command needs a login (the service's settings do not allow anonymous requests) and there is none for that URL, or it has expired, a CLI whose stderr is a terminal runs the device flow up front, before reading stdin, evaluating anything or uploading (stdin may be a pipe); otherwise it fails and suggests `nfi login`, before sending its request. On a 401 when no explicit token was used, the CLI fetches the service's settings again (they may have changed), logs in again once (recording the URL with the new settings) and repeats that one request (never the whole command); an explicit token that is rejected fails with no prompt. A refresh token is dropped only when the provider says it is invalid (`invalid_grant`); other provider errors fail the command (or, where anonymous access is allowed, it continues without the login) and keep it.
 - Plain HTTP: tokens (explicit or cached) are never sent, and logins and refreshes never made, over plain `http://` to a host other than loopback (`localhost`, 127.0.0.0/8, `::1`): not to the service URL, nor to the provider's issuer or endpoints. The command fails before sending anything, unless `--allow-insecure` (all CLIs) or `NFI_ALLOW_INSECURE=1` is given. Requests without a token are not affected.
-- `whoami` never logs in: it sends the login of a URL logged in to, if usable, and otherwise no token; it prints `<url>: <username>` (and the session, if any), then the service's `additional_info` as indented JSON (`--json`: the whole response); `<url>: not authenticated` with exit status 1 without a valid login; `<url>: does not use login` for a listener without OIDC.
-- `nfi-admin` has the same `login`, `logout` and `whoami` commands for the admin listener, and keeps `--token`, `--token-file`/`NFI_ADMIN_TOKEN_FILE` and `NFI_ADMIN_TOKEN` for an explicit token (the static admin token or an ID token).
+- `whoami` never logs in: it sends the login of a URL logged in to, if usable, and otherwise no token; it prints `<url>: <username>` (and the session, if any), then the service's `additional_info` as indented JSON (`--json`: the whole response); `<url>: not authenticated` with exit status 1 without a valid login; `<url>: authenticated with a static token` for the static token of a listener without OIDC (`<url>: not authenticated`, exit status 1, without it or with a wrong one); `<url>: does not use login` for a listener without authentication. `yoink whoami` checks whichever of its two URLs are configured.
+- `nfi-admin` has the same `login`, `logout` and `whoami` commands for the admin listener, and takes `--token-file`/`NFI_ADMIN_TOKEN_FILE` or `NFI_ADMIN_TOKEN` for an explicit token (never on the command line, where other users could see it) (the static admin token or an ID token).
 
 **Admin CLI**
 
@@ -478,11 +479,12 @@ YOINK_TOKEN=$CI_ID_TOKEN yoink --plain .#foo   # CI: a pre-obtained ID token, li
 
 **Behaviour**
 
-- The CLI exits only when every path has a result: 0 if all were mirrored, 1 if any failed, or on an unrecoverable error. A dropped connection is resumed by re-posting the unfinished paths (the service deduplicates); it gives up after 5 minutes without progress. `q`/Ctrl-C detaches with status 130, and the service keeps mirroring.
+- The CLI exits only when every path has a result: 0 if all were mirrored, 1 if any failed, or on an unrecoverable error. A dropped connection is resumed by re-posting the unfinished paths (the service deduplicates); it gives up after 5 minutes without progress (a result, a phase change or more bytes transferred; the status the service repeats on reconnecting doesn't count). Logs already shown are not repeated after a reconnect. `q`/Ctrl-C detaches with status 130 (in plain mode too, after the summary; in the monitor SIGTERM and SIGHUP also detach, restoring the terminal), and the service keeps mirroring.
 - **Monitor** (on a terminal): overall progress by path count, and a scrollable field with one indicator per path, in request order. Indicators shrink, from a full line (name, bar, phase, `12.3/45.6 MiB`) down to `[T 57]` (phase abbreviation and percent), to fit as many as possible; a finished path shows only its result, not its last phase. Yellow means warnings, red errors. Keys: arrows/`j`/`k` move, Enter shows that path's log, `l` all logs, Esc back, `q` quit; click selects, clicking again opens the log.
-- **Nix's lookup cache**: when any of the PURLs were `pkg:nix`, the CLI finally removes nix's `binary-cache*` files from `$XDG_CACHE_HOME/nix` (`~/.cache/nix`), which remember cache misses, so the paths just mirrored are found by the next nix command.
+- **Nix's lookup cache**: Nix remembers cache misses for `narinfo-cache-negative-ttl` (default 1 h), so a path looked up before it was mirrored can still look absent. After mirroring (also on detach), for the `pkg:nix` paths that succeeded (those with a name), yoink asks Nix whether it trusts you (`nix store info --json`, with the `--nix` command). If it does, `nix build --dry-run --option narinfo-cache-negative-ttl 0 --stdin` looks the paths up again, overwriting the stale misses (nothing is fetched; a failure is only a warning). If not, the daemon would ignore that setting, so yoink prints what to do instead: add yourself to `trusted-users`, set `narinfo-cache-negative-ttl` low in the daemon's `nix.conf`, run `sudo rm /root/.cache/nix/binary-cache-v*.sqlite*`, or use `--download`.
+- **`--download`** (with `--cache-url`, `$YOINK_CACHE_URL` or config `cache_url`: the binary cache the service mirrors into): instead, after mirroring, `nix copy --from <cache URL> --option narinfo-cache-negative-ttl 0 --stdin` puts the mirrored paths in the local store now. Nix reads the cache itself, so the daemon's cached misses don't matter; unless you are a trusted user, the paths must be signed by a key in `trusted-public-keys` (`require-sigs`). A failed download makes the command fail (status 1, after the summary); nothing is downloaded on detach. `--download` without a cache URL is refused before anything is done.
 - **Plain mode** (not a terminal, or `--plain`): phase changes, errors and results, one per line; `-v` adds warnings and info, `-vv` progress; `-q` only errors.
-- Configuration: `$XDG_CONFIG_HOME/yoink/config.toml` may set `url`, `nfi_url` and `nix`.
+- Configuration: `$XDG_CONFIG_HOME/yoink/config.toml` may set `url`, `nfi_url`, `nix` and `cache_url`.
 
 ### Service
 
@@ -505,7 +507,7 @@ The service always requires an OIDC ID token. Options before the backend subcomm
 | `--purl-authz-cel-file` | CEL policy per requested PURL; also `purl` (`{type, namespace, name, version, qualifiers, subpath, raw}`), e.g. `purl.type == 'nix'` (default `true`) |
 | `--max-purls` | most PURLs per request (default 100000) |
 
-**API.** `POST /v1/mirror` with `{"purls": [...]}` returns Server-Sent Events: `phases` (the backend's phases: `id`, `name`, one-character `abbrev`), then per PURL `status` (`phase`, optional `progress: {current, max, unit}`), `log` (`level`: `info`, `warning`, `error` or `fatal`, `message`) and finally one `result` (`outcome`: `success` or `fatal`). Every event names its PURL as requested. Jobs outlive the request: re-posting attaches to them. `GET /auth/v1/config` and `GET /auth/v1/whoami` are as on `nfi-service`.
+**API.** `POST /v1/mirror` with `{"purls": [...]}` returns Server-Sent Events: `phases` (the backend's phases: `id`, `name`, one-character `abbrev`), then per PURL `status` (`phase`, optional `progress: {current, max, unit}`), `log` (`level`: `info`, `warning`, `error` or `fatal`, `message`, and for a job's own lines `id: {job, line}`, so a client re-posting can skip lines it has) and finally one `result` (`outcome`: `success` or `fatal`). Every event names its PURL as requested. Jobs outlive the request: re-posting attaches to them. `GET /auth/v1/config` and `GET /auth/v1/whoami` are as on `nfi-service`.
 
 **HTTP backend** (`http`, options with `YOINK_*` variables):
 
@@ -518,10 +520,10 @@ The service always requires an OIDC ID token. Options before the backend subcomm
 | `--{upstream,target}-header-name`, `--{upstream,target}-header-file` | a custom header and the file holding its value (e.g. GitLab `PRIVATE-TOKEN` or `JOB-TOKEN`) |
 | `--nar-layout nar\|flat` | NARs under `nar/` (default) or next to the narinfos |
 | `--signing-key-file` | add a signature with this Nix key (`name:base64`); upstream signatures are always kept |
-| `--concurrency`, `--retries`, `--http-timeout` | paths in flight (16), retries per step for transient errors (5), idle timeout in seconds (120) |
+| `--concurrency`, `--retries`, `--http-timeout` | paths in flight (16), retries per step for transient errors (5), seconds without data flowing before a request fails (120): narinfo requests must finish within it, NAR transfers may take as long as they need while data keeps moving |
 | `--cache-priority`, `--no-cache-info` | `nix-cache-info` is created on the target with this priority (30) unless disabled |
 
-Each path goes through Queued (`Q`), Checking target (`C`: already there means done), Fetching narinfo (`N`), Transferring NAR (`T`: streamed from upstream into the target, with size and hash checked) and Publishing narinfo (`P`). The narinfo is uploaded last, so a narinfo on the target always means a complete path.
+Each path goes through Queued (`Q`), Checking target (`C`: already there means done), Fetching narinfo (`N`), Transferring NAR (`T`: streamed from upstream into the target, with size and hash checked once uploaded) and Publishing narinfo (`P`). The narinfo is uploaded last, so a narinfo on the target always means a complete path.
 
 **GitLab generic package registry as the target.** File names there can't contain `/`, so use the flat layout:
 

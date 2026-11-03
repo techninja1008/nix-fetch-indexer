@@ -16,8 +16,13 @@ use serde::{Deserialize, Serialize};
 /// when OIDC is not configured on that listener).
 pub const CONFIG_PATH: &str = "/auth/v1/config";
 /// Where a service reports the caller's [`Whoami`] (401 without a valid
-/// token; 404 when OIDC is not configured on that listener).
+/// token; 404 when the listener has no authentication). On a listener with
+/// a fixed token, the token's username is [`TOKEN_USERNAME`].
 pub const WHOAMI_PATH: &str = "/auth/v1/whoami";
+
+/// The [`Whoami`] username of a listener's fixed token (no session, no
+/// `additional_info`).
+pub const TOKEN_USERNAME: &str = "(token)";
 
 /// The OIDC settings a service advertises to its clients.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

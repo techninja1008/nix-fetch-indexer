@@ -24,11 +24,8 @@ struct Cli {
         global = true
     )]
     url: String,
-    /// Admin bearer token (the static admin token or an ID token); takes
-    /// precedence over --token-file and $NFI_ADMIN_TOKEN.
-    #[arg(long, global = true)]
-    token: Option<String>,
-    /// Read the admin token from a file; takes precedence over
+    /// Read the admin token (the static admin token or an ID token) from a
+    /// file instead of using the login; takes precedence over
     /// $NFI_ADMIN_TOKEN, which holds the token itself.
     #[arg(long, env = "NFI_ADMIN_TOKEN_FILE", global = true)]
     token_file: Option<PathBuf>,
@@ -267,13 +264,10 @@ async fn submitted(api: &Api, id: i64, do_wait: bool, json: bool) -> Result<bool
     }
 }
 
-const TOKEN_HINT: &str = "pass --token or --token-file (NFI_ADMIN_TOKEN, NFI_ADMIN_TOKEN_FILE)";
+const TOKEN_HINT: &str = "set NFI_ADMIN_TOKEN or pass --token-file";
 
 async fn run(cli: Cli) -> Result<Outcome> {
-    let token = match cli.token.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
-        Some(t) => Some(t.to_string()),
-        None => nfi_auth_client::explicit(cli.token_file.as_deref(), "NFI_ADMIN_TOKEN")?,
-    };
+    let token = nfi_auth_client::explicit(cli.token_file.as_deref(), "NFI_ADMIN_TOKEN")?;
     let url = &cli.url;
     let creds = Credentials::new("nfi-admin", url, token, TOKEN_HINT).allow_insecure(cli.allow_insecure);
     let ok = match cli.cmd {

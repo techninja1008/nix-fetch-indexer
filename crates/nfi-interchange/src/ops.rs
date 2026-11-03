@@ -154,35 +154,106 @@ impl ClosureBuilder {
             .union_with(closures);
     }
 
-    /// Mark the whole runtime closure of `roots` as present in `closure`.
-    /// Returns the hashes of references that are not known to the builder.
+    /// Mark the runtime closure of each of `roots` as present in `closure`,
+    /// unless it is incomplete: a root unknown to the builder, or whose
+    /// closure references (at any depth) a path unknown to it, is not
+    /// marked, nor is anything only such roots reach. Returns those roots,
+    /// each once, for the caller to record as missing.
     pub fn mark_closure(
         &mut self,
         roots: impl IntoIterator<Item = StoreHash>,
         closure: usize,
     ) -> Vec<StoreHash> {
-        let mut unknown = Vec::new();
-        let mut seen = HashSet::new();
-        let mut stack: Vec<StoreHash> = roots.into_iter().collect();
-        while let Some(h) = stack.pop() {
-            if !seen.insert(h) {
+        let roots: Vec<StoreHash> = roots.into_iter().collect();
+        // Known paths reachable from the roots, and those of them that
+        // reference an unknown path.
+        let mut reached = vec![false; self.paths.len()];
+        let mut reach = Vec::new();
+        let mut broken = Vec::new();
+        let mut stack: Vec<usize> = roots.iter().filter_map(|h| self.index.get(h).copied()).collect();
+        while let Some(i) = stack.pop() {
+            if std::mem::replace(&mut reached[i], true) {
                 continue;
             }
-            match self.index.get(&h) {
-                Some(&i) => {
-                    self.paths[i].0.closures.set(closure);
-                    stack.extend(self.paths[i].1.iter().copied());
+            reach.push(i);
+            for r in &self.paths[i].1 {
+                match self.index.get(r) {
+                    Some(&j) => stack.push(j),
+                    None => broken.push(i),
                 }
-                None => unknown.push(h),
             }
         }
-        unknown
+        // Paths that reach a broken path are incomplete too.
+        let mut incomplete = vec![false; self.paths.len()];
+        if !broken.is_empty() {
+            let mut referrers: HashMap<usize, Vec<usize>> = HashMap::new();
+            for &i in &reach {
+                for r in &self.paths[i].1 {
+                    if let Some(&j) = self.index.get(r) {
+                        referrers.entry(j).or_default().push(i);
+                    }
+                }
+            }
+            while let Some(i) = broken.pop() {
+                if !std::mem::replace(&mut incomplete[i], true) {
+                    broken.extend(referrers.get(&i).into_iter().flatten().copied());
+                }
+            }
+        }
+        let mut unmarked = Vec::new();
+        let mut seen = HashSet::new();
+        for h in roots {
+            match self.index.get(&h) {
+                Some(&i) if !incomplete[i] => stack.push(i),
+                _ if seen.insert(h) => unmarked.push(h),
+                _ => {}
+            }
+        }
+        // The closures of complete roots contain no incomplete path.
+        let mut marked = vec![false; self.paths.len()];
+        while let Some(i) = stack.pop() {
+            if std::mem::replace(&mut marked[i], true) {
+                continue;
+            }
+            self.paths[i].0.closures.set(closure);
+            stack.extend(self.paths[i].1.iter().map(|r| self.index[r]));
+        }
+        unmarked
     }
 
-    /// Produce a normalised section (paths sorted by hash). References to
-    /// unknown paths are dropped.
+    /// Produce a normalised section (paths sorted by hash). Paths in no
+    /// closure are dropped unless a kept path references them.
+    ///
+    /// # Panics
+    ///
+    /// If a kept path references a path unknown to the builder: closures
+    /// must be complete, as [`Self::mark_closure`] ensures.
     pub fn finish(self) -> ClosureSection {
-        let mut paths = self.paths;
+        let mut keep = vec![false; self.paths.len()];
+        let mut stack: Vec<usize> = (0..self.paths.len())
+            .filter(|&i| !self.paths[i].0.closures.is_empty())
+            .collect();
+        while let Some(i) = stack.pop() {
+            if std::mem::replace(&mut keep[i], true) {
+                continue;
+            }
+            let (p, refs) = &self.paths[i];
+            for r in refs {
+                match self.index.get(r) {
+                    Some(&j) => stack.push(j),
+                    None => panic!(
+                        "{}-{} references {r}, which is not in the closure builder",
+                        p.hash, p.name
+                    ),
+                }
+            }
+        }
+        let mut paths: Vec<_> = self
+            .paths
+            .into_iter()
+            .zip(keep)
+            .filter_map(|(p, k)| k.then_some(p))
+            .collect();
         paths.sort_by_key(|p| p.0.hash);
         let index: HashMap<StoreHash, u32> = paths
             .iter()
@@ -192,7 +263,7 @@ impl ClosureBuilder {
         let paths = paths
             .into_iter()
             .map(|(mut p, refs)| {
-                let mut r: Vec<u32> = refs.iter().filter_map(|h| index.get(h).copied()).collect();
+                let mut r: Vec<u32> = refs.iter().map(|h| index[h]).collect();
                 r.sort_unstable();
                 r.dedup();
                 p.references = r;
@@ -369,8 +440,9 @@ fn program_key(p: &Program) -> (String, String, String) {
 
 /// Merge `inputs` into a single bundle: union of release tables (by name),
 /// union of entries (by key) with OR-ed release bits. Each input must pass
-/// [`Bundle::validate`]; the first that does not is reported (counting from
-/// 1) and nothing is merged.
+/// [`Bundle::validate`], and releases of the same name must agree on their
+/// commit, channel and series; the first input that does not is reported
+/// (counting from 1) and nothing is merged.
 pub fn merge(inputs: impl IntoIterator<Item = Bundle>) -> Result<Bundle, String> {
     let mut out = Bundle::default();
     let mut closure: Option<ClosureBuilder> = None;
@@ -386,8 +458,25 @@ pub fn merge(inputs: impl IntoIterator<Item = Bundle>) -> Result<Bundle, String>
         let map: Vec<usize> = input
             .releases
             .iter()
-            .map(|r| out.ensure_release(r.clone()))
-            .collect();
+            .map(|r| {
+                if let Some(o) = out.release_index(&r.name).map(|i| &out.releases[i])
+                    && (&o.commit, &o.channel, &o.series) != (&r.commit, &r.channel, &r.series)
+                {
+                    return Err(format!(
+                        "merge input {}: release {} is commit {} of {} ({}), but commit {} of {} ({}) in an earlier input",
+                        n + 1,
+                        r.name,
+                        r.commit,
+                        r.channel,
+                        r.series,
+                        o.commit,
+                        o.channel,
+                        o.series
+                    ));
+                }
+                Ok(out.ensure_release(r.clone()))
+            })
+            .collect::<Result<_, String>>()?;
         let remap = |i: usize| map.get(i).copied();
         let emap: Vec<usize> = input
             .evals

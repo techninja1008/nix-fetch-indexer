@@ -301,7 +301,7 @@ async fn package_row(pool: &PgPool, release: i32, attr: &str, system: &str) -> R
     Ok(sqlx::query_as(
         "SELECT p.name, p.pname, p.version, p.description, p.homepage, p.license, p.main_program, p.broken, p.unfree
          FROM packages p JOIN package_releases pr ON pr.package_id = p.id
-         WHERE pr.release_id = $1 AND p.attr = $2 AND p.system = $3 LIMIT 1",
+         WHERE pr.release_id = $1 AND p.attr = $2 AND p.system = $3 ORDER BY p.id LIMIT 1",
     )
     .bind(release)
     .bind(attr)
@@ -349,21 +349,33 @@ pub enum LookupError {
     NotFound,
 }
 
+/// The release a user-given commit (a commit prefix, see [`commit_prefix`])
+/// selects; never [`LookupError::NotFound`].
+pub async fn select_release(
+    pool: &PgPool,
+    commit: &str,
+) -> Result<std::result::Result<ReleaseRow, LookupError>> {
+    let Some(prefix) = commit_prefix(commit) else {
+        return Ok(Err(LookupError::MalformedCommit(malformed_prefix_message(
+            commit,
+        ))));
+    };
+    Ok(match resolve_commit_prefix(pool, &prefix).await? {
+        PrefixMatch::One(r) => Ok(r),
+        PrefixMatch::None => Err(LookupError::UnknownCommit),
+        PrefixMatch::Many(n) => Err(LookupError::AmbiguousCommit(n)),
+    })
+}
+
 pub async fn lookup(
     pool: &PgPool,
     attr: &str,
     commit: &str,
     system: &str,
 ) -> Result<std::result::Result<PackageInfo, LookupError>> {
-    let Some(prefix) = commit_prefix(commit) else {
-        return Ok(Err(LookupError::MalformedCommit(malformed_prefix_message(
-            commit,
-        ))));
-    };
-    let release = match resolve_commit_prefix(pool, &prefix).await? {
-        PrefixMatch::One(r) => r,
-        PrefixMatch::None => return Ok(Err(LookupError::UnknownCommit)),
-        PrefixMatch::Many(n) => return Ok(Err(LookupError::AmbiguousCommit(n))),
+    let release = match select_release(pool, commit).await? {
+        Ok(r) => r,
+        Err(e) => return Ok(Err(e)),
     };
     let pkg = package_row(pool, release.id, attr, system).await?;
     let (outs, drv_path) = outputs(pool, release.id, attr, system).await?;
@@ -410,9 +422,16 @@ fn select_outputs(all: BTreeMap<String, String>, wanted: &Option<Vec<String>>) -
     }
 }
 
-/// Why the items of `req` can't be looked up, if they can't: every item
-/// whose commit is not a full commit hash (see [`full_commit`]).
-pub fn bulk_commit_error(req: &BulkRequest) -> Option<String> {
+/// Why the items of `req` can't be looked up, if they can't: more than
+/// [`BULK_MAX_ITEMS`] items, or items whose commit is not a full commit hash
+/// (see [`full_commit`]), each of which is named.
+pub fn bulk_request_error(req: &BulkRequest) -> Option<String> {
+    if req.items.len() > BULK_MAX_ITEMS {
+        return Some(format!(
+            "too many items: {} (at most {BULK_MAX_ITEMS} per request; split the request)",
+            req.items.len()
+        ));
+    }
     let bad: Vec<String> = req
         .items
         .iter()
@@ -429,20 +448,42 @@ pub fn bulk_commit_error(req: &BulkRequest) -> Option<String> {
 }
 
 /// Look up `req`'s items. Fails with a request error (the message of
-/// [`bulk_commit_error`]) before any lookup if a commit is malformed.
+/// [`bulk_request_error`]) before any lookup if the request is invalid.
+///
+/// Takes a fixed number of queries whatever the number of items: one for
+/// the distinct commits, one for every item's outputs (and, for items
+/// without outputs, whether the package exists), then the cache lookup and
+/// closure of all selected outputs.
 pub async fn bulk(pool: &PgPool, req: &BulkRequest) -> Result<std::result::Result<BulkResponse, String>> {
-    if let Some(e) = bulk_commit_error(req) {
+    if let Some(e) = bulk_request_error(req) {
         return Ok(Err(e));
     }
-    let mut commits: HashMap<String, Option<ReleaseRow>> = HashMap::new();
+    let item_commits: Vec<String> = req
+        .items
+        .iter()
+        .map(|it| full_commit(&it.commit).expect("validated above"))
+        .collect();
+    let distinct: Vec<String> = item_commits
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let releases: HashMap<String, ReleaseRow> = sqlx::query_as::<_, ReleaseRow>(
+        "SELECT id, name, commit, channel, series FROM releases WHERE commit = ANY($1)",
+    )
+    .bind(&distinct)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|r| (r.commit.clone(), r))
+    .collect();
+
     let mut items = Vec::with_capacity(req.items.len());
-    let mut wanted_paths = BTreeSet::new();
-    for it in &req.items {
+    // The items with a known release, by index: their (release, attr, system).
+    let (mut q_idx, mut q_rel, mut q_attr, mut q_sys) = (vec![], vec![], vec![], vec![]);
+    for (i, (it, commit)) in req.items.iter().zip(&item_commits).enumerate() {
         let system = it.system.clone().unwrap_or_else(|| DEFAULT_SYSTEM.to_string());
-        let commit = full_commit(&it.commit).expect("validated above");
-        if !commits.contains_key(&commit) {
-            commits.insert(commit.clone(), resolve_commit(pool, &commit).await?);
-        }
         let mut res = BulkItemResult {
             attr: it.attr.clone(),
             commit: it.commit.clone(),
@@ -453,21 +494,49 @@ pub async fn bulk(pool: &PgPool, req: &BulkRequest) -> Result<std::result::Resul
             missing_outputs: vec![],
             available_outputs: vec![],
         };
-        let Some(release) = commits[&commit].clone() else {
-            res.status = ItemStatus::UnknownCommit;
-            items.push(res);
-            continue;
-        };
-        res.release = Some(release.name.clone());
-        res.commit = release.commit.clone();
-        let (outs, _) = outputs(pool, release.id, &it.attr, &system).await?;
+        match releases.get(commit) {
+            None => res.status = ItemStatus::UnknownCommit,
+            Some(release) => {
+                res.release = Some(release.name.clone());
+                res.commit = release.commit.clone();
+                q_idx.push(i as i32);
+                q_rel.push(release.id);
+                q_attr.push(it.attr.clone());
+                q_sys.push(system);
+            }
+        }
+        items.push(res);
+    }
+    // (item index, outputs, their paths, whether the package exists).
+    let rows: Vec<(i32, Vec<String>, Vec<String>, bool)> = sqlx::query_as(
+        "SELECT q.idx, COALESCE(o.outputs, '{}'), COALESCE(o.paths, '{}'),
+                o.outputs IS NOT NULL OR EXISTS (
+                    SELECT 1 FROM packages p JOIN package_releases pr ON pr.package_id = p.id
+                     WHERE pr.release_id = q.rel AND p.attr = q.attr AND p.system = q.system)
+           FROM unnest($1::int[], $2::int[], $3::text[], $4::text[]) AS q(idx, rel, attr, system)
+           CROSS JOIN LATERAL (
+               SELECT array_agg(po.output ORDER BY po.output) AS outputs,
+                      array_agg(po.path ORDER BY po.output) AS paths
+                 FROM package_outputs po
+                WHERE po.release_id = q.rel AND po.attr = q.attr AND po.system = q.system) o",
+    )
+    .bind(&q_idx)
+    .bind(&q_rel)
+    .bind(&q_attr)
+    .bind(&q_sys)
+    .fetch_all(pool)
+    .await?;
+
+    let mut wanted_paths = BTreeSet::new();
+    for (i, outputs, paths, package) in rows {
+        let (it, res) = (&req.items[i as usize], &mut items[i as usize]);
+        let outs: BTreeMap<String, String> = outputs.into_iter().zip(paths).collect();
         if outs.is_empty() {
-            res.status = if package_row(pool, release.id, &it.attr, &system).await?.is_some() {
+            res.status = if package {
                 ItemStatus::NoOutpaths
             } else {
                 ItemStatus::UnknownAttr
             };
-            items.push(res);
             continue;
         }
         let missing: Vec<String> = it
@@ -481,7 +550,6 @@ pub async fn bulk(pool: &PgPool, req: &BulkRequest) -> Result<std::result::Resul
             res.status = ItemStatus::UnknownOutput;
             res.missing_outputs = missing;
             res.available_outputs = outs.into_keys().collect();
-            items.push(res);
             continue;
         }
         let sel = select_outputs(outs, &it.outputs);
@@ -498,7 +566,6 @@ pub async fn bulk(pool: &PgPool, req: &BulkRequest) -> Result<std::result::Resul
                 )
             })
             .collect();
-        items.push(res);
     }
     let cached = cached_paths(pool, &wanted_paths).await?;
     for it in &mut items {

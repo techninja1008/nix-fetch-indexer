@@ -79,15 +79,35 @@ async fn tokens() {
     let o = admin(&[], &["whoami"]);
     assert_eq!(o.code, 1);
     assert_eq!(o.stdout.trim(), format!("{}: not authenticated", svc.admin_url));
-    // `login` there reuses it without a terminal, although bob fails the
-    // admin policy (whoami does not apply it); commands then get 403.
+    // `login` there uses it only if the user agrees on a terminal.
     let o = admin(&[], &["login"]);
-    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert_eq!(o.code, 1);
     assert!(
-        o.stderr
-            .contains(&format!("logged in to {} as bob", svc.admin_url)),
+        o.stderr.contains("run `nfi-admin login` on a terminal to choose"),
         "{}",
         o.stderr
+    );
+    let mut c = Command::new(env!("CARGO_BIN_EXE_nfi-admin"));
+    c.args(["--url", &svc.admin_url, "login"])
+        .env("XDG_CONFIG_HOME", d.path())
+        .env("NFI_TOKEN_CACHE", d.path().join("tokens"))
+        .env_remove("NFI_ADMIN_TOKEN")
+        .env_remove("NFI_ADMIN_TOKEN_FILE");
+    let o = tokio::task::spawn_blocking(move || {
+        nfi_test_support::pty::run_typing(c, 100, 30, std::time::Duration::from_secs(60), "y\n")
+    })
+    .await
+    .unwrap();
+    // Although bob fails the admin policy (whoami does not apply it);
+    // commands then get 403.
+    assert_eq!(o.code, Some(0), "{}", o.text);
+    assert!(
+        o.text.contains(&format!(
+            "Use your login for {} to log in to {}? [y/N]",
+            svc.public_url, svc.admin_url
+        )) && o.text.contains(&format!("logged in to {} as bob", svc.admin_url)),
+        "{}",
+        o.text
     );
     let o = admin(&[], &["whoami"]);
     assert!(
@@ -120,8 +140,13 @@ async fn tokens() {
         "{}",
         o.stdout
     );
-    // --token takes precedence over the environment.
-    let o = admin(&[("NFI_ADMIN_TOKEN", "garbage")], &["--token", &root, "jobs"]);
+    // --token-file takes precedence over the environment.
+    let f = d.path().join("root");
+    std::fs::write(&f, &root).unwrap();
+    let o = admin(
+        &[("NFI_ADMIN_TOKEN", "garbage")],
+        &["--token-file", f.to_str().unwrap(), "jobs"],
+    );
     assert_eq!(o.code, 0, "{}", o.stderr);
 }
 

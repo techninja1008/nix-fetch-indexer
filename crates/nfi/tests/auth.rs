@@ -147,6 +147,16 @@ async fn tokens() {
 /// Run `sh -c script` on a pseudo-terminal, so that `nfi` may prompt for a
 /// login; `$NFI` is the binary.
 async fn sh_tty(dir: &Path, env: &[(&str, &str)], script: &str) -> nfi_test_support::pty::PtyOutput {
+    sh_tty_typing(dir, env, "", script).await
+}
+
+/// [`sh_tty`], typing `input` on the terminal.
+async fn sh_tty_typing(
+    dir: &Path,
+    env: &[(&str, &str)],
+    input: &str,
+    script: &str,
+) -> nfi_test_support::pty::PtyOutput {
     let mut c = Command::new("sh");
     c.args(["-c", script])
         .env("NFI", env!("CARGO_BIN_EXE_nfi"))
@@ -155,8 +165,9 @@ async fn sh_tty(dir: &Path, env: &[(&str, &str)], script: &str) -> nfi_test_supp
         .env_remove("NFI_TOKEN")
         .env_remove("NFI_TOKEN_FILE")
         .envs(env.iter().copied());
+    let input = input.to_string();
     tokio::task::spawn_blocking(move || {
-        nfi_test_support::pty::run(c, 100, 30, std::time::Duration::from_secs(60))
+        nfi_test_support::pty::run_typing(c, 100, 30, std::time::Duration::from_secs(60), &input)
     })
     .await
     .unwrap()
@@ -164,8 +175,13 @@ async fn sh_tty(dir: &Path, env: &[(&str, &str)], script: &str) -> nfi_test_supp
 
 /// Run `nfi` on a pseudo-terminal.
 async fn nfi_tty(dir: &Path, args: &[&str]) -> nfi_test_support::pty::PtyOutput {
+    nfi_tty_typing(dir, "", args).await
+}
+
+/// Run `nfi` on a pseudo-terminal, typing `input` on it.
+async fn nfi_tty_typing(dir: &Path, input: &str, args: &[&str]) -> nfi_test_support::pty::PtyOutput {
     let args: Vec<String> = args.iter().map(|a| format!("'{a}'")).collect();
-    sh_tty(dir, &[], &format!("exec \"$NFI\" {}", args.join(" "))).await
+    sh_tty_typing(dir, &[], input, &format!("exec \"$NFI\" {}", args.join(" "))).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -227,6 +243,34 @@ async fn interactive_login() {
     assert!(prompt < o.text.find("STDIN").expect(&o.text), "{}", o.text);
     assert!(o.text.contains("0 paths in closure"), "{}", o.text);
     assert_eq!(idp.device_logins(), 1);
+
+    // The same service at another URL: asked on the terminal whether to use
+    // the login there, while stdin is still the data; yes is remembered.
+    let other = url.replace("127.0.0.1", "localhost");
+    let o = sh_tty_typing(
+        d.path(),
+        &[("URL", &other)],
+        "y\n",
+        "echo missing@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa | \"$NFI\" --url \"$URL\" bulk -f -",
+    )
+    .await;
+    assert_eq!(o.code, Some(0), "{}", o.text);
+    assert!(
+        o.text
+            .contains(&format!("Use your login for {url} to log in to {other}? [y/N]")),
+        "{}",
+        o.text
+    );
+    assert!(o.text.contains("0 paths in closure"), "{}", o.text);
+    assert!(!o.text.contains("To log in"), "{}", o.text);
+    assert_eq!(idp.device_logins(), 1);
+    let o = run(
+        env!("CARGO_BIN_EXE_nfi"),
+        d.path(),
+        &[],
+        &["--url", &other, "whoami"],
+    );
+    assert!(o.stdout.starts_with(&format!("{other}: alice\n")), "{}", o.stderr);
 
     // The login is cached: later commands, even without a terminal, use it.
     let o = run(
@@ -340,19 +384,62 @@ async fn cached_login_not_sent_to_other_urls() {
     );
     assert!(evil.bearers().is_empty());
 
-    // On a terminal, `whoami` still sends nothing, and a command asks for a
-    // new login rather than using the cached one.
+    // Nor does `login` without a terminal: it says to log in on one.
+    let o = run(env!("CARGO_BIN_EXE_nfi"), d.path(), &[], &["--url", url, "login"]);
+    assert_eq!(o.code, 1);
+    assert!(
+        o.stderr.contains(&format!(
+            "the login for http://nfi.example could be used for {url}: run `nfi login` on a terminal"
+        )),
+        "{}",
+        o.stderr
+    );
+    assert!(evil.bearers().is_empty());
+
+    // On a terminal, `whoami` still sends nothing, and a command asks
+    // whether to use the cached login: no means a new login.
     let o = nfi_tty(d.path(), &["--url", url, "whoami"]).await;
     assert_eq!(o.code, Some(1), "{}", o.text);
     assert!(!o.text.contains("To log in"), "{}", o.text);
     assert!(evil.bearers().is_empty());
-    let o = nfi_tty(d.path(), &["--url", url, "releases"]).await;
+    let question = format!("Use your login for http://nfi.example to log in to {url}? [y/N]");
+    let o = nfi_tty_typing(d.path(), "n\n", &["--url", url, "releases"]).await;
     assert_eq!(o.code, Some(0), "{}", o.text);
+    assert!(o.text.contains(&question), "{}", o.text);
     assert!(o.text.contains("To log in, open"), "{}", o.text);
     assert_eq!(idp.device_logins(), 1);
     let sent = evil.bearers();
     assert_eq!(sent.len(), 1);
     assert_ne!(sent[0], cached);
+
+    // Yes: the cached login is checked with whoami and used, without a
+    // device login, and the URL recorded.
+    let d = tempfile::tempdir().unwrap();
+    let store = TokenStore::at(d.path().join("tokens"));
+    store
+        .save_token(&StoredToken {
+            issuer: idp.issuer().into(),
+            client_id: idp.client_id().into(),
+            id_token: cached.clone(),
+            refresh_token: None,
+        })
+        .unwrap();
+    store
+        .record_url("http://nfi.example", &idp.auth_config())
+        .unwrap();
+    let o = nfi_tty_typing(d.path(), "y\n", &["--url", url, "releases"]).await;
+    assert_eq!(o.code, Some(0), "{}", o.text);
+    assert!(o.text.contains(&question), "{}", o.text);
+    assert!(!o.text.contains("To log in"), "{}", o.text);
+    assert_eq!(idp.device_logins(), 1);
+    assert_eq!(evil.bearers()[1..], [cached.clone(), cached.clone()]);
+    let o = run(
+        env!("CARGO_BIN_EXE_nfi"),
+        d.path(),
+        &[],
+        &["--url", url, "whoami"],
+    );
+    assert_eq!((o.code, o.stdout.trim()), (0, format!("{url}: mallory").as_str()));
 }
 
 /// A URL's settings are fetched once, on its first use: a login is then

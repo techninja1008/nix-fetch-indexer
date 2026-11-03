@@ -114,8 +114,9 @@ let
       libId = "${name} (lib)";
       testsId = "${name} (integration tests)";
       self = internal.crates.${name};
-      # All of the crate's features, so feature-gated tests run too (in the
-      # workspace, other crates enable e.g. yoink-api's `client`).
+      # All of the crate's features, so feature-gated tests run too (e.g.
+      # nfi-service's embedded backends, or the test features a crate's
+      # dev-dependency on itself enables, as nfi-auth's does).
       testFeatures = [
         "default"
       ]
@@ -240,10 +241,16 @@ let
         cp ${../Cargo.toml} "$NIX_BUILD_TOP/workspace/Cargo.toml"
 
         # buildRustCrate puts a crate's test binaries in tests/: one per
-        # tests/*.rs (or tests/*/main.rs) file, one per binary target, and one
-        # for the library (named after it, plus a hash). Take the integration
-        # tests from their own build and the rest from the unit-test build.
+        # tests/*.rs (or tests/*/main.rs) file, one per binary target (named
+        # after it), and one for the library (named after it, plus a hash).
+        # Take the integration tests from their own build and the rest from
+        # the unit-test build; the integration build also has the binary
+        # targets' (the same as the unit build's). Anything else is a test
+        # binary this doesn't know how to run, which must not be skipped.
         package_id=$(jq -r --arg name ${name} '.packages[] | select(.name == $name) | .id' ${cargoMetadata})
+        bins=" ${
+          lib.concatMapStringsSep " " (b: b.name) (cargoNix.internal.crates.${name}.crateBin or [ ])
+        } "
         test -d ${unitTests}/tests ${
           lib.optionalString (integrationTests != null) "-a -d ${integrationTests}/tests"
         }
@@ -251,15 +258,22 @@ let
           lib.optionalString (integrationTests != null) "${integrationTests}/tests/*"
         }; do
           b=$(basename "$f")
-          if [ -e "tests/$b.rs" ] || [ -e "tests/$b/main.rs" ]; then
-            [[ $f == ${toString integrationTests}/* ]] || continue
-            kind=test id="${name}::$b"
-          elif [[ $f != ${unitTests}/* ]]; then
-            continue
+          if [[ $f != ${unitTests}/* ]]; then
+            if [ -e "tests/$b.rs" ] || [ -e "tests/$b/main.rs" ]; then
+              kind=test id="${name}::$b"
+            elif [[ $bins == *" $b "* ]]; then
+              continue
+            else
+              echo "unexpected integration test binary $f" >&2
+              exit 1
+            fi
           elif [[ $b == ${lib.replaceStrings [ "-" ] [ "_" ] name}-* ]]; then
             kind=lib id="${name}"
-          else
+          elif [[ $bins == *" $b "* ]]; then
             kind=bin id="${name}::bin/$b"
+          else
+            echo "unexpected unit test binary $f" >&2
+            exit 1
           fi
           jq -n --arg id "$id" --arg name "$b" --arg kind "$kind" --arg pkg "$package_id" --arg path "$f" \
             '{($id): {"binary-id": $id, "binary-name": $name, "package-id": $pkg, "kind": $kind, "binary-path": $path, "build-platform": "target"}}'
@@ -267,11 +281,18 @@ let
           '{"rust-build-meta": {"target-directory": "/nonexistent", "base-output-directories": ["debug"], "non-test-binaries": {}, "build-script-out-dirs": {}, "linked-paths": [], "target-platforms": [{"triple": "${stdenvNoCC.hostPlatform.rust.rustcTarget}", "target-features": "unknown"}], "target-platform": null}, "rust-binaries": (add // {})}' \
           > $NIX_BUILD_TOP/binaries-metadata.json
 
+        # A crate with tests must run some (a test binary that lost its tests
+        # would otherwise pass); one without (e.g. yoink-api) passes.
+        if grep -rqE '#\[(tokio::)?test[](]' src tests 2>/dev/null; then
+          no_tests=fail
+        else
+          no_tests=pass
+        fi
         cargo-nextest nextest run \
           --cargo-metadata ${cargoMetadata} \
           --binaries-metadata $NIX_BUILD_TOP/binaries-metadata.json \
           --workspace-remap $NIX_BUILD_TOP/workspace \
-          --no-fail-fast --no-tests=pass --show-progress=none --color=never
+          --no-fail-fast --no-tests=$no_tests --show-progress=none --color=never
 
         runHook postBuild
       '';

@@ -13,6 +13,8 @@ pub struct Config {
     pub nfi_url: Option<String>,
     /// nix command used to evaluate flake references.
     pub nix: Option<String>,
+    /// Binary cache the service mirrors into, for `--download`.
+    pub cache_url: Option<String>,
 }
 
 /// Load `path`, or the default file if it exists.

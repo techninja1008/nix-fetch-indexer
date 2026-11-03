@@ -490,3 +490,46 @@ in {
     );
     assert!(entries.iter().all(|e| e.system == "x86_64-linux"));
 }
+
+#[tokio::test]
+async fn transitive_404_makes_the_root_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture(dir.path());
+    let cache = dir.path().join("cache");
+    // 6 -> 7 -> {3, 98}, where 98 is not in the cache; 8 -> 3.
+    for (n, refs) in [(6u32, &[7u32][..]), (7, &[3, 98]), (8, &[3])] {
+        let refs: Vec<String> = refs.iter().map(|x| format!("{}-p{x}", hash(*x))).collect();
+        let body = format!(
+            "StorePath: /nix/store/{}-p{n}\nURL: nar/x.nar.xz\nCompression: xz\nReferences: {}\n",
+            hash(n),
+            refs.join(" ")
+        );
+        std::fs::write(cache.join(format!("{}.narinfo", hash(n))), body).unwrap();
+    }
+    let name = "nixos-25.05.300.cccccccccccc";
+    let rdir = dir.path().join("releases/nixos/25.05").join(name);
+    std::fs::create_dir_all(&rdir).unwrap();
+    std::fs::write(rdir.join("git-revision"), "c".repeat(40)).unwrap();
+    let sp: String = [6u32, 8, 99]
+        .iter()
+        .map(|n| format!("/nix/store/{}-p{n}\n", hash(*n)))
+        .collect();
+    std::fs::write(rdir.join("store-paths.xz"), xz(sp.as_bytes())).unwrap();
+    let eval = fake_eval(dir.path());
+    let base = serve(dir.path()).await;
+    let fetcher = Fetcher::new(1).unwrap();
+    let loc = ReleaseLocation::parse(&format!("{base}/releases/nixos/25.05/{name}")).unwrap();
+    let o = opts(&base, targets("store-paths"), &eval);
+    let b = index_releases(&fetcher, &[loc], &o, None).await.unwrap();
+    b.validate().unwrap();
+    // The sibling root's closure is complete; 6's is not, so neither 6 nor
+    // 7 (reached only from 6) is in the closure.
+    assert_eq!(names(&b, 0), vec!["p3", "p8"]);
+    let c = b.closure.as_ref().unwrap();
+    assert!(c.paths.iter().all(|p| p.name != "p6" && p.name != "p7"));
+    // Missing roots are recorded by name; the 404'd reference itself is not.
+    let mut missing: Vec<&str> = c.missing.iter().map(|m| m.name.as_str()).collect();
+    missing.sort();
+    assert_eq!(missing, vec!["p6", "p99"]);
+    assert!(c.missing.iter().all(|m| m.closures.get(0)));
+}

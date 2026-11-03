@@ -134,6 +134,18 @@ async fn query_cli() {
     assert_eq!(o.code, 1);
     assert!(o.stderr.contains("item 1 (missing@aaaa)"), "{}", o.stderr);
 
+    // More items than the service takes in one request: sent in batches,
+    // the results merged.
+    let many = d.join("many.txt");
+    let lines = vec![format!("hello@{A}"); nfi_api::BULK_MAX_ITEMS + 1].join("\n");
+    std::fs::write(&many, lines).unwrap();
+    let o = run(&["--json", "bulk", "-f", many.to_str().unwrap()]);
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let v: serde_json::Value = serde_json::from_str(&o.stdout).unwrap();
+    assert_eq!(v["items"].as_array().unwrap().len(), nfi_api::BULK_MAX_ITEMS + 1);
+    assert_eq!(v["closure"], json!(expect));
+    assert!(o.stderr.contains("2 paths in closure (at most "), "{}", o.stderr);
+
     // bulk from a file with a fetch hook using {} substitution; hook output reaches the terminal.
     let items = d.join("items.txt");
     std::fs::write(&items, format!("# comment\ncurl {A}\n\nhello@{A}@x86_64-linux\n")).unwrap();
@@ -267,6 +279,21 @@ async fn query_cli() {
         let o = run(&["--json", "search", "--program", "curl"]);
         let v: serde_json::Value = serde_json::from_str(&o.stdout).unwrap();
         assert_eq!(v["hits"][0]["attr"], "curl");
+    }
+
+    // A commit that selects no single release.
+    for (commit, err) in [
+        (
+            "zz",
+            "HTTP 400 Bad Request: invalid commit \"zz\": expected a hex commit prefix",
+        ),
+        ("deadbeef", "HTTP 404 Not Found: unknown commit deadbeef"),
+    ] {
+        let o = run(&["search", "--commit", commit, "x"]);
+        assert_eq!(o.code, 1);
+        if svc.has_search {
+            assert!(o.stderr.contains(err), "{}", o.stderr);
+        }
     }
 
     // Errors from the service are reported.

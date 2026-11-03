@@ -122,7 +122,10 @@ async fn pulls_into_the_target_cache() {
             .env("YOINK_TOKEN", &token)
             .env("NFI_TOKEN_CACHE", d.path().join("tokens"))
             .env("XDG_CONFIG_HOME", d.path())
+            .env("XDG_CACHE_HOME", d.path().join("cache"))
             .env("HOME", d.path())
+            .env("NFI_NIX", nix_stub(d.path()))
+            .env_remove("YOINK_CACHE_URL")
             .env_remove("NFI_URL")
             .stdin(std::process::Stdio::null());
         async move {
@@ -159,6 +162,19 @@ async fn pulls_into_the_target_cache() {
     assert!(err.contains("40 of 41 paths mirrored, 1 failed"), "{err}");
 }
 
+/// A stand-in for nix (run after mirroring): trusted, and succeeding.
+fn nix_stub(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let stub = dir.join("nix");
+    std::fs::write(
+        &stub,
+        "#!/bin/sh\ncase \"$*\" in *\"store info\"*) echo '{\"trusted\":true}' ;; *) cat >/dev/null ;; esac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    stub
+}
+
 /// `yoink` on a pseudo-terminal with an empty token cache.
 async fn yoink_tty(url: &str, dir: &std::path::Path, args: &[String]) -> nfi_test_support::pty::PtyOutput {
     let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_yoink"));
@@ -166,7 +182,10 @@ async fn yoink_tty(url: &str, dir: &std::path::Path, args: &[String]) -> nfi_tes
         .env("YOINK_URL", url)
         .env("NFI_TOKEN_CACHE", dir.join("tokens"))
         .env("XDG_CONFIG_HOME", dir)
+        .env("XDG_CACHE_HOME", dir.join("cache"))
         .env("HOME", dir)
+        .env("NFI_NIX", nix_stub(dir))
+        .env_remove("YOINK_CACHE_URL")
         .env("TERM", "xterm-256color")
         .env_remove("YOINK_TOKEN")
         .env_remove("YOINK_TOKEN_FILE")

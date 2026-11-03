@@ -71,11 +71,32 @@ pub fn admin_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn search(State(s): State<AppState>, Query(q): Query<SearchQuery>) -> R<SearchResponse> {
+async fn search(State(s): State<AppState>, Query(mut q): Query<SearchQuery>) -> R<SearchResponse> {
     let Some(m) = &s.meili else {
         return Err(err(StatusCode::SERVICE_UNAVAILABLE, "search is not configured"));
     };
+    // Documents list full, lowercase commit hashes: select the release the
+    // way package lookups do, then filter on its hash.
+    if let Some(commit) = q.commit.as_deref().filter(|c| !c.is_empty()) {
+        match query::select_release(&s.pool, commit).await? {
+            Ok(r) => q.commit = Some(r.commit),
+            Err(e) => return Err(commit_error(commit, e)),
+        }
+    }
     Ok(Json(m.search(&q).await?))
+}
+
+/// The response for a commit that selects no single release.
+fn commit_error(commit: &str, e: LookupError) -> AppError {
+    match e {
+        LookupError::MalformedCommit(e) => err(StatusCode::BAD_REQUEST, e),
+        LookupError::AmbiguousCommit(n) => err(
+            StatusCode::BAD_REQUEST,
+            format!("commit prefix {commit:?} is ambiguous: it matches {n} releases"),
+        ),
+        LookupError::UnknownCommit => err(StatusCode::NOT_FOUND, format!("unknown commit {commit}")),
+        LookupError::NotFound => err(StatusCode::NOT_FOUND, format!("not found at {commit}")),
+    }
 }
 
 async fn package(
@@ -86,21 +107,11 @@ async fn package(
     let system = p.system.unwrap_or_else(|| DEFAULT_SYSTEM.to_string());
     match query::lookup(&s.pool, &attr, &p.commit, &system).await? {
         Ok(info) => Ok(Json(info)),
-        Err(LookupError::MalformedCommit(e)) => Err(err(StatusCode::BAD_REQUEST, e)),
-        Err(LookupError::AmbiguousCommit(n)) => Err(err(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "commit prefix {:?} is ambiguous: it matches {n} releases",
-                p.commit
-            ),
-        )),
-        Err(LookupError::UnknownCommit) => {
-            Err(err(StatusCode::NOT_FOUND, format!("unknown commit {}", p.commit)))
-        }
         Err(LookupError::NotFound) => Err(err(
             StatusCode::NOT_FOUND,
             format!("{attr} ({system}) not found at {}", p.commit),
         )),
+        Err(e) => Err(commit_error(&p.commit, e)),
     }
 }
 
@@ -283,13 +294,4 @@ async fn reindex(State(s): State<AppState>) -> Result<Response, AppError> {
 async fn check(State(s): State<AppState>) -> Result<Response, AppError> {
     let id = jobs::enqueue(&s.pool, "check", serde_json::json!({})).await?;
     Ok((StatusCode::ACCEPTED, Json(JobCreated { id })).into_response())
-}
-
-pub type RouterAlias = Router;
-
-/// Serve a router on a listener until the process exits.
-pub async fn serve(listener: tokio::net::TcpListener, router: Router) {
-    if let Err(e) = axum::serve(listener, router).await {
-        tracing::error!(error = %e, "server exited");
-    }
 }

@@ -16,6 +16,9 @@ pub const SEARCH_PATH: &str = "/v1/search";
 pub const PACKAGES_PATH: &str = "/v1/packages";
 /// POST [`BulkRequest`] -> [`BulkResponse`].
 pub const BULK_PATH: &str = "/v1/lookup/bulk";
+/// Most items a [`BulkRequest`] may hold; larger requests are refused (400)
+/// and should be split.
+pub const BULK_MAX_ITEMS: usize = 10_000;
 /// POST a derivation graph, [`MinimiseParams`] -> [`MinimiseResponse`].
 pub const MINIMISE_PATH: &str = "/v1/minimise";
 /// GET, [`ReleasesParams`] -> `Vec<`[`ReleaseInfo`]`>`.
@@ -58,6 +61,9 @@ pub struct SearchQuery {
     pub channel: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub series: Option<String>,
+    /// A commit hash or a prefix of at least 8 hex digits, in either case,
+    /// selecting one indexed release (400 if malformed or ambiguous, 404 if
+    /// unknown).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -4,7 +4,7 @@
 use crate::targets::display_name;
 use std::collections::HashMap;
 use std::time::Instant;
-use yoink_api::{Event, LogLevel, Outcome, PhaseDef, Progress};
+use yoink_api::{Event, LogId, LogLevel, Outcome, PhaseDef, Progress};
 
 /// One requested PURL.
 #[derive(Clone, Debug)]
@@ -19,6 +19,9 @@ pub struct Item {
     pub logs: Vec<usize>,
     /// The most severe log level seen.
     pub worst: Option<LogLevel>,
+    /// The last job log line received: a re-posted request gets the job's
+    /// logs again, and the lines up to this one are skipped.
+    last_log: Option<LogId>,
 }
 
 impl Item {
@@ -92,6 +95,7 @@ impl State {
                     outcome: None,
                     logs: vec![],
                     worst: None,
+                    last_log: None,
                 })
                 .collect(),
             index: purls.iter().enumerate().map(|(i, p)| (p.clone(), i)).collect(),
@@ -149,7 +153,18 @@ impl State {
                     Change::Progress(i)
                 }
             }
-            Event::Log { level, message, .. } => {
+            Event::Log {
+                level, message, id, ..
+            } => {
+                if let Some(id) = id {
+                    if item
+                        .last_log
+                        .is_some_and(|l| l.job == id.job && id.line <= l.line)
+                    {
+                        return Change::Ignored;
+                    }
+                    item.last_log = Some(id);
+                }
                 item.worst = item.worst.max(Some(level));
                 item.logs.push(self.logs.len());
                 self.logs.push(LogEntry {
@@ -253,12 +268,28 @@ pub(crate) mod tests {
             purl: p.into(),
             level,
             message: "m".into(),
+            id: None,
         };
         assert_eq!(s.apply(log(&b, LogLevel::Warning)), Change::Log(0));
         s.apply(log(&b, LogLevel::Info));
         assert_eq!(s.items[1].worst, Some(LogLevel::Warning));
         s.apply(log(&b, LogLevel::Fatal));
         assert_eq!(s.items[1].logs, vec![0, 1, 2]);
+        // Job log lines seen before (sent again after a reconnect) are
+        // skipped; those of another job (a new attempt) are not.
+        let job_log = |job, line| Event::Log {
+            purl: b.clone(),
+            level: LogLevel::Info,
+            message: format!("{job}/{line}"),
+            id: Some(LogId { job, line }),
+        };
+        assert_eq!(s.apply(job_log(7, 0)), Change::Log(3));
+        assert_eq!(s.apply(job_log(7, 1)), Change::Log(4));
+        assert_eq!(s.apply(job_log(7, 0)), Change::Ignored);
+        assert_eq!(s.apply(job_log(7, 1)), Change::Ignored);
+        assert_eq!(s.apply(job_log(7, 2)), Change::Log(5));
+        assert_eq!(s.apply(job_log(8, 0)), Change::Log(6));
+        assert_eq!(s.items[1].logs.len(), 7);
         assert_eq!(
             s.apply(Event::Result {
                 purl: a.clone(),

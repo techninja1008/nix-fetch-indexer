@@ -2026,6 +2026,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "hex",
+ "libc",
  "nfi-auth",
  "nfi-test-support",
  "reqwest",
@@ -2196,6 +2197,7 @@ name = "nfi-testenv"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "nfi-embedded-postgres",
  "nfi-interchange",
  "nfi-service",
@@ -4891,6 +4893,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "shell-words",
  "tempfile",
  "tokio",
  "yoink-api",

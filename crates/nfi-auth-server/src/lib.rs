@@ -11,7 +11,7 @@
 //! CEL variables:
 //! - `claims`: the token's claims, as a map.
 //! - `user`: `{"username": string, "session": string or null}`.
-//! - whatever else the service documents, e.g. `request`.
+//! - whatever else the service documents, e.g. `request` ([`request_var`]).
 
 mod guard;
 pub mod keys;
@@ -40,6 +40,8 @@ const LEEWAY_SECS: u64 = 60;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
+    #[error("bad request: {0}")]
+    BadRequest(String),
     #[error("missing bearer token")]
     Missing,
     #[error("invalid token: {0}")]
@@ -56,6 +58,7 @@ impl AuthError {
     pub fn status(&self) -> http::StatusCode {
         use http::StatusCode as S;
         match self {
+            AuthError::BadRequest(_) => S::BAD_REQUEST,
             AuthError::Missing | AuthError::Invalid(_) => S::UNAUTHORIZED,
             AuthError::Forbidden(_) => S::FORBIDDEN,
             AuthError::Unavailable(_) => S::SERVICE_UNAVAILABLE,
@@ -90,9 +93,33 @@ pub fn read_trimmed(path: &Path) -> Result<String> {
     Ok(s)
 }
 
-/// `{"method": ..., "path": ...}`, the `request` variable of HTTP policies.
-pub fn request_var(method: &http::Method, path: &str) -> serde_json::Value {
-    serde_json::json!({"method": method.as_str(), "path": path})
+/// `{"method": ..., "path": ...}`, the `request` variable of HTTP policies,
+/// for a request to `raw_path`: `path` is percent-decoded (see
+/// [`decode_path`]), as route parameters are.
+pub fn request_var(method: &http::Method, raw_path: &str) -> Result<serde_json::Value, AuthError> {
+    Ok(serde_json::json!({"method": method.as_str(), "path": decode_path(raw_path)?}))
+}
+
+/// Percent-decode a request path. Rejected (400): invalid percent-encoding
+/// or UTF-8, and an encoded `/`, which routing treats as part of a segment
+/// but would look like a separator to a policy (no route needs one).
+pub fn decode_path(raw: &str) -> Result<String, AuthError> {
+    let bad = |what: &str| AuthError::BadRequest(format!("{what} in the path"));
+    let hex = |c: Option<u8>| c.and_then(|c| char::from(c).to_digit(16));
+    let mut out = Vec::with_capacity(raw.len());
+    let mut bytes = raw.bytes();
+    while let Some(c) = bytes.next() {
+        if c != b'%' {
+            out.push(c);
+            continue;
+        }
+        match (hex(bytes.next()), hex(bytes.next())) {
+            (Some(h), Some(l)) if h * 16 + l == u32::from(b'/') => return Err(bad("an encoded /")),
+            (Some(h), Some(l)) => out.push((h * 16 + l) as u8),
+            _ => return Err(bad("invalid percent-encoding")),
+        }
+    }
+    String::from_utf8(out).map_err(|_| bad("invalid UTF-8"))
 }
 
 /// A compiled CEL expression.
@@ -441,6 +468,18 @@ mod tests {
         let v = vars(serde_json::json!({"claims": {"sub": "123"}}));
         let e = Expr::new(DEFAULT_USERNAME_EXPR).unwrap();
         assert_eq!(e.eval_string(&v).unwrap().as_deref(), Some("123"));
+    }
+
+    #[test]
+    fn paths() {
+        assert_eq!(
+            decode_path("/v1/packages/%69nternal-x%2b%20y").unwrap(),
+            "/v1/packages/internal-x+ y"
+        );
+        assert_eq!(decode_path("/a/%C3%A9").unwrap(), "/a/\u{e9}");
+        for p in ["/a%2Fb", "/a%2fb", "/a%zz", "/a%4", "/a%", "/a%ff", "/a%+1"] {
+            assert!(matches!(decode_path(p), Err(AuthError::BadRequest(_))), "{p}");
+        }
     }
 
     #[test]

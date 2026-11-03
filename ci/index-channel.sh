@@ -150,13 +150,37 @@ fi
 mkdir -p "$work"
 
 # ---------- storage backends ----------
-# store_get <tag> <asset> <dest>: download; fails if the asset doesn't exist.
+# store_get <tag> <asset> <dest>: download; returns 1 if the release or the
+#   asset doesn't exist, and exits the script on any other failure (network,
+#   rate limit, 5xx, auth): treating those as "missing" would rebuild and
+#   overwrite releases.txt and the cumulative bundles from new releases only.
 # store_put <tag> <title> <notes> <file>...: create the release if needed and
 #   upload (replacing) the files.
+store_failed() {
+  echo "error: reading $2 of $1 from $STORE failed${3:+: $3}" >&2
+  exit 3
+}
 case $STORE in
   gh:*)
     repo=${STORE#gh:}
-    store_get() { gh release download "$1" -R "$repo" -p "$2" -O "$3" --clobber >/dev/null 2>&1; }
+    store_get() {
+      local tag=$1 asset=$2 dest=$3 release err rc=0
+      err=$(mktemp)
+      # The REST API tells "not found" (HTTP 404) apart from other failures.
+      release=$(gh api "repos/$repo/releases/tags/$tag" 2>"$err") || rc=$?
+      if ((rc != 0)); then
+        if grep -q 'HTTP 404' "$err"; then rm -f "$err"; return 1; fi
+        store_failed "$tag" "$asset" "$(cat "$err")"
+      fi
+      if ! jq -e --arg n "$asset" 'any(.assets[]; .name == $n)' <<<"$release" >/dev/null; then
+        rm -f "$err"
+        return 1
+      fi
+      # It exists: failing to download it is an error.
+      gh release download "$tag" -R "$repo" -p "$asset" -O "$dest" --clobber >/dev/null 2>"$err" ||
+        store_failed "$tag" "$asset" "$(cat "$err")"
+      rm -f "$err"
+    }
     store_put() {
       local tag=$1 title=$2 notes=$3; shift 3
       if gh release view "$tag" -R "$repo" >/dev/null 2>&1; then
@@ -169,7 +193,10 @@ case $STORE in
     ;;
   dir:*)
     root=${STORE#dir:}
-    store_get() { [[ -f $root/$1/$2 ]] && cp "$root/$1/$2" "$3"; }
+    store_get() {
+      [[ -e $root/$1/$2 ]] || return 1
+      cp "$root/$1/$2" "$3" || store_failed "$1" "$2"
+    }
     store_put() {
       local tag=$1 title=$2 notes=$3; shift 3
       mkdir -p "$root/$tag"

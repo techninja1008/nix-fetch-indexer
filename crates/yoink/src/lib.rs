@@ -5,6 +5,7 @@
 pub mod client;
 pub mod config;
 pub mod format;
+pub mod nix;
 pub mod plain;
 pub mod pull;
 pub mod state;

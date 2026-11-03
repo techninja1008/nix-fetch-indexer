@@ -3,7 +3,7 @@ use clap::{Args, Parser, Subcommand};
 use nfi::client::Client;
 use nfi::*;
 use nfi_api::drv::ReducedGraph;
-use nfi_api::{BulkRequest, ItemStatus, SearchQuery};
+use nfi_api::{BULK_MAX_ITEMS, BulkRequest, ItemStatus, SearchQuery};
 use nfi_auth_client::Credentials;
 use nfi_auth_client::http::retry;
 use std::path::PathBuf;
@@ -362,9 +362,17 @@ async fn exec(cmd: Cmd, json: bool, cfg: &Config, client: &Client, creds: &Crede
             if all.is_empty() {
                 bail!("no items given");
             }
-            let req = BulkRequest { items: all };
             let hook = hook_cmd(&hook, cfg);
-            let r = retry(creds, |t| async { client.with_token(t).bulk(&req).await }).await?;
+            // The service takes at most BULK_MAX_ITEMS items per request.
+            let mut responses = Vec::new();
+            for items in all.chunks(BULK_MAX_ITEMS) {
+                let req = BulkRequest {
+                    items: items.to_vec(),
+                };
+                responses.push(retry(creds, |t| async { client.with_token(t).bulk(&req).await }).await?);
+            }
+            let batched = responses.len() > 1;
+            let r = merge_bulk(responses);
             let failed: Vec<_> = r.items.iter().filter(|i| i.status != ItemStatus::Ok).collect();
             for i in &failed {
                 let outputs = if i.status == ItemStatus::UnknownOutput {
@@ -388,8 +396,10 @@ async fn exec(cmd: Cmd, json: bool, cfg: &Config, client: &Client, creds: &Crede
                     println!("{p}");
                 }
             }
+            // Summed over the batches: shared paths count more than once.
+            let at_most = if batched { "at most " } else { "" };
             eprintln!(
-                "{} paths in closure ({} download, {} unpacked)",
+                "{} paths in closure ({at_most}{} download, {at_most}{} unpacked)",
                 r.closure.len(),
                 human_size(r.file_size),
                 human_size(r.nar_size)

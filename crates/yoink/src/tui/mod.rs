@@ -213,6 +213,9 @@ pub async fn run(mut app: App, mut rx: UnboundedReceiver<Msg>) -> Result<(State,
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut redraw = true;
+    // Being terminated or losing the terminal detaches like `q`, so the
+    // terminal is restored (in raw mode Ctrl-C arrives as a key).
+    let mut terminate = Terminate::new()?;
     loop {
         if redraw {
             term.draw(|f| render::draw(f, &mut app))?;
@@ -240,11 +243,45 @@ pub async fn run(mut app: App, mut rx: UnboundedReceiver<Msg>) -> Result<(State,
                 None => break,
             },
             _ = tick.tick() => redraw = true,
+            _ = terminate.recv() => app.quit = true,
         }
     }
     drop(term);
     drop(guard);
     Ok((app.state, app.quit))
+}
+
+/// SIGTERM and SIGHUP.
+struct Terminate {
+    #[cfg(unix)]
+    signals: [tokio::signal::unix::Signal; 2],
+}
+
+impl Terminate {
+    fn new() -> Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Terminate {
+                signals: [signal(SignalKind::terminate())?, signal(SignalKind::hangup())?],
+            })
+        }
+        #[cfg(not(unix))]
+        Ok(Terminate {})
+    }
+
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        {
+            let [a, b] = &mut self.signals;
+            tokio::select! {
+                _ = a.recv() => {}
+                _ = b.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        std::future::pending::<()>().await
+    }
 }
 
 pub fn apply(s: &mut State, m: Msg) {

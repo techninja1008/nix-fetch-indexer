@@ -72,11 +72,28 @@ async fn open_and_token() {
     assert_eq!(get_(format!("{u}/x"), Some("s3cret")).await.status(), 200);
     assert_eq!(get_(format!("{u}/healthz"), None).await.status(), 200);
     assert_eq!(get_(format!("{u}{CONFIG_PATH}"), None).await.status(), 404);
-    // Whoami answers the same with or without the token.
-    for t in [None, Some("s3cret"), Some("wrong")] {
+    // Whoami checks the token.
+    let me: Whoami = get_(format!("{u}{WHOAMI_PATH}"), Some("s3cret"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        me,
+        Whoami {
+            username: "(token)".into(),
+            session: None,
+            additional_info: Default::default()
+        }
+    );
+    for (t, e) in [
+        (None, "missing bearer token"),
+        (Some("wrong"), "invalid token: wrong token"),
+    ] {
         let r = get_(format!("{u}{WHOAMI_PATH}"), t).await;
-        assert_eq!(r.status(), 404);
-        assert_eq!(error(r).await, "this listener does not use OIDC login");
+        assert_eq!(r.status(), 401);
+        assert_eq!(r.headers()["www-authenticate"], "Bearer");
+        assert_eq!(error(r).await, e);
     }
 }
 
@@ -181,4 +198,40 @@ async fn whoami() {
     let r = get_(format!("{u}{WHOAMI_PATH}"), Some(&t)).await;
     assert_eq!(r.status(), 500);
     assert_eq!(error(r).await, "whoami expression failed");
+}
+
+/// Policies see the path percent-decoded, as route parameters are: an
+/// encoded character does not get around a prefix rule.
+#[tokio::test]
+async fn policy_sees_the_decoded_path() {
+    let idp = MockIdp::start("c").await;
+    let guard = Arc::new(oidc(
+        &idp,
+        None,
+        "!request.path.startsWith('/v1/packages/internal-')",
+        false,
+    ));
+    let app = Router::new()
+        .route(
+            "/v1/packages/{*attr}",
+            get(|axum::extract::Path(a): axum::extract::Path<String>| async move { a }),
+        )
+        .layer(axum::middleware::from_fn_with_state(guard, middleware));
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let u = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    let t = idp.token(json!({"sub": "1", "preferred_username": "alice"}));
+    let r = get_(format!("{u}/v1/packages/hello%2Dx"), Some(&t)).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.text().await.unwrap(), "hello-x");
+    for p in ["internal-x", "%69nternal-x", "%69%6E%74ernal-x"] {
+        let r = get_(format!("{u}/v1/packages/{p}"), Some(&t)).await;
+        assert_eq!(r.status(), 403, "{p}");
+    }
+    // Encoded slashes and invalid encodings are rejected.
+    for p in ["a%2Finternal-x", "a%zz", "a%FF"] {
+        let r = get_(format!("{u}/v1/packages/{p}"), Some(&t)).await;
+        assert_eq!(r.status(), 400, "{p}");
+        assert!(error(r).await.starts_with("bad request: "), "{p}");
+    }
 }

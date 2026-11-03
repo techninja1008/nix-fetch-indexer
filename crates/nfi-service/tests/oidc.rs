@@ -179,7 +179,16 @@ async fn admin_token_with_oidc_public() {
     assert_eq!(get(u("/admin/v1/jobs"), Some(&alice)).await.status(), 401);
     assert_eq!(get(u("/admin/v1/jobs"), Some("s3cret")).await.status(), 200);
     assert_eq!(get(u(CONFIG_PATH), None).await.status(), 404);
-    assert_eq!(get(u(WHOAMI_PATH), Some("s3cret")).await.status(), 404);
+    // Whoami checks the static token.
+    let r = get(u(WHOAMI_PATH), Some("s3cret")).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        r.json::<serde_json::Value>().await.unwrap(),
+        json!({"username": "(token)", "additional_info": {}})
+    );
+    for t in [None, Some("wrong"), Some(alice.as_str())] {
+        assert_eq!(get(u(WHOAMI_PATH), t).await.status(), 401);
+    }
 }
 
 #[test]
