@@ -224,36 +224,57 @@ fn filter_sections_and_keeps_referenced_paths() {
     assert_eq!(st.releases[0].missing_paths, 1);
 }
 
+fn info(n: u8, refs: &[u8]) -> PathInfo {
+    PathInfo {
+        hash: h(n),
+        name: format!("p{n}"),
+        references: refs.iter().map(|&x| h(x)).collect(),
+        nar_size: None,
+        file_size: None,
+        deriver: None,
+    }
+}
+
 #[test]
 fn mark_closure_propagates() {
     let mut cb = ClosureBuilder::new();
     let none = Bitset::new();
-    cb.insert(
-        PathInfo {
-            hash: h(1),
-            name: "a".into(),
-            references: vec![h(2)],
-            nar_size: None,
-            file_size: None,
-            deriver: None,
-        },
-        &none,
-    );
-    cb.insert(
-        PathInfo {
-            hash: h(2),
-            name: "b".into(),
-            references: vec![h(3)],
-            nar_size: None,
-            file_size: None,
-            deriver: None,
-        },
-        &none,
-    );
-    let unknown = cb.mark_closure([h(1)], 2);
-    assert_eq!(unknown, vec![h(3)]);
+    // 1 -> 2 -> 3 (self-referencing), 4 -> 2.
+    for (n, refs) in [(1, &[2][..]), (2, &[3]), (3, &[3]), (4, &[2])] {
+        cb.insert(info(n, refs), &none);
+    }
+    assert!(cb.mark_closure([h(1), h(4)], 2).is_empty());
     let c = cb.finish();
+    assert_eq!(c.paths.len(), 4);
     assert!(c.paths.iter().all(|p| p.closures.get(2)));
+}
+
+#[test]
+fn mark_closure_skips_incomplete_closures() {
+    let mut cb = ClosureBuilder::new();
+    let none = Bitset::new();
+    // 1 -> 2 -> {3, 9}, where 9 is unknown; 4 -> 3; 5 -> 2.
+    for (n, refs) in [(1, &[2][..]), (2, &[3, 9]), (3, &[]), (4, &[3]), (5, &[2])] {
+        cb.insert(info(n, refs), &none);
+    }
+    // Unknown roots and roots whose closure includes an unknown path (at
+    // any depth) are returned, once each, and not marked.
+    let mut unmarked = cb.mark_closure([h(1), h(4), h(5), h(8), h(1)], 0);
+    unmarked.sort();
+    assert_eq!(unmarked, vec![h(1), h(5), h(8)]);
+    let c = cb.finish();
+    // Paths in no closure are dropped; the sibling's closure is complete.
+    let names: Vec<&str> = c.paths.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, vec!["p3", "p4"]);
+    assert!(c.paths.iter().all(|p| p.closures.get(0)));
+}
+
+#[test]
+#[should_panic(expected = "not in the closure builder")]
+fn finish_rejects_dangling_references() {
+    let mut cb = ClosureBuilder::new();
+    cb.insert(info(1, &[2]), &Bitset::single(0));
+    cb.finish();
 }
 
 #[test]
@@ -518,4 +539,39 @@ fn merge_rejects_invalid_inputs() {
     let mut bad = eval_errors("r2", &a, &[]);
     bad.eval_errors.as_mut().unwrap().evals.set(5);
     assert!(ops::merge([bad]).unwrap_err().contains("out of range"));
+}
+
+#[test]
+fn validate_rejects_bad_commits_and_duplicate_paths() {
+    let good = sample("r1", &"a".repeat(40), false);
+    for commit in [
+        "a".repeat(39),
+        "A".repeat(40),
+        "g".repeat(40),
+        format!("{} ", "a".repeat(39)),
+    ] {
+        let mut bad = good.clone();
+        bad.releases[0].commit = commit;
+        let err = bad.validate().unwrap_err();
+        assert!(err.contains("not 40 lowercase hex digits"), "{err}");
+    }
+    let mut bad = good;
+    let c = bad.closure.as_mut().unwrap();
+    let dup = c.paths[0].clone();
+    c.paths.push(dup);
+    let err = bad.validate().unwrap_err();
+    assert!(err.contains("duplicate closure path"), "{err}");
+}
+
+#[test]
+fn merge_rejects_conflicting_releases() {
+    let a = sample("r1", &"a".repeat(40), false);
+    let other_commit = sample("r1", &"b".repeat(40), true);
+    let err = ops::merge([a.clone(), other_commit]).unwrap_err();
+    assert!(err.starts_with("merge input 2: release r1"), "{err}");
+    let mut other_channel = eval_errors("r1", &"a".repeat(40), &[]);
+    other_channel.releases[0].channel = "nixos-unstable".into();
+    assert!(ops::merge([a.clone(), other_channel]).is_err());
+    // Agreeing releases merge.
+    ops::merge([a.clone(), eval_errors("r1", &"a".repeat(40), &[])]).unwrap();
 }

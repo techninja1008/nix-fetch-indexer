@@ -6497,6 +6497,11 @@ rec {
             packageId = "hex";
           }
           {
+            name = "libc";
+            packageId = "libc";
+            target = { target, features }: (target."unix" or false);
+          }
+          {
             name = "nfi-auth";
             packageId = "nfi-auth";
           }
@@ -7131,6 +7136,10 @@ rec {
           {
             name = "anyhow";
             packageId = "anyhow";
+          }
+          {
+            name = "axum";
+            packageId = "axum";
           }
           {
             name = "nfi-embedded-postgres";
@@ -17080,6 +17089,10 @@ rec {
           {
             name = "serde_json";
             packageId = "serde_json";
+          }
+          {
+            name = "shell-words";
+            packageId = "shell-words";
           }
           {
             name = "tokio";

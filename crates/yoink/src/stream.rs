@@ -5,7 +5,7 @@ use crate::client::{Client, EventStream};
 use crate::state::Conn;
 use nfi_auth_client::Credentials;
 use nfi_auth_client::http::{HttpError, is_unauthorized};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 use yoink_api::Event;
@@ -42,6 +42,47 @@ impl Backoff {
     }
 }
 
+/// Tells progress from repetition: a re-posted request sends each job's
+/// current status (and logs) again, which is no progress, so a service
+/// behind a proxy that keeps cutting streams can't keep the client trying
+/// for ever. Progress is a result, a phase change, or a job's progress
+/// counter passing the highest seen in its phase.
+#[derive(Debug, Default)]
+pub struct ProgressTracker {
+    /// Per PURL: the last phase and the highest progress seen in it.
+    seen: HashMap<String, (String, Option<u64>)>,
+}
+
+impl ProgressTracker {
+    pub fn is_progress(&mut self, ev: &Event) -> bool {
+        match ev {
+            Event::Result { .. } => true,
+            Event::Status {
+                purl,
+                phase,
+                progress,
+            } => {
+                let current = progress.map(|p| p.current);
+                match self.seen.get_mut(purl) {
+                    Some((p, best)) if p == phase => {
+                        if current > *best {
+                            *best = current;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    _ => {
+                        self.seen.insert(purl.clone(), (phase.clone(), current));
+                        true
+                    }
+                }
+            }
+            Event::Phases { .. } | Event::Log { .. } => false,
+        }
+    }
+}
+
 pub enum Msg {
     Event(Event),
     Conn(Conn),
@@ -69,6 +110,7 @@ pub async fn drive(
     let mut remaining = purls;
     let mut done = HashSet::new();
     let mut backoff = Backoff::default();
+    let mut progress = ProgressTracker::default();
     let mut next = first;
     loop {
         remaining.retain(|p| !done.contains(p));
@@ -105,13 +147,11 @@ pub async fn drive(
                 while let Some(ev) = s.next().await {
                     match ev {
                         Ok(ev) => {
-                            match &ev {
-                                Event::Phases { .. } => {}
-                                Event::Result { purl, .. } => {
-                                    done.insert(purl.clone());
-                                    backoff.success();
-                                }
-                                _ => backoff.success(),
+                            if let Event::Result { purl, .. } = &ev {
+                                done.insert(purl.clone());
+                            }
+                            if progress.is_progress(&ev) {
+                                backoff.success();
                             }
                             if tx.send(Msg::Event(ev)).is_err() {
                                 return;
@@ -173,6 +213,39 @@ mod tests {
         assert_eq!(b.failure(t0 + Backoff::GIVE_UP), None);
         b.success();
         assert_eq!(b.failure(t0 + Backoff::GIVE_UP), Some(Backoff::FIRST));
+    }
+
+    #[test]
+    fn progress() {
+        use yoink_api::{LogLevel, Outcome, Progress};
+        let status = |phase: &str, current: Option<u64>| Event::Status {
+            purl: "a".into(),
+            phase: phase.into(),
+            progress: current.map(|current| Progress {
+                current,
+                max: 100,
+                unit: None,
+            }),
+        };
+        let mut t = ProgressTracker::default();
+        assert!(t.is_progress(&status("q", None)));
+        // The same status again (as after a reconnect) is not progress.
+        assert!(!t.is_progress(&status("q", None)));
+        assert!(t.is_progress(&status("t", Some(10))));
+        assert!(!t.is_progress(&status("t", Some(10))));
+        assert!(t.is_progress(&status("t", Some(20))));
+        assert!(!t.is_progress(&status("t", Some(15))));
+        assert!(!t.is_progress(&Event::Log {
+            purl: "a".into(),
+            level: LogLevel::Warning,
+            message: "retrying".into(),
+            id: None,
+        }));
+        assert!(t.is_progress(&status("p", None)));
+        assert!(t.is_progress(&Event::Result {
+            purl: "a".into(),
+            outcome: Outcome::Success,
+        }));
     }
 
     #[test]

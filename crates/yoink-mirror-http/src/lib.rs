@@ -2,19 +2,26 @@
 //! (cache.nixos.org by default) to another that accepts `PUT`s, such as a
 //! plain WebDAV-style server or a GitLab generic package registry.
 //!
-//! A job per store path hash:
+//! A job per requested store path (hash and name, so a request with a wrong
+//! name never shares the job of a right one):
 //!
 //! 1. **Queued** until one of `--concurrency` slots is free.
 //! 2. **Checking target**: `GET <target>/<hash>.narinfo`; present means done.
 //! 3. **Fetching narinfo** from the upstream cache.
 //! 4. **Transferring NAR**: the upstream NAR is streamed into a `PUT` to the
-//!    target, checking its size and `FileHash` on the way.
+//!    target, hashing it on the way; its size and `FileHash` are checked once
+//!    uploaded (a mismatch fails the step, so no narinfo points at it).
 //! 5. **Publishing narinfo**: the narinfo is uploaded last, with its `URL`
 //!    pointed at the copied NAR and its signatures kept (plus ours with
 //!    `--signing-key-file`), so a narinfo on the target means a complete path.
 //!
 //! Transient failures (connection errors, timeouts, HTTP 408/429/5xx, a
 //! corrupted transfer) are retried with backoff, `--retries` times per step.
+//!
+//! `--http-timeout` bounds idleness, not duration: small requests must
+//! complete within it, and a NAR transfer fails only when no data moves
+//! (nothing read from upstream and nothing taken by the upload) for that
+//! long, or the target doesn't answer that long after the last byte.
 
 pub mod narinfo;
 
@@ -22,7 +29,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use narinfo::{Narinfo, Signer};
-use nfi_interchange::{StoreHash, nixbase32};
+use nfi_interchange::nixbase32;
 use reqwest::header::{HeaderName, HeaderValue};
 use sha2::Digest;
 use std::path::PathBuf;
@@ -102,6 +109,8 @@ pub struct Config {
     pub retry_delay: Duration,
     /// Upload `nix-cache-info` with this priority if the target has none.
     pub cache_info_priority: Option<u32>,
+    /// Time limit for a small request (narinfos, nix-cache-info), and the
+    /// longest a NAR transfer may go without data moving.
     pub timeout: Duration,
 }
 
@@ -217,7 +226,9 @@ pub struct Args {
     /// Don't create nix-cache-info on the target.
     #[arg(long, env = "YOINK_NO_CACHE_INFO")]
     pub no_cache_info: bool,
-    /// Per-request timeout in seconds, without data flowing.
+    /// Seconds without data flowing before a request fails: a narinfo request
+    /// must complete in this time; a NAR transfer may take as long as it
+    /// needs while data keeps moving.
     #[arg(long = "http-timeout", env = "YOINK_HTTP_TIMEOUT", default_value_t = 120)]
     pub timeout: u64,
 }
@@ -264,13 +275,18 @@ fn retryable(s: reqwest::StatusCode) -> bool {
         || s == reqwest::StatusCode::REQUEST_TIMEOUT
 }
 
-/// Fail on a non-success status, classifying it.
-async fn ok(what: &str, r: reqwest::Response) -> Result<reqwest::Response, Failure> {
+/// Fail on a non-success status, classifying it. The error body is read for
+/// at most `timeout`.
+async fn ok(what: &str, r: reqwest::Response, timeout: Duration) -> Result<reqwest::Response, Failure> {
     let s = r.status();
     if s.is_success() {
         return Ok(r);
     }
-    let body = r.text().await.unwrap_or_default();
+    let body = tokio::time::timeout(timeout, r.text())
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or_default();
     let body: String = body.chars().take(300).collect();
     let e = anyhow!(
         "{what}: HTTP {s}{}",
@@ -295,7 +311,9 @@ struct Inner {
 
 pub struct HttpMirror {
     inner: Arc<Inner>,
-    jobs: JobTable<StoreHash>,
+    /// Keyed by hash and name: the name is checked against the upstream
+    /// narinfo by the job, so each name needs its own.
+    jobs: JobTable<NixTarget>,
 }
 
 impl HttpMirror {
@@ -304,7 +322,11 @@ impl HttpMirror {
         let http = reqwest::Client::builder()
             .user_agent(concat!("yoink/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(30))
-            .read_timeout(cfg.timeout)
+            // No client-wide (read) timeout: reqwest's read timeout runs from
+            // sending the request and is reset only by response body reads,
+            // so it would cut off any NAR upload taking longer. Small requests
+            // get a total timeout ([`Inner::get`], [`Inner::put`]); NAR
+            // transfers an idle timeout ([`Inner::transfer`]).
             .build()?;
         let inner = Arc::new(Inner {
             slots: tokio::sync::Semaphore::new(cfg.concurrency),
@@ -339,22 +361,31 @@ impl Mirror for HttpMirror {
     fn mirror(&self, purl: &Purl) -> Result<Job> {
         let target = purl.nix_target()?;
         let inner = self.inner.clone();
-        Ok(self.jobs.get_or_start(
-            target.hash,
-            QUEUED,
-            move |r| async move { inner.run(target, r).await },
-        ))
+        Ok(self
+            .jobs
+            .get_or_start(target.clone(), QUEUED, move |r| async move {
+                inner.run(target, r).await
+            }))
     }
 }
 
 impl Inner {
+    /// A GET of a small file, which must complete within the timeout.
     fn get(&self, e: &Endpoint, path: &str) -> reqwest::RequestBuilder {
-        e.credential.apply(self.http.get(format!("{}/{path}", e.url)))
+        e.credential
+            .apply(self.http.get(format!("{}/{path}", e.url)))
+            .timeout(self.cfg.timeout)
     }
 
-    fn put(&self, path: &str) -> reqwest::RequestBuilder {
+    /// A PUT to the target without a time limit (for streamed uploads).
+    fn put_streaming(&self, path: &str) -> reqwest::RequestBuilder {
         let t = &self.cfg.target;
         t.credential.apply(self.http.put(format!("{}/{path}", t.url)))
+    }
+
+    /// A PUT of a small file, which must complete within the timeout.
+    fn put(&self, path: &str) -> reqwest::RequestBuilder {
+        self.put_streaming(path).timeout(self.cfg.timeout)
     }
 
     async fn ensure_cache_info(&self, priority: u32) -> Result<()> {
@@ -425,7 +456,9 @@ impl Inner {
                 if resp.status() == reqwest::StatusCode::NOT_FOUND {
                     return Ok(false);
                 }
-                ok(&format!("GET {hash}.narinfo"), resp).await.map(|_| true)
+                ok(&format!("GET {hash}.narinfo"), resp, self.cfg.timeout)
+                    .await
+                    .map(|_| true)
             })
             .await?;
         if present {
@@ -447,7 +480,10 @@ impl Inner {
                         self.cfg.upstream.url
                     )));
                 }
-                Ok(ok(&format!("GET {hash}.narinfo"), resp).await?.text().await?)
+                Ok(ok(&format!("GET {hash}.narinfo"), resp, self.cfg.timeout)
+                    .await?
+                    .text()
+                    .await?)
             })
             .await?;
         let ni = Narinfo::parse(&text).context("parsing the upstream narinfo")?;
@@ -495,35 +531,50 @@ impl Inner {
                 .body(body.clone())
                 .send()
                 .await?;
-            ok(&format!("PUT {hash}.narinfo"), resp).await.map(|_| ())
+            ok(&format!("PUT {hash}.narinfo"), resp, self.cfg.timeout)
+                .await
+                .map(|_| ())
         })
         .await?;
         Ok(())
     }
 
     /// Stream the NAR from upstream into a PUT to the target, checking its
-    /// size and hash.
+    /// size and hash once it is uploaded.
+    ///
+    /// There is no limit on how long this takes, only on idleness: it fails
+    /// when no data moves (no chunk read from upstream and none taken by the
+    /// upload) for the timeout, which also bounds waiting for upstream's
+    /// response headers and for the target's answer after the last byte.
     async fn transfer(&self, ni: &Narinfo, key: &str, r: &JobReporter) -> Result<(), Failure> {
         let up = &self.cfg.upstream;
         let rb = if ni.url.contains("://") {
-            let rb = self.http.get(&ni.url);
-            // Only send our upstream credentials to the upstream itself.
-            if ni.url.starts_with(&format!("{}/", up.url)) {
-                up.credential.apply(rb)
-            } else {
-                rb
-            }
+            self.http.get(&ni.url)
         } else {
-            self.get(up, &ni.url)
+            self.http.get(format!("{}/{}", up.url, ni.url))
         };
-        let resp = ok("downloading the NAR", rb.send().await?).await?;
+        // Only send our upstream credentials to the upstream itself.
+        let rb = if !ni.url.contains("://") || ni.url.starts_with(&format!("{}/", up.url)) {
+            up.credential.apply(rb)
+        } else {
+            rb
+        };
+        let activity = Activity::new();
+        let resp = tokio::select! {
+            r = rb.send() => r?,
+            _ = activity.idle(self.cfg.timeout) => return Err(self.idle_failure("waiting for the upstream NAR")),
+        };
+        let resp = ok("downloading the NAR", resp, self.cfg.timeout).await?;
         let size = ni.file_size.or(resp.content_length());
         let max = size.unwrap_or(0);
         r.progress(0, max, Some(Unit::Bytes));
 
         let (mut tx, rx) = futures::channel::mpsc::channel::<std::io::Result<Bytes>>(4);
+        // A chunk taken by the upload is data moving towards the target.
+        let taken = activity.clone();
+        let rx = rx.inspect(move |_| taken.touch());
         let mut put = self
-            .put(key)
+            .put_streaming(key)
             .header(reqwest::header::CONTENT_TYPE, "application/x-nix-nar");
         if let Some(n) = size {
             put = put.header(reqwest::header::CONTENT_LENGTH, n);
@@ -535,6 +586,7 @@ impl Inner {
             let mut n = 0u64;
             let mut body = resp.bytes_stream();
             while let Some(chunk) = body.next().await {
+                activity.touch();
                 let chunk = match chunk {
                     Ok(c) => c,
                     Err(e) => {
@@ -557,9 +609,12 @@ impl Inner {
             drop(tx);
             Ok((n, hasher.finalize()))
         };
-        let (pumped, uploaded) = tokio::join!(pump, upload);
+        let (pumped, uploaded) = tokio::select! {
+            r = async { tokio::join!(pump, upload) } => r,
+            _ = activity.idle(self.cfg.timeout) => return Err(self.idle_failure("transferring the NAR")),
+        };
         let (n, digest) = pumped?;
-        ok("uploading the NAR", uploaded?).await?;
+        ok("uploading the NAR", uploaded?, self.cfg.timeout).await?;
         if let Some(s) = ni.file_size
             && n != s
         {
@@ -582,6 +637,38 @@ impl Inner {
             _ => r.warn("no usable FileHash in the narinfo; the NAR's hash was not checked"),
         }
         Ok(())
+    }
+
+    fn idle_failure(&self, what: &str) -> Failure {
+        Failure::Transient(anyhow!(
+            "{what}: no data for {}s (--http-timeout)",
+            self.cfg.timeout.as_secs_f32()
+        ))
+    }
+}
+
+/// When data last moved in a transfer.
+#[derive(Clone)]
+struct Activity(Arc<std::sync::Mutex<tokio::time::Instant>>);
+
+impl Activity {
+    fn new() -> Self {
+        Activity(Arc::new(std::sync::Mutex::new(tokio::time::Instant::now())))
+    }
+
+    fn touch(&self) {
+        *self.0.lock().unwrap() = tokio::time::Instant::now();
+    }
+
+    /// Resolve once nothing has moved for `timeout`.
+    async fn idle(&self, timeout: Duration) {
+        loop {
+            let deadline = *self.0.lock().unwrap() + timeout;
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep_until(deadline).await;
+        }
     }
 }
 

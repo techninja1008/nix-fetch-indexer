@@ -31,7 +31,7 @@ fn plant(idp: &MockIdp, store: &TokenStore, refresh_token: &str) {
 async fn concurrent_refresh_uses_the_rotating_token_once() {
     let idp = MockIdp::start("cli").await;
     let d = tempfile::tempdir().unwrap();
-    let store = TokenStore::at(d.path());
+    let store = TokenStore::at(d.path().join("tokens"));
     plant(&idp, &store, "rt-planted");
 
     // Two processes' worth of credentials refreshing at once: one refreshes
@@ -55,7 +55,7 @@ async fn concurrent_refresh_uses_the_rotating_token_once() {
 async fn rejected_refresh_token_is_removed() {
     let idp = MockIdp::start("cli").await;
     let d = tempfile::tempdir().unwrap();
-    let store = TokenStore::at(d.path());
+    let store = TokenStore::at(d.path().join("tokens"));
     plant(&idp, &store, "rt-x");
     assert!(creds(&idp, &store).current().await.unwrap().is_some());
     // The provider has rotated it away: no login, and nothing left cached.
@@ -71,7 +71,7 @@ async fn rejected_refresh_token_is_removed() {
 async fn other_refresh_errors_keep_the_refresh_token() {
     let idp = MockIdp::start("cli").await;
     let d = tempfile::tempdir().unwrap();
-    let store = TokenStore::at(d.path());
+    let store = TokenStore::at(d.path().join("tokens"));
     plant(&idp, &store, "rt-y");
     let kept = || {
         store
@@ -108,7 +108,7 @@ async fn other_refresh_errors_keep_the_refresh_token() {
 async fn logout_waits_for_a_refresh() {
     let idp = MockIdp::start("cli").await;
     let d = tempfile::tempdir().unwrap();
-    let store = TokenStore::at(d.path());
+    let store = TokenStore::at(d.path().join("tokens"));
     plant(&idp, &store, "rt-z");
     // The refresh holds the lock while the provider answers (100 ms); a
     // logout meanwhile waits for it, so the refreshed login is not saved
@@ -130,11 +130,12 @@ async fn login_falls_back_to_the_device_flow() {
     let idp = MockIdp::start("cli").await;
     let evil = Impostor::start(&idp).await;
     let d = tempfile::tempdir().unwrap();
-    let store = TokenStore::at(d.path());
+    let store = TokenStore::at(d.path().join("tokens"));
 
-    // Refreshing the cached login fails (not `invalid_grant`): a warning,
-    // then a device login.
+    // Refreshing the cached login of a URL logged in to fails (not
+    // `invalid_grant`): a warning, then a device login.
     plant(&idp, &store, "rt-w");
+    store.record_url(evil.url(), &idp.auth_config()).unwrap();
     idp.set_refresh_error(Some("server_error"));
     let c = creds_for(evil.url(), &store);
     assert_eq!(c.login(false).await.unwrap().username, "mallory");
@@ -152,6 +153,18 @@ async fn login_falls_back_to_the_device_flow() {
     assert_eq!(creds(&idp, &store).current().await.unwrap(), None);
     assert!(store.token(idp.issuer(), idp.client_id()).unwrap().is_some());
     assert!(creds_for(evil.url(), &store).current().await.unwrap().is_some());
+
+    // Failing to check it (here a 403) is a rejection too.
+    evil.set_whoami_status(403);
+    let e = creds_for(evil.url(), &store).login(true).await.unwrap_err();
+    let e = format!("{e:#}");
+    assert!(
+        e.contains("rejected the new login") && e.contains("403 Forbidden: whoami failed"),
+        "{e}"
+    );
+    assert_eq!(idp.device_logins(), 3);
+    assert_eq!(creds_for(evil.url(), &store).current().await.unwrap(), None);
+    assert!(store.token(idp.issuer(), idp.client_id()).unwrap().is_some());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -159,7 +172,7 @@ async fn cached_login_is_only_sent_to_urls_logged_in_to() {
     let idp = MockIdp::start("cli").await;
     let evil = Impostor::start(&idp).await;
     let d = tempfile::tempdir().unwrap();
-    let store = TokenStore::at(d.path());
+    let store = TokenStore::at(d.path().join("tokens"));
     let alice = idp.token(json!({"sub": "1", "preferred_username": "alice"}));
     store
         .save_token(&StoredToken {
@@ -187,7 +200,12 @@ async fn cached_login_is_only_sent_to_urls_logged_in_to() {
         assert_eq!(c.current().await.unwrap(), None);
         assert!(matches!(c.whoami().await.unwrap(), Identity::NotAuthenticated));
     }
-    assert_eq!(std::fs::read_dir(d.path().join("settings")).unwrap().count(), 1);
+    assert_eq!(
+        std::fs::read_dir(d.path().join("tokens").join("settings"))
+            .unwrap()
+            .count(),
+        1
+    );
     assert_eq!(idp.config_fetches(), 1);
     assert!(evil.bearers().is_empty());
     let c = creds_for(evil.url(), &store);
@@ -200,11 +218,25 @@ async fn cached_login_is_only_sent_to_urls_logged_in_to() {
         Some(alice.clone())
     );
 
-    // Logging in there on purpose uses the provider login and records the
-    // URL, without a new device login.
-    assert_eq!(c.login(false).await.unwrap().username, "mallory");
-    assert_eq!(evil.bearers(), std::slice::from_ref(&alice));
-    assert_eq!(idp.device_logins(), 0);
+    // Logging in there uses it only if the user agrees on the terminal:
+    // without one, nothing is sent, and the error says how. (Tests may have
+    // a terminal.)
+    if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        let e = format!("{:#}", c.login(false).await.unwrap_err());
+        assert!(
+            e.contains(&format!(
+                "the login for {} could be used for {}: run `t login` on a terminal to choose, \
+                 or `t login --force` for a new login",
+                idp.issuer(),
+                evil.url()
+            )),
+            "{e}"
+        );
+        assert!(evil.bearers().is_empty());
+        assert_eq!((idp.device_logins(), idp.refreshes()), (0, 0));
+    }
+    // Once it was (recorded as `login` then does), it is used there.
+    store.record_url(evil.url(), &idp.auth_config()).unwrap();
     let c = creds_for(evil.url(), &store);
     assert_eq!(c.token(false).await.unwrap(), Some(alice));
 
@@ -221,7 +253,7 @@ async fn cached_login_is_only_sent_to_urls_logged_in_to() {
     assert!(store.token(idp.issuer(), idp.client_id()).unwrap().is_none());
     assert_eq!(creds(&idp, &store).current().await.unwrap(), None);
     assert_eq!(creds(&idp, &store).logout().await.unwrap(), None);
-    assert_eq!(evil.bearers().len(), 1);
+    assert!(evil.bearers().is_empty());
 }
 
 /// A URL's settings are fetched on its first use and cached: later uses
@@ -232,7 +264,7 @@ async fn settings_are_fetched_once_then_only_to_log_in_and_after_a_401() {
     let idp = MockIdp::start("cli").await;
     let evil = Impostor::start(&idp).await;
     let d = tempfile::tempdir().unwrap();
-    let store = TokenStore::at(d.path());
+    let store = TokenStore::at(d.path().join("tokens"));
     plant(&idp, &store, "rt-s");
 
     // Recorded: the token (refreshed), whoami, and a hint naming `login`.
@@ -264,7 +296,7 @@ async fn settings_are_fetched_once_then_only_to_log_in_and_after_a_401() {
     // `login` fetches them, and records them for the URL.
     let fetched = idp.config_fetches();
     let c = creds_for(evil.url(), &store);
-    assert_eq!(c.login(false).await.unwrap().username, "mallory");
+    assert_eq!(c.login(true).await.unwrap().username, "mallory");
     assert_eq!(idp.config_fetches(), fetched + 1);
     let c = creds_for(evil.url(), &store);
     assert!(c.token(false).await.unwrap().is_some());
@@ -279,7 +311,7 @@ async fn no_login_is_cached_until_a_401() {
     let svc = Impostor::start(&idp).await;
     svc.set_no_login(true);
     let d = tempfile::tempdir().unwrap();
-    let store = TokenStore::at(d.path());
+    let store = TokenStore::at(d.path().join("tokens"));
     for _ in 0..2 {
         assert_eq!(creds_for(svc.url(), &store).token(true).await.unwrap(), None);
     }

@@ -8,6 +8,22 @@ use sqlx::PgPool;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+/// Advisory lock key serialising all search index writes ([`Meili::sync_attrs`]
+/// and [`Meili::reindex`]), across replicas.
+///
+/// Distinct from [`crate::ingest::WRITE_LOCK`]: a rebuild can take minutes,
+/// and ingest and prune need not wait for it. Search writers only read
+/// committed index data after taking this lock, and every ingest or prune
+/// syncs search after committing, so the newest sync runs last: a write
+/// committed after a rebuild read the database has its sync queued behind the
+/// rebuild, and a rebuild never swaps in documents older than a sync that ran
+/// before it.
+pub const SEARCH_LOCK: i64 = 0x6e66_6901;
+
+/// How long to wait for one Meilisearch task (index creation, a document
+/// batch, a swap) before giving up.
+const TASK_TIMEOUT: Duration = Duration::from_secs(600);
+
 #[derive(Clone)]
 pub struct Meili {
     client: reqwest::Client,
@@ -65,6 +81,7 @@ impl Meili {
         let Some(uid) = task.get("taskUid").and_then(Value::as_u64) else {
             return Ok(());
         };
+        let deadline = tokio::time::Instant::now() + TASK_TIMEOUT;
         let mut delay = Duration::from_millis(20);
         loop {
             let t = self
@@ -74,6 +91,13 @@ impl Meili {
                 Some("succeeded") => return Ok(()),
                 Some("failed") | Some("canceled") => bail!("meilisearch task {uid} failed: {}", t["error"]),
                 _ => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!(
+                    "meilisearch task {uid} did not finish within {}s (status {})",
+                    TASK_TIMEOUT.as_secs(),
+                    t["status"]
+                );
             }
             tokio::time::sleep(delay).await;
             delay = (delay * 2).min(Duration::from_millis(500));
@@ -178,11 +202,68 @@ impl Meili {
         Ok(ids)
     }
 
+    /// Take [`SEARCH_LOCK`], held until the returned transaction ends
+    /// (also if the caller is cancelled: the transaction is rolled back).
+    async fn lock(pool: &PgPool) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+        let mut tx = pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(SEARCH_LOCK)
+            .execute(&mut *tx)
+            .await?;
+        Ok(tx)
+    }
+
+    async fn delete_index(&self, uid: &str) -> Result<()> {
+        let t = self
+            .send(self.req(reqwest::Method::DELETE, &format!("/indexes/{uid}")))
+            .await?;
+        self.wait(&t).await
+    }
+
+    /// Whether `uid` is a scratch index of a rebuild of this index.
+    fn is_scratch(&self, uid: &str) -> bool {
+        uid.strip_prefix(&self.index)
+            .and_then(|s| s.strip_prefix("_rebuild"))
+            .is_some_and(|s| {
+                // Unique scratch names, or the fixed one older versions used.
+                s.is_empty()
+                    || s.strip_prefix('_')
+                        .is_some_and(|h| h.len() == 32 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            })
+    }
+
+    /// Scratch indexes left behind by interrupted rebuilds.
+    async fn leftover_scratch(&self) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        let mut offset = 0;
+        loop {
+            let r = self
+                .send(self.req(
+                    reqwest::Method::GET,
+                    &format!("/indexes?limit=1000&offset={offset}"),
+                ))
+                .await?;
+            let results = r["results"].as_array().map_or(&[][..], Vec::as_slice);
+            out.extend(
+                results
+                    .iter()
+                    .filter_map(|i| i["uid"].as_str())
+                    .filter(|uid| self.is_scratch(uid))
+                    .map(str::to_string),
+            );
+            if results.len() < 1000 {
+                return Ok(out);
+            }
+            offset += 1000;
+        }
+    }
+
     /// Refresh the documents of the given attributes from Postgres.
     pub async fn sync_attrs(&self, pool: &PgPool, attrs: &BTreeSet<String>) -> Result<usize> {
         if attrs.is_empty() {
             return Ok(0);
         }
+        let lock = Self::lock(pool).await?;
         self.ensure_index().await?;
         let attrs: Vec<String> = attrs.iter().cloned().collect();
         let mut total = 0;
@@ -199,35 +280,53 @@ impl Meili {
             self.delete_documents(&self.index, &stale).await?;
             total += docs.len();
         }
+        lock.commit().await?;
         Ok(total)
     }
 
     /// Rebuild the whole index into a fresh one and swap it in.
     pub async fn reindex(&self, pool: &PgPool) -> Result<usize> {
+        let mut lock = Self::lock(pool).await?;
         self.ensure_index().await?;
-        let tmp = format!("{}_rebuild", self.index);
-        // Drop a leftover scratch index from an interrupted rebuild.
-        if self.index_exists(&tmp).await? {
+        // Rebuilds are serialised, so any scratch index is a leftover from an
+        // interrupted one.
+        for uid in self.leftover_scratch().await? {
+            tracing::info!(index = %uid, "deleting leftover search rebuild index");
+            self.delete_index(&uid).await?;
+        }
+        // A scratch index of its own, so even a rebuild that outlived its
+        // lock (its database connection was lost) can't clobber another's.
+        let suffix: String = sqlx::query_scalar("SELECT replace(gen_random_uuid()::text, '-', '')")
+            .fetch_one(&mut *lock)
+            .await?;
+        let tmp = format!("{}_rebuild_{suffix}", self.index);
+        let res = async {
+            self.ensure_index_named(&tmp).await?;
+            let docs = build_docs(pool, None).await?;
+            self.add_documents(&tmp, &docs).await?;
             let t = self
-                .send(self.req(reqwest::Method::DELETE, &format!("/indexes/{tmp}")))
+                .send(
+                    self.req(reqwest::Method::POST, "/swap-indexes")
+                        .json(&json!([{"indexes": [self.index, tmp]}])),
+                )
                 .await?;
             self.wait(&t).await?;
+            Ok(docs.len())
         }
-        self.ensure_index_named(&tmp).await?;
-        let docs = build_docs(pool, None).await?;
-        self.add_documents(&tmp, &docs).await?;
-        let t = self
-            .send(
-                self.req(reqwest::Method::POST, "/swap-indexes")
-                    .json(&json!([{"indexes": [self.index, tmp]}])),
-            )
-            .await?;
-        self.wait(&t).await?;
-        let t = self
-            .send(self.req(reqwest::Method::DELETE, &format!("/indexes/{tmp}")))
-            .await?;
-        self.wait(&t).await?;
-        Ok(docs.len())
+        .await;
+        // After a swap, the scratch index holds the old documents; after a
+        // failure, whatever was built.
+        let cleanup = async {
+            if self.index_exists(&tmp).await? {
+                self.delete_index(&tmp).await?;
+            }
+            anyhow::Ok(())
+        };
+        if let Err(e) = cleanup.await {
+            tracing::warn!(index = %tmp, error = %format!("{e:#}"), "deleting search rebuild index");
+        }
+        lock.commit().await?;
+        res
     }
 
     pub async fn search(&self, q: &SearchQuery) -> Result<SearchResponse> {

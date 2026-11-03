@@ -12,7 +12,8 @@
 //! request. The stream ends after the last `result`. Jobs belong to the
 //! service, not the request: disconnecting does not stop them, and
 //! re-posting the same PURLs attaches to the jobs still running, so a
-//! client recovers from a dropped stream by posting again.
+//! client recovers from a dropped stream by posting again. A job's logs
+//! are sent again on each attach; their [`LogId`] tells repeats apart.
 
 pub use nfi_auth::ErrorBody;
 use serde::{Deserialize, Serialize};
@@ -83,6 +84,14 @@ impl LogLevel {
     }
 }
 
+/// A job's log line: the job (unique within the service's lifetime) and
+/// the line's index in it, counting from 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct LogId {
+    pub job: u64,
+    pub line: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
@@ -110,6 +119,12 @@ pub enum Event {
         purl: String,
         level: LogLevel,
         message: String,
+        /// Identifies the line, so a client re-posting after a dropped
+        /// stream (which gets the job's kept logs again) can skip the ones
+        /// it has. Absent on lines that aren't the job's own (e.g. a
+        /// rejected PURL's error).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<LogId>,
     },
     Result {
         purl: String,

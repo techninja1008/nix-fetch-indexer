@@ -9,7 +9,13 @@
 //! settings are fetched on first use and then again only by `login` and
 //! after it rejects a request (a 401). Tokens are never sent, and logins
 //! never made, over plain HTTP to hosts other than loopback unless that is
-//! explicitly allowed.
+//! explicitly allowed. The cache's directories must be owned by the user
+//! and inaccessible to others (as they are created).
+//!
+//! A URL without a record is never sent a cached login by itself: when a
+//! command or `login` needs one, it asks on the terminal whether to use the
+//! provider login made for other URLs (if the URL advertises the same
+//! provider and client), else runs the device flow.
 
 pub mod http;
 
@@ -20,13 +26,16 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::OnceCell;
 
 /// Tokens expiring within this many seconds are refreshed before use.
 const EXPIRY_MARGIN_SECS: i64 = 60;
+
+/// How to give the CLIs a token cache.
+const NO_CACHE_HINT: &str = "set HOME, XDG_CACHE_HOME or NFI_TOKEN_CACHE";
 
 /// A cached login.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -127,28 +136,83 @@ fn create_dir(dir: &Path) -> Result<()> {
         .with_context(|| format!("creating {}", dir.display()))
 }
 
+/// Fail unless `dir` (if it exists) is a directory owned by the effective
+/// user and inaccessible to anyone else; `Ok(false)` if it does not exist.
+fn private_dir(dir: &Path) -> Result<bool> {
+    let m = match std::fs::metadata(dir) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+    };
+    if !m.is_dir() {
+        bail!("{} is not a directory", dir.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        if m.uid() != me {
+            bail!(
+                "refusing to use the token cache {}: it is owned by uid {}, not by you (uid {me})",
+                dir.display(),
+                m.uid()
+            );
+        }
+        if m.mode() & 0o077 != 0 {
+            bail!(
+                "refusing to use the token cache {}: others have access to it (mode {:o}); \
+                 make it private with `chmod 700`",
+                dir.display(),
+                m.mode() & 0o7777
+            );
+        }
+    }
+    Ok(true)
+}
+
 /// The on-disk token cache.
 #[derive(Clone, Debug)]
 pub struct TokenStore {
     dir: PathBuf,
+    /// Set once all its directories were found private (see [`private_dir`]).
+    checked: Arc<OnceLock<()>>,
 }
 
 impl TokenStore {
     /// `$NFI_TOKEN_CACHE`, else `$XDG_CACHE_HOME/nfi/tokens`, else
-    /// `~/.cache/nfi/tokens`.
-    fn default_location() -> Result<Self> {
+    /// `~/.cache/nfi/tokens`; `None` if neither is set.
+    fn default_location() -> Option<Self> {
         if let Some(d) = std::env::var_os("NFI_TOKEN_CACHE") {
-            return Ok(Self::at(d));
+            return Some(Self::at(d));
         }
         let base = std::env::var_os("XDG_CACHE_HOME")
             .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-            .context("neither XDG_CACHE_HOME nor HOME is set")?;
-        Ok(Self::at(base.join("nfi").join("tokens")))
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+        Some(Self::at(base.join("nfi").join("tokens")))
     }
 
     pub fn at(dir: impl Into<PathBuf>) -> Self {
-        TokenStore { dir: dir.into() }
+        TokenStore {
+            dir: dir.into(),
+            checked: Arc::default(),
+        }
+    }
+
+    /// Fail unless the store's directories are private (see
+    /// [`private_dir`]): checked before each use until all exist.
+    fn check(&self) -> Result<()> {
+        if self.checked.get().is_some() {
+            return Ok(());
+        }
+        let mut all = true;
+        for d in [self.dir.clone(), self.urls_dir(), self.dir.join("settings")] {
+            all &= private_dir(&d)?;
+        }
+        if all {
+            let _ = self.checked.set(());
+        }
+        Ok(())
     }
 
     fn token_path(&self, issuer: &str, client_id: &str) -> PathBuf {
@@ -170,11 +234,19 @@ impl TokenStore {
             .join(format!("{}.json", digest(&[url.trim_end_matches('/')])))
     }
 
-    /// Create the store's directories (see [`create_dir`]).
+    /// Create the store's directories (see [`create_dir`]) and check them.
     fn create_dirs(&self) -> Result<()> {
+        self.check()?;
         create_dir(&self.dir)?;
         create_dir(&self.urls_dir())?;
-        create_dir(&self.dir.join("settings"))
+        create_dir(&self.dir.join("settings"))?;
+        self.check()
+    }
+
+    /// [`read_json`], once the store is checked.
+    fn read<T: DeserializeOwned>(&self, path: &Path) -> Result<Option<T>> {
+        self.check()?;
+        read_json(path)
     }
 
     /// Write atomically; the temporary file is created with mode 0600.
@@ -190,7 +262,7 @@ impl TokenStore {
     }
 
     pub fn token(&self, issuer: &str, client_id: &str) -> Result<Option<StoredToken>> {
-        read_json(&self.token_path(issuer, client_id))
+        self.read(&self.token_path(issuer, client_id))
     }
 
     pub fn save_token(&self, t: &StoredToken) -> Result<()> {
@@ -198,6 +270,7 @@ impl TokenStore {
     }
 
     pub fn remove_token(&self, issuer: &str, client_id: &str) -> Result<bool> {
+        self.check()?;
         remove(&self.token_path(issuer, client_id))
     }
 
@@ -217,7 +290,7 @@ impl TokenStore {
 
     /// The provider login `url` was logged in with, if any.
     fn url_login(&self, url: &str) -> Result<Option<UrlLogin>> {
-        let r: Option<UrlLogin> = read_json(&self.url_path(url))?;
+        let r: Option<UrlLogin> = self.read(&self.url_path(url))?;
         Ok(r.filter(|r| r.url == url.trim_end_matches('/')))
     }
 
@@ -234,12 +307,13 @@ impl TokenStore {
     /// The cached settings of `url`: `None` if not cached (or unreadable),
     /// `Some(None)` if it has no OIDC.
     fn settings(&self, url: &str) -> Option<Option<AuthConfig>> {
-        let s: UrlSettings = read_json(&self.settings_path(url)).ok().flatten()?;
+        let s: UrlSettings = self.read(&self.settings_path(url)).ok().flatten()?;
         (s.url == url.trim_end_matches('/')).then_some(s.config)
     }
 
     /// The URLs logged in to with (`issuer`, `client_id`).
     fn urls(&self, issuer: &str, client_id: &str) -> Result<Vec<String>> {
+        self.check()?;
         let dir = self.urls_dir();
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
@@ -304,6 +378,9 @@ impl std::fmt::Display for DevicePrompt {
 #[derive(Debug)]
 pub enum Identity {
     User(Whoami),
+    /// The fixed token of a listener without OIDC (its [`Whoami`] names
+    /// [`nfi_auth::TOKEN_USERNAME`]).
+    StaticToken(Whoami),
     NotAuthenticated,
     /// The service does not use OIDC login.
     NoLogin,
@@ -348,7 +425,7 @@ impl Credentials {
             url: url.trim_end_matches('/').to_string(),
             explicit,
             token_hint,
-            store: TokenStore::default_location().ok(),
+            store: TokenStore::default_location(),
             http: client(reqwest::redirect::Policy::default()),
             idp: client(reqwest::redirect::Policy::none()),
             discovered: OnceCell::new(),
@@ -402,8 +479,8 @@ impl Credentials {
     /// logged in to (refreshed if needed). Without a usable one, a service
     /// without OIDC or accepting anonymous requests (as its settings say:
     /// those recorded, else cached, else fetched now) gets none; otherwise
-    /// this logs in (if `prompt` and stderr is a terminal) or fails with the
-    /// hint.
+    /// this logs in (if `prompt` and stderr is a terminal: see
+    /// [`Credentials::reuse`]) or fails with the hint.
     pub async fn token(&self, prompt: bool) -> Result<Option<String>> {
         if let Some(t) = self.explicit_token()? {
             return Ok(Some(t));
@@ -428,8 +505,17 @@ impl Credentials {
             }
             return Ok(None);
         }
-        if prompt && self.store.is_some() && interactive() {
-            return self.device_rediscovered().await;
+        if prompt
+            && interactive()
+            && let Some(store) = &self.store
+        {
+            let Some(cfg) = self.config().await? else {
+                return Ok(None);
+            };
+            if let Some((t, _)) = self.reuse(store, cfg).await? {
+                return Ok(Some(t));
+            }
+            return self.device(cfg).await.map(Some);
         }
         bail!("{}", self.hint())
     }
@@ -456,45 +542,78 @@ impl Credentials {
         self.ask(t.as_deref()).await
     }
 
-    /// Log in: unless `force`, keep a cached provider login the service
-    /// accepts (even one made for another URL: the user chose to log in
-    /// here; if using it fails, with a warning); otherwise run the device
-    /// flow. Either way the URL is recorded as logged in. Returns who the
-    /// service sees.
+    /// Log in: unless `force`, with the cached provider login if possible
+    /// (see [`Credentials::reuse`]); otherwise run the device flow. Either
+    /// way the URL is recorded as logged in. Returns who the service sees.
     pub async fn login(&self, force: bool) -> Result<Whoami> {
         let cfg = self
             .config()
             .await?
-            .with_context(|| format!("{} does not use OIDC login", self.url))?;
+            .with_context(|| format!("{} does not use OIDC login", printable(&self.url)))?;
         self.secure(&self.url)?;
-        if !force && let Some(store) = &self.store {
-            match self.reuse(store, cfg).await {
-                Ok(Some((t, w))) => {
-                    store.record_url(&self.url, cfg)?;
-                    self.remember(t);
-                    return Ok(w);
-                }
-                Ok(None) => {}
-                Err(e) => eprintln!("warning: not using the cached login: {e:#}"),
-            }
+        if !force
+            && let Some(store) = &self.store
+            && let Some((_, w)) = self.reuse(store, cfg).await?
+        {
+            return Ok(w);
         }
         let t = self.device(cfg).await?;
-        match self.ask(Some(&t)).await? {
-            Identity::User(w) => Ok(w),
-            _ => {
-                // Keep the provider login, but stop sending it here.
-                *self.current.lock().unwrap() = None;
-                if let Some(store) = &self.store {
-                    remove(&store.url_path(&self.url))?;
-                }
-                bail!("{} rejected the new login", self.url)
+        let r = self.ask(Some(&t)).await;
+        if let Ok(Identity::User(w)) = r {
+            return Ok(w);
+        }
+        // Keep the provider login, but stop sending it here.
+        *self.current.lock().unwrap() = None;
+        if let Some(store) = &self.store {
+            remove(&store.url_path(&self.url))?;
+        }
+        let rejected = format!("{} rejected the new login", printable(&self.url));
+        match r {
+            Err(e) => Err(e.context(rejected)),
+            Ok(_) => bail!("{rejected}"),
+        }
+    }
+
+    /// Log in with the cached provider login for `cfg`, if there is one:
+    /// used without asking if this URL was logged in with it, else only if
+    /// the user agrees to use the login made for other URLs here (asked on
+    /// the terminal; without one, this fails rather than ask). Records the
+    /// URL if the service accepts it. `None`: run the device flow (no such
+    /// login, the user said no, or it cannot be used: with a warning).
+    async fn reuse(&self, store: &TokenStore, cfg: &AuthConfig) -> Result<Option<(String, Whoami)>> {
+        let urls = store.urls(&cfg.issuer, &cfg.client_id)?;
+        if urls.is_empty() || store.token(&cfg.issuer, &cfg.client_id)?.is_none() {
+            return Ok(None);
+        }
+        if !urls.contains(&self.url) {
+            let others = urls.iter().map(|u| printable(u)).collect::<Vec<_>>().join(", ");
+            let url = printable(&self.url);
+            match confirm(format!("Use your login for {others} to log in to {url}? [y/N] ")).await? {
+                Some(true) => {}
+                Some(false) => return Ok(None),
+                None => bail!(
+                    "the login for {others} could be used for {url}: run `{0} login` on a terminal \
+                     to choose, or `{0} login --force` for a new login",
+                    self.tool
+                ),
+            }
+        }
+        match self.accepted(store, cfg).await {
+            Ok(Some((t, w))) => {
+                store.record_url(&self.url, cfg)?;
+                Ok(Some((self.remember(t), w)))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => {
+                eprintln!("warning: not using the cached login: {e:#}");
+                Ok(None)
             }
         }
     }
 
-    /// The cached provider login and who the service sees with it, if it
-    /// accepts it.
-    async fn reuse(&self, store: &TokenStore, cfg: &AuthConfig) -> Result<Option<(String, Whoami)>> {
+    /// The cached provider login for `cfg` and who the service sees with
+    /// it, if it accepts it.
+    async fn accepted(&self, store: &TokenStore, cfg: &AuthConfig) -> Result<Option<(String, Whoami)>> {
         let Login::Usable(t) = self.provider(store, cfg).await? else {
             return Ok(None);
         };
@@ -536,11 +655,13 @@ impl Credentials {
     /// the URL with the new settings.
     pub async fn relogin(&self) -> Result<Option<String>> {
         *self.current.lock().unwrap() = None;
-        if self.explicit.is_some() || self.config().await?.is_none() || self.store.is_none() || !interactive()
-        {
+        if self.explicit.is_some() {
             return Ok(None);
         }
-        self.device_rediscovered().await
+        match self.config().await? {
+            Some(cfg) if self.store.is_some() && interactive() => self.device(cfg).await.map(Some),
+            _ => Ok(None),
+        }
     }
 
     /// What to do about a 401. Suggests logging in if the service uses OIDC
@@ -563,7 +684,7 @@ impl Credentials {
                 self.tool, self.token_hint
             ),
             (true, None) => format!(
-                "authentication required: set HOME or NFI_TOKEN_CACHE to log in, or {}",
+                "authentication required: {NO_CACHE_HINT} to log in, or {}",
                 self.token_hint
             ),
             (false, _) => format!("authentication required: {}", self.token_hint),
@@ -604,15 +725,6 @@ impl Credentials {
             return Ok(c);
         }
         Ok(self.config().await?.cloned())
-    }
-
-    /// Fetch the service's settings and run the device flow; `None` if it
-    /// does not use OIDC (any more).
-    async fn device_rediscovered(&self) -> Result<Option<String>> {
-        match self.config().await? {
-            Some(cfg) => self.device(cfg).await.map(Some),
-            None => Ok(None),
-        }
     }
 
     fn remember(&self, t: String) -> String {
@@ -689,7 +801,7 @@ impl Credentials {
         let store = self
             .store
             .as_ref()
-            .context("no token cache: set HOME, XDG_CACHE_HOME or NFI_TOKEN_CACHE")?;
+            .with_context(|| format!("no token cache: {NO_CACHE_HINT}"))?;
         let t = self.device_login(cfg).await?;
         let _lock = self.lock(store, &cfg.issuer, &cfg.client_id).await?;
         store.save_token(&t)?;
@@ -711,13 +823,21 @@ impl Credentials {
         Ok(match r.status() {
             reqwest::StatusCode::UNAUTHORIZED => Identity::NotAuthenticated,
             reqwest::StatusCode::NOT_FOUND => Identity::NoLogin,
-            _ => Identity::User(
-                http::check(r)
+            _ => {
+                let w: Whoami = http::check(r)
                     .await?
                     .json()
                     .await
-                    .with_context(|| format!("decoding {u}"))?,
-            ),
+                    .with_context(|| format!("decoding {u}"))?;
+                let token = w.username == nfi_auth::TOKEN_USERNAME
+                    && w.session.is_none()
+                    && w.additional_info.is_empty();
+                if token {
+                    Identity::StaticToken(w)
+                } else {
+                    Identity::User(w)
+                }
+            }
         })
     }
 
@@ -929,6 +1049,44 @@ fn interactive() -> bool {
     std::io::stderr().is_terminal()
 }
 
+/// Ask a yes/no question on the controlling terminal (never stdin, which
+/// may be data); `None` without one or unless [`interactive`].
+async fn confirm(question: String) -> Result<Option<bool>> {
+    if !interactive() {
+        return Ok(None);
+    }
+    tokio::task::spawn_blocking(move || {
+        use std::io::{BufRead, Write};
+        let Ok(tty) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+        else {
+            return Ok(None);
+        };
+        (&tty).write_all(question.as_bytes())?;
+        let mut answer = String::new();
+        std::io::BufReader::new(&tty).read_line(&mut answer)?;
+        let a = answer.trim();
+        Ok(Some(a.eq_ignore_ascii_case("y") || a.eq_ignore_ascii_case("yes")))
+    })
+    .await?
+}
+
+/// `s` with control characters escaped, to print a URL from a cache file or
+/// a service.
+fn printable(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
 /// Whether credentials sent to `url` would cross the network unencrypted:
 /// plain `http://` to a host other than loopback (`localhost`,
 /// 127.0.0.0/8, `::1`).
@@ -1061,6 +1219,62 @@ mod tests {
             ),
             (0o700, 0o700, 0o700)
         );
+    }
+
+    /// Directories it did not create are used only if private to the user
+    /// (and are not changed).
+    #[cfg(unix)]
+    #[test]
+    fn store_refuses_shared_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("t");
+        let chmod =
+            |p: &Path, m: u32| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        let t = StoredToken {
+            issuer: "i".into(),
+            client_id: "c".into(),
+            id_token: "x".into(),
+            refresh_token: None,
+        };
+        let err = |s: &TokenStore| format!("{:#}", s.token("i", "c").unwrap_err());
+        std::fs::create_dir(&dir).unwrap();
+        chmod(&dir, 0o755);
+        let s = TokenStore::at(&dir);
+        let e = err(&s);
+        assert!(
+            e.contains(&format!("refusing to use the token cache {}", dir.display()))
+                && e.contains("others have access to it (mode 755)"),
+            "{e}"
+        );
+        assert!(s.save_token(&t).is_err());
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert!(!dir.join("urls").exists());
+
+        chmod(&dir, 0o700);
+        s.save_token(&t).unwrap();
+        // A subdirectory too, on a store's first use.
+        chmod(&dir.join("settings"), 0o750);
+        let s = TokenStore::at(&dir);
+        assert!(err(&s).contains("mode 750"), "{}", err(&s));
+        chmod(&dir.join("settings"), 0o700);
+        assert!(s.token("i", "c").unwrap().is_some());
+
+        // Owned by someone else (only root can arrange that).
+        if unsafe { libc::geteuid() } == 0 {
+            std::os::unix::fs::chown(&dir, Some(1), None).unwrap();
+            let e = err(&TokenStore::at(&dir));
+            assert!(e.contains("it is owned by uid 1, not by you (uid 0)"), "{e}");
+        }
+    }
+
+    #[test]
+    fn printable_urls() {
+        assert_eq!(printable("http://a/\x1b[2Jb\n"), "http://a/\\u{1b}[2Jb\\n");
+        assert_eq!(printable("https://n\u{e9}.example"), "https://n\u{e9}.example");
     }
 
     #[test]

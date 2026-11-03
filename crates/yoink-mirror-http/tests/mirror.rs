@@ -33,6 +33,18 @@ struct Cache {
     /// Fail this many PUTs with 503 first.
     fail_puts: AtomicUsize,
     gets: Mutex<HashMap<String, usize>>,
+    /// Serve NARs slowly: in this many chunks, one per interval, stalling
+    /// for good after `stall_after` chunks if set.
+    slow_nars: Option<Slow>,
+    /// Never answer a NAR PUT (after reading its body).
+    hang_nar_puts: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Slow {
+    chunks: usize,
+    every: Duration,
+    stall_after: Option<usize>,
 }
 
 impl Cache {
@@ -53,6 +65,25 @@ async fn serve_cache(cache: Arc<Cache>, prefix: &str) -> String {
         }
         *c.gets.lock().unwrap().entry(p.clone()).or_default() += 1;
         match c.file(&p) {
+            Some(b) if p.starts_with("nar/") && c.slow_nars.is_some() => {
+                let slow = c.slow_nars.unwrap();
+                let size = b.len().div_ceil(slow.chunks);
+                let chunks: Vec<Bytes> = b.chunks(size).map(Bytes::copy_from_slice).collect();
+                let body = futures::stream::iter(chunks.into_iter().enumerate()).then(
+                    move |(i, chunk)| async move {
+                        if slow.stall_after.is_some_and(|n| i >= n) {
+                            std::future::pending::<()>().await;
+                        }
+                        tokio::time::sleep(slow.every).await;
+                        Ok::<_, std::io::Error>(chunk)
+                    },
+                );
+                (
+                    [(axum::http::header::CONTENT_LENGTH, b.len().to_string())],
+                    axum::body::Body::from_stream(body),
+                )
+                    .into_response()
+            }
             Some(b) => b.into_response(),
             None => StatusCode::NOT_FOUND.into_response(),
         }
@@ -70,6 +101,9 @@ async fn serve_cache(cache: Arc<Cache>, prefix: &str) -> String {
         }
         if c.flat_only && p.contains('/') {
             return StatusCode::BAD_REQUEST.into_response();
+        }
+        if c.hang_nar_puts && p.contains(".nar") && !p.ends_with(".narinfo") {
+            std::future::pending::<()>().await;
         }
         if c.fail_puts
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -128,7 +162,11 @@ struct Env {
 }
 
 async fn start(target: Cache, prefix: &str, f: impl FnOnce(&mut Config)) -> Env {
-    let upstream = Arc::new(Cache::default());
+    start_with(Cache::default(), target, prefix, f).await
+}
+
+async fn start_with(upstream: Cache, target: Cache, prefix: &str, f: impl FnOnce(&mut Config)) -> Env {
+    let upstream = Arc::new(upstream);
     let target = Arc::new(target);
     let up_url = serve_cache(upstream.clone(), "").await;
     let t_url = serve_cache(target.clone(), prefix).await;
@@ -192,6 +230,7 @@ fn logs(evs: &[Event], p: &str, level: LogLevel) -> Vec<String> {
                 purl,
                 level: l,
                 message,
+                ..
             } if purl == p && *l == level => Some(message.clone()),
             _ => None,
         })
@@ -274,18 +313,41 @@ async fn failures() {
         .lock()
         .unwrap()
         .insert(format!("nar/{file_hash}.nar.xz"), Bytes::from_static(b"abd"));
+    add_path(&e.upstream, 2, "hello2", b"def", &[]);
+    add_path(&e.upstream, 3, "right", b"ghi", &[]);
     let corrupt = nix(&path(1, "hello"));
     let missing = nix(&path(9, "nope"));
-    let wrong_name = nix(&path(1, "goodbye"));
+    let wrong_name = nix(&path(2, "goodbye"));
+    // The same hash under the right and a wrong name, at the same time: the
+    // wrong one must not share the right one's job (or vice versa).
+    let right = nix(&path(3, "right"));
+    let also_wrong = nix(&path(3, "wrong"));
     let npm = "pkg:npm/left-pad@1.0.0".to_string();
     let (r, evs) = pull(
         &e.client,
-        &[corrupt.clone(), missing.clone(), wrong_name.clone(), npm.clone()],
+        &[
+            corrupt.clone(),
+            missing.clone(),
+            wrong_name.clone(),
+            right.clone(),
+            also_wrong.clone(),
+            npm.clone(),
+        ],
     )
     .await;
-    for p in [&corrupt, &missing, &wrong_name, &npm] {
+    for p in [&corrupt, &missing, &wrong_name, &also_wrong, &npm] {
         assert_eq!(r[p], Outcome::Fatal, "{p}: {evs:#?}");
         assert_eq!(logs(&evs, p, LogLevel::Fatal).len(), 1, "{p}");
+    }
+    assert_eq!(r[&right], Outcome::Success, "{evs:#?}");
+    for (p, upstream) in [(&wrong_name, path(2, "hello2")), (&also_wrong, path(3, "right"))] {
+        let f = &logs(&evs, p, LogLevel::Fatal)[0];
+        assert!(
+            f.contains(&format!(
+                "is {upstream} upstream; the requested name doesn't match"
+            )),
+            "{f}"
+        );
     }
     let f = &logs(&evs, &corrupt, LogLevel::Fatal)[0];
     assert!(
@@ -297,6 +359,88 @@ async fn failures() {
     assert!(logs(&evs, &npm, LogLevel::Fatal)[0].contains("unsupported package type"));
     // Nothing was published for the corrupt path (an orphaned NAR is harmless).
     assert!(e.target.file(&format!("{}.narinfo", hash(1))).is_none());
+    assert!(e.target.file(&format!("{}.narinfo", hash(2))).is_none());
+    assert!(e.target.file(&format!("{}.narinfo", hash(3))).is_some());
+}
+
+/// `--http-timeout` limits idleness, not duration: a transfer much longer
+/// than it succeeds while data keeps moving (reqwest's read timeout, which
+/// is not reset by upload progress, used to cut such uploads off).
+#[tokio::test]
+async fn slow_transfers_are_not_timed_out() {
+    let up = Cache {
+        slow_nars: Some(Slow {
+            chunks: 12,
+            every: Duration::from_millis(150),
+            stall_after: None,
+        }),
+        ..Default::default()
+    };
+    let e = start_with(up, target_cache(), "", |c| {
+        c.timeout = Duration::from_millis(600);
+        c.retries = 0;
+    })
+    .await;
+    add_path(&e.upstream, 1, "slow", &vec![7u8; 120_000], &[]);
+    let p = nix(&path(1, "slow"));
+    let t0 = std::time::Instant::now();
+    let (r, evs) = pull(&e.client, std::slice::from_ref(&p)).await;
+    assert_eq!(r[&p], Outcome::Success, "{evs:#?}");
+    assert!(
+        t0.elapsed() > Duration::from_millis(1500),
+        "the transfer was slow"
+    );
+    assert_eq!(
+        e.target.file(&format!(
+            "nar/{}.nar.xz",
+            nixbase32::encode(&sha2::Sha256::digest(vec![7u8; 120_000]))
+        )),
+        Some(Bytes::from(vec![7u8; 120_000]))
+    );
+}
+
+/// A transfer with no data moving for the timeout fails (and is retried).
+#[tokio::test]
+async fn idle_transfers_time_out() {
+    let up = Cache {
+        slow_nars: Some(Slow {
+            chunks: 4,
+            every: Duration::from_millis(10),
+            stall_after: Some(2),
+        }),
+        ..Default::default()
+    };
+    let e = start_with(up, target_cache(), "", |c| {
+        c.timeout = Duration::from_millis(300);
+        c.retries = 1;
+    })
+    .await;
+    add_path(&e.upstream, 1, "stalls", &vec![1u8; 40_000], &[]);
+    let p = nix(&path(1, "stalls"));
+    let (r, evs) = pull(&e.client, std::slice::from_ref(&p)).await;
+    assert_eq!(r[&p], Outcome::Fatal, "{evs:#?}");
+    let f = &logs(&evs, &p, LogLevel::Fatal)[0];
+    assert!(
+        f.contains("transferring the NAR: no data for 0.3s") && f.contains("gave up after 2 attempts"),
+        "{f}"
+    );
+
+    // A target that takes the NAR but never answers times out too.
+    let t = Cache {
+        hang_nar_puts: true,
+        ..target_cache()
+    };
+    let e = start(t, "", |c| {
+        c.timeout = Duration::from_millis(300);
+        c.retries = 0;
+    })
+    .await;
+    add_path(&e.upstream, 1, "hangs", b"abc", &[]);
+    let p = nix(&path(1, "hangs"));
+    let (r, evs) = pull(&e.client, std::slice::from_ref(&p)).await;
+    assert_eq!(r[&p], Outcome::Fatal, "{evs:#?}");
+    let f = &logs(&evs, &p, LogLevel::Fatal)[0];
+    assert!(f.contains("no data for 0.3s"), "{f}");
 }
 
 #[tokio::test]

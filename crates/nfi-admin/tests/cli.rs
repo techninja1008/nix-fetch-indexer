@@ -4,7 +4,9 @@ use std::process::Command;
 
 fn admin(svc: &nfi_testenv::TestService, args: &[&str]) -> (i32, String, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_nfi-admin"))
-        .args(["--url", &svc.admin_url, "--token", "tok"])
+        .args(["--url", &svc.admin_url])
+        .env("NFI_ADMIN_TOKEN", "tok")
+        .env_remove("NFI_ADMIN_TOKEN_FILE")
         .args(args)
         .output()
         .unwrap();
@@ -101,18 +103,46 @@ async fn missing_admin_token_hint() {
         return;
     };
     let dir = tempfile::tempdir().unwrap();
-    let out = tokio::task::block_in_place(|| {
-        Command::new(env!("CARGO_BIN_EXE_nfi-admin"))
-            .args(["--url", &svc.admin_url, "releases"])
+    let run = |token: Option<&str>, args: &[&str]| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nfi-admin"));
+        c.args(["--url", &svc.admin_url])
+            .args(args)
             .env("NFI_TOKEN_CACHE", dir.path().join("tokens"))
             .env_remove("NFI_ADMIN_TOKEN")
-            .env_remove("NFI_ADMIN_TOKEN_FILE")
-            .output()
-            .unwrap()
-    });
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(1), "{err}");
+            .env_remove("NFI_ADMIN_TOKEN_FILE");
+        if let Some(t) = token {
+            c.env("NFI_ADMIN_TOKEN", t);
+        }
+        let out = tokio::task::block_in_place(|| c.output().unwrap());
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (code, _, err) = run(None, &["releases"]);
+    assert_eq!(code, Some(1), "{err}");
     // A fixed-token listener has no OIDC login to suggest.
-    assert!(err.contains("pass --token or --token-file"), "{err}");
+    assert!(err.contains("set NFI_ADMIN_TOKEN or pass --token-file"), "{err}");
     assert!(!err.contains("nfi-admin login"), "{err}");
+
+    // `whoami` checks the static token.
+    let url = &svc.admin_url;
+    for (token, code, out) in [
+        (
+            Some("tok"),
+            0,
+            format!("{url}: authenticated with a static token"),
+        ),
+        (Some("wrong"), 1, format!("{url}: not authenticated")),
+        (None, 1, format!("{url}: not authenticated")),
+    ] {
+        let (c, o, e) = run(token, &["whoami"]);
+        assert_eq!((c, o.trim()), (Some(code), out.as_str()), "{e}");
+    }
+
+    // The token is never taken from the command line.
+    let (code, _, err) = run(None, &["--token", "tok", "releases"]);
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains("unexpected argument '--token'"), "{err}");
 }

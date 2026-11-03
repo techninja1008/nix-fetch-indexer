@@ -145,7 +145,7 @@ async fn mirror_stream() {
     assert!(evs.iter().any(|ev| matches!(ev,
         Event::Status { purl, phase, progress: Some(_) } if purl == "pkg:fake/ok" && phase == "t")));
     assert!(evs.iter().any(|ev| matches!(ev,
-        Event::Log { purl, level: LogLevel::Warning, message } if purl == "pkg:fake/bad" && message == "halfway")));
+        Event::Log { purl, level: LogLevel::Warning, message, .. } if purl == "pkg:fake/bad" && message == "halfway")));
     let who: nfi_auth::Whoami = c.get_json(nfi_auth::WHOAMI_PATH).await.unwrap();
     assert_eq!(who.username, "alice");
     assert_eq!(who.additional_info["groups"], json!(["dev"]));

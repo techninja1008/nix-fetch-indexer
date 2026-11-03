@@ -144,6 +144,7 @@ mod tests {
             purl: a.clone(),
             level,
             message: "boom".into(),
+            id: None,
         };
         let c = s.apply(log(LogLevel::Warning));
         assert_eq!(p.change(&s, &c), None);

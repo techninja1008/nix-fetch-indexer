@@ -59,7 +59,7 @@ OCI images for the service are built with Nix `dockerTools`. There is no Dockerf
   - `series`: e.g. `25.05` or `unstable`
   - `url`
   - `indexed_at`
-- **Commit lookups:** there are two kinds of commit input. Lockfile-style `attr@commit` (bulk items) must be entirely unambiguous, so it takes only full 40-character commit hashes (any case, normalised to lowercase) and matches exactly; anything else is a request error (400). Commits a user selects a release with (`GET /v1/packages/{attr}?commit=`, i.e. `nfi show --commit`, and prune's `commits`) share one prefix rule: at least 8 hex digits (any case), matching exactly one release. A malformed or ambiguous prefix is a 400 (the latter naming the prefix and its match count); one matching none is an unknown commit (404) for package lookups and selects nothing for prune.
+- **Commit lookups:** there are two kinds of commit input. Lockfile-style `attr@commit` (bulk items) must be entirely unambiguous, so it takes only full 40-character commit hashes (any case, normalised to lowercase) and matches exactly; anything else is a request error (400). Commits a user selects a release with (`GET /v1/packages/{attr}?commit=`, i.e. `nfi show --commit`, `GET /v1/search?commit=`, and prune's `commits`) share one prefix rule: at least 8 hex digits (any case), matching exactly one release. A malformed or ambiguous prefix is a 400 (the latter naming the prefix and its match count); one matching none is an unknown commit (404) for package lookups and search, and selects nothing for prune.
 - **Store path keys:** store paths are keyed by their 32-char nix-base32 hash. The hash is unique across systems, so the closure graph is system-agnostic.
 - **System tags:** package, out-path and program entries are tagged with `system`.
 
@@ -83,7 +83,7 @@ Release { name, commit, channel, series, url, datasets: [closure|packages|outpat
 ClosureSection {
   closures: [Closure { eval: eval index, closure_type }],   // closure type name within the eval type; may be empty
   paths: [ClosurePath { hash, name, references: [path index], nar_size, file_size, deriver: Option<String>, closures: Bitset }],
-  missing: [MissingPath { hash, name, closures: Bitset }]   // roots that are 404 on the cache
+  missing: [MissingPath { hash, name, closures: Bitset }]   // roots that are 404 on the cache, or whose closure includes a 404
 }
 PackagesSection { entries: [Package { attr, name, pname, version, system, description, homepage, license, main_program, broken, unfree, releases: Bitset }] }
 OutpathsSection { entries: [Outpaths { attr, system, drv_path, outputs: {name: store path}, releases: Bitset }] }
@@ -118,7 +118,7 @@ EvalErrorsSection {
 - **JSON form:** the same data model.
   - Structurally identical, with bitsets as hex strings and references as index arrays.
   - It is detected by a leading `{`.
-- **Merge:** union the release tables by name, the evaluation tables by (release, eval type) (sorted by release, then eval type), and the closure tables by (evaluation, closure type), remap the bitsets, and union entries by key:
+- **Merge:** union the release tables by name (inputs that disagree on a release's commit, channel or series are an error), the evaluation tables by (release, eval type) (sorted by release, then eval type), and the closure tables by (evaluation, closure type), remap the bitsets, and union entries by key:
   - closure: hash
   - packages: (attr, version, system, metadata)
   - outpaths: (attr, system, drv_path)
@@ -135,7 +135,7 @@ EvalErrorsSection {
   - Fetch `store-paths.xz`, then mass-query narinfos over HTTP/2 with bounded concurrency (default 512), spread over several independent connections (`--connections`, default 8), because the cache caps concurrent streams per connection.
   - Retries back off on 429/5xx.
   - The indexer follows references transitively.
-  - Paths that return 404 are recorded in `missing`.
+  - A root that returns 404, or whose closure includes (at any depth) a path that does, is recorded in `missing` under its own name and is not part of the closure; paths in its closure belong to the closure only if a complete root reaches them. 404'd references are not recorded themselves, so a closure is never reported complete when it isn't.
   - `--seed <bundle>` reuses known hashes: store paths are immutable, so only new hashes are fetched. In channel-list mode, each release seeds the next.
   - Every closure type goes through the same walk from its roots; only root collection differs.
 - **Helper probes** (the `helpers` evaluator: `helpers:direct`, `helpers:full`)
@@ -183,6 +183,7 @@ EvalErrorsSection {
 
 - Children are started from the main thread and stopped on shutdown.
 - On Linux, `PR_SET_PDEATHSIG` also signals them if the service dies.
+- The service checks on its children every second. If one exits, it logs which and how, stops the other and exits with an error, so whatever supervises the service restarts the node rather than it serving errors.
 
 ### Postgres schema (sketch)
 
@@ -193,16 +194,19 @@ eval_types(id, name unique)             -- store-paths, helpers, ...
 evals(id, release_id, type_id, errors_indexed, unique (release_id, type_id))
 closure_types(id, eval_type_id, name, unique (eval_type_id, name))   -- (store-paths, ''), (helpers, direct), (helpers, full)
 closures(id, eval_id, type_id, unique (eval_id, type_id))            -- type's eval type = evaluation's
-store_paths(id bigserial, hash char(32) unique, name, nar_size, file_size, deriver,
+store_paths(id bigserial, hash text unique, name, nar_size, file_size, deriver,
             closures int[],   -- sorted ids of the closures containing the path
             refs bigint[])    -- ids of the path's runtime references
-missing_paths(hash, name, closure_id)
+missing_paths(hash, name, closure_id, primary key (hash, closure_id))   -- also indexed by closure_id (cascade deletes)
 eval_errors(attr, system, eval_id)      -- one row per (error, evaluation), like missing_paths; only in evals with errors_indexed
-packages(id, attr, version, system, name, pname, description, homepage, license, main_program, broken, unfree)
+packages(id, key unique, attr, system, name, pname, version, description, homepage, license text[], main_program,
+         outputs text[], broken, unfree)   -- key: hash of the metadata; shared by releases with identical metadata
 package_releases(package_id, release_id)
-package_outputs(attr, system, release_id, output, path_hash, drv_path)   -- joined from outpaths at ingest
-programs(name, system, attr, release_id)
-jobs(id, kind, status, params jsonb, staged_blob oid/bytea, progress, error, created_at, started_at, finished_at)
+package_outputs(release_id, attr, system, output, path, drv_path)   -- full store paths, from outpaths
+programs(release_id, name, system, attr)
+jobs(id, kind, status, params jsonb, progress, result jsonb, error, worker, claim_id uuid, attempts,
+     created_at, started_at, heartbeat_at, finished_at)   -- status: staging, queued, running, succeeded, failed
+job_blob_chunks(job_id, seq, data bytea)   -- a staged upload, in 8 MiB chunks; deleted when its job finishes
 ```
 
 Membership and references are arrays on the path row, not one row per (path, closure) or per edge. Migration 0003 introduced evaluations and closures by giving each existing release a store-paths evaluation and closure with the release's own id, so existing arrays stayed valid. A channel's releases share most of their paths, so per-pair rows grow quickly: all 87 `nixos-26.05` releases are 2.7M paths, 22.5M memberships and 38M references.
@@ -226,7 +230,7 @@ A store path's references never change, so they are written only once, when the 
 - eval errors are only in evaluations whose errors are indexed.
 
 **Enforcement:**
-- `Bundle::validate` rejects open closures.
+- `Bundle::validate` rejects open closures, duplicate closure paths and release commits that aren't 40 lowercase hex digits.
 - Ingest skips paths in no closure.
 - `nfi-admin check` (`POST /admin/v1/check`) verifies the invariants.
 - Closure queries fail with an `index inconsistency` error instead of returning partial results.
@@ -235,10 +239,12 @@ A store path's references never change, so they are written only once, when the 
 
 - Admin ingest and prune requests enqueue a job.
 - Any replica's worker claims jobs with `SELECT … FOR UPDATE SKIP LOCKED`.
-- Uploaded bundles are staged in Postgres before processing.
+- **Claims:** a running job's worker bumps `heartbeat_at` every 15 s. A job whose heartbeat is older than 2 minutes (its replica died or lost the database) is claimed again. Each claim gets a fresh `claim_id`, and heartbeat, progress and result updates only apply while the job still carries it, so a worker that lost its claim can't overwrite the new one's work.
+- **Attempts:** each claim counts in `attempts`. A job whose 3rd claim goes stale is failed (`abandoned after 3 attempts`) instead of claimed again, so a job that kills its worker (e.g. by exhausting its memory) can't take down every replica in turn.
+- Uploaded bundles are staged in Postgres (`job_blob_chunks`) before processing; the job is `staging` (shown as queued) meanwhile, with `heartbeat_at` bumped as data arrives. A staged upload that receives no data for 10 minutes (its client or replica died) is failed by the workers and its chunks deleted; its uploader, if still there, can store nothing more.
 - Ingest is purely additive (`ON CONFLICT DO NOTHING`): entries are immutable, so re-ingesting is a no-op and nothing is deleted or garbage-collected on ingest. A release name already indexed with a different commit is rejected.
-- Prune removes release associations, then garbage-collects store paths, packages and programs that no remaining release references.
-- Search documents are updated after each Postgres commit.
+- Prune removes the selected releases (their evaluations, closures, package associations, outputs and programs cascade) or closures, then garbage-collects store paths left in no closure and packages no remaining release references.
+- Search documents are updated after each Postgres commit. All search writes (an ingest's or prune's sync, a rebuild) take one advisory lock (`SEARCH_LOCK`, separate from the write lock so a long rebuild doesn't hold up ingest) and read the database only once they hold it. Since every write syncs after it commits, a write a rebuild didn't see syncs after that rebuild, never before it.
 
 ### Search documents
 
@@ -247,16 +253,18 @@ A store path's references never change, so they are written only once, when the 
   - `programs[]`, `main_program`
   - `releases[]`, `channels[]`, `series[]`, `commits[]`
 - Filterable attributes: `attr`, `pname`, `version`, `system`, `programs`, `releases`, `channels`, `series`, `commits`.
-- An admin `reindex` rebuilds the index from Postgres.
+- An admin `reindex` rebuilds the index from Postgres into a scratch index with a unique name (`<index>_rebuild_<uuid>`) and swaps it in. Scratch indexes of interrupted rebuilds are deleted by the next rebuild.
+- Waits on Meilisearch tasks give up after 10 minutes, failing the job.
 
 ### Public API
 
 - `GET /v1/search?q=&attr=&version=&program=&series=&channel=&commit=&system=&limit=&offset=`
+  - `commit` selects a release like package lookups do (a prefix of at least 8 hex digits, any case; 400 if malformed or ambiguous, 404 if unknown), then filters on its full hash.
 - `GET /v1/packages/{attr}?commit=&system=`: direct lookup. Returns metadata plus output store paths, with a cached flag per output.
 - `POST /v1/lookup/bulk`
-  - Request body: `{items:[{attr, commit, system?}]}`
+  - Request body: `{items:[{attr, commit, system?, outputs?}]}`, at most 10,000 items (`BULK_MAX_ITEMS`; more is a 400). The items are looked up together, in a fixed number of queries.
   - Response:
-    - `items`: one per request, with status `ok | unknown_attr | unknown_commit | not_cached` and its paths
+    - `items`: one per request, with status `ok | unknown_commit | unknown_attr | no_outpaths | unknown_output | not_cached` and its paths
     - `closure`: the deduplicated runtime closure of all resolved paths
 - `POST /v1/minimise`
   - Request body: either raw `nix derivation show --recursive` JSON or the reduced graph `{derivations:{drvPath:{outputs:{name:path}, inputDrvs:{drv:[outputs]}, inputSrcs:[...]}}}`.
@@ -314,12 +322,12 @@ OIDC is optional on `nfi-service` and required on `yoink-service`.
 - **Tokens:** clients send an OIDC **ID token** as `Authorization: Bearer`. Services validate it against the issuer's JWKS: signature (asymmetric algorithms only; a JWK that declares an `alg` must match the token's, `use: enc` keys are ignored), `iss`, `aud` (the client id unless configured), `exp`/`nbf` with 60 s leeway.
 - **Keys:** discovery and the JWKS are fetched at startup (an unreachable provider is only a warning; a discovery document for another issuer stops the service). A known `kid` never causes a fetch. An unknown `kid` refetches the set, one fetch at a time and at most every 30 s (failed attempts count); a set older than 1 h is refreshed in the background while still in use, so revoked keys drop out within about an hour. Without any key set, or for an unknown `kid` while the last fetch failed (a key rotation during a provider outage), requests get 503, not 401, so CLIs don't log in again for nothing.
 - **Principal:** CEL expressions over `claims` give the `username` (default `preferred_username`, else `sub`) and an optional credential/session id (e.g. `claims.sid`). Both go into every request's log span. An empty username rejects the token.
-- **Authorisation:** CEL expressions that must evaluate to `true`. Variables: `claims`, `user` (`{username, session}`), `request` (`{method, path}`), and on yoink's per-PURL policy `purl` (`{type, namespace, name, version, qualifiers, subpath, raw}`). A non-bool result or evaluation error denies (and is logged).
+- **Authorisation:** CEL expressions that must evaluate to `true`. Variables: `claims`, `user` (`{username, session}`), `request` (`{method, path}`, `path` percent-decoded like route parameters; a path with an encoded `/`, invalid percent-encoding or invalid UTF-8 is a 400, since it would not match the segments the router saw), and on yoink's per-PURL policy `purl` (`{type, namespace, name, version, qualifiers, subpath, raw}`). A non-bool result or evaluation error denies (and is logged).
 - **Configuration:** values (issuer, client id) are flags/env; CEL expressions and secrets are always read from files named by flags/env.
 - **Guards:** each listener has a guard (`nfi_auth_server::Guard`): open, a fixed token, or OIDC with a policy and optionally anonymous access; one middleware applies it. Rejections are JSON `{error}` bodies, 401s with `WWW-Authenticate: Bearer`.
-- **Discovery:** each listener serves `GET /auth/v1/config` (`{issuer, client_id, scopes, anonymous}`, unauthenticated; 404 unless the listener uses OIDC) and `GET /auth/v1/whoami` (outside the middleware: it authenticates the token itself, without the policy or anonymous access, so a user the policy denies still learns who they are; 401 without a valid token, 404 unless the listener uses OIDC, with or without a token): `{username, session, additional_info}`, where `additional_info` is the map a CEL expression over `claims` and `user` gives (default `claims`; a non-map result is logged and answered with 500). Clients treat a missing `additional_info` (older services) as empty.
+- **Discovery:** each listener serves `GET /auth/v1/config` (`{issuer, client_id, scopes, anonymous}`, unauthenticated; 404 unless the listener uses OIDC) and `GET /auth/v1/whoami` (outside the middleware: it authenticates the token itself, without the policy or anonymous access, so a user the policy denies still learns who they are; 401 without a valid token, 404 on an open listener; a fixed-token listener checks its token and answers `{username: "(token)"}`): `{username, session, additional_info}`, where `additional_info` is the map a CEL expression over `claims` and `user` gives (default `claims`; a non-map result is logged and answered with 500). Clients treat a missing `additional_info` (older services) as empty.
 - **Logs:** both services log accepted requests (and whoami requests) in a `request{method, path, user, session}` span (`-` for none, `(token)` for a fixed token) ending with `request status=...`; rejected ones as `request rejected` with `method`, `path`, `status` and `error` (at `error` level for a 5xx, else `info`).
-- **CLIs:** device authorization grant (RFC 8628) with a public client, then refresh tokens. `nfi_auth_client::Credentials` holds one service's credentials: an explicit token, else a login cached per (issuer, client id) under `$XDG_CACHE_HOME/nfi/tokens` (directories 0700, files 0600, written via a temporary file and rename), shared by `nfi`, `nfi-admin` and `yoink`. A cached token is bound to URLs: `urls/<digest(url)>.json` records `{url, issuer, client_id, scopes, anonymous}`, the settings the URL advertised at `/auth/v1/config`, for each URL logged in to (by `login`, by a device login a command made for that URL, or by one after a 401), and a token is only sent to a URL with a record, for the (issuer, client id) recorded. Otherwise a service could announce someone else's provider and client and collect their token. Commands use the recorded settings; for a URL without a record, `settings/<digest(url)>.json` caches `{url, config}` (`config` null for a 404: no OIDC), fetched on the URL's first use. That cache only says whether a login is needed: it never makes a URL receive a token, which only a record does. The settings are fetched again only by `login` and after a 401 (at most once per process), and every fetch updates the cache, so a cached "no OIDC" is corrected by the service's first 401. After a 401 a device login with the new settings replaces the record (also when the issuer or client changed). `login` without `--force` may check the provider login against the URL's whoami (the user chose that URL) and records it; `logout` reads the record (no network) and, under the refresh lock (so a concurrent refresh cannot save the login back), removes the provider token and every URL recorded for it; a URL without a record is not logged in, and nothing is removed. If reusing the provider login fails, `login` warns and falls back to the device flow; if the service rejects the new login, its URL record is removed. A token with less than 60 s left is refreshed under an exclusive lock on `<token>.lock`, re-reading the cache after acquiring it, so concurrent CLIs use a rotating refresh token once; a device login saves under the same lock. Only `invalid_grant` removes the refresh token; other OAuth or transport errors keep it. Corrupt cache files, and files in any other format, count as missing (one warning), as does an unreadable settings entry. A command gets its token up front (cheap argument checks first, then the login prompt if stderr is a terminal, then stdin, nix evaluation and uploads), so prompts never interleave with work or yoink's monitor; only a token rejected despite that (a 401) prompts later, for the one request. No token is sent, and no device login or refresh made, over plain `http://` to a host other than loopback (the service URL, the issuer, the device authorization and token endpoints) unless `--allow-insecure` or `NFI_ALLOW_INSECURE=1` allows it. Provider requests (discovery, device authorization, token) use a client that does not follow redirects, since a 307/308 would replay a refresh token or device code to another host; service requests use a separate client that does (reqwest drops the bearer token on a cross-host redirect). Every API request goes through `nfi_auth_client::http::retry`: on a 401 when no explicit token was used it logs in again (when it may prompt) and repeats that single request, which is safe because the auth middleware answers 401 before any handler runs; an explicit token is never replaced. `whoami` fetches no settings and uses no cached ones: it sends the URL's usable login if any, else no token, never prompts, and the service's answer decides (200 a user, 401 not authenticated, 404 no login). Non-interactive use (CI) passes a pre-obtained ID token by env or file, e.g. a CI platform's OIDC token with the right audience.
+- **CLIs:** device authorization grant (RFC 8628) with a public client, then refresh tokens. `nfi_auth_client::Credentials` holds one service's credentials: an explicit token, else a login cached per (issuer, client id) under `$XDG_CACHE_HOME/nfi/tokens` (directories 0700, files 0600, written via a temporary file and rename; on first use the directories must be owned by the effective user with no group or other access, or the cache is refused), shared by `nfi`, `nfi-admin` and `yoink`. A cached token is bound to URLs: `urls/<digest(url)>.json` records `{url, issuer, client_id, scopes, anonymous}`, the settings the URL advertised at `/auth/v1/config`, for each URL logged in to (by `login`, by a device login a command made for that URL, or by one after a 401), and a token is only sent to a URL with a record, for the (issuer, client id) recorded. Otherwise a service could announce someone else's provider and client and collect their token. Commands use the recorded settings; for a URL without a record, `settings/<digest(url)>.json` caches `{url, config}` (`config` null for a 404: no OIDC), fetched on the URL's first use. That cache only says whether a login is needed: it never makes a URL receive a token, which only a record does. The settings are fetched again only by `login` and after a 401 (at most once per process), and every fetch updates the cache, so a cached "no OIDC" is corrected by the service's first 401. After a 401 a device login with the new settings replaces the record (also when the issuer or client changed). A provider login is never sent to a URL without a record on the CLI's own initiative: when `login` (without `--force`) or a command's up-front login finds one for the (issuer, client id) a new URL advertises, it asks on the controlling terminal (`/dev/tty`, not stdin, which may be data) whether to use it there; yes checks it against the URL's whoami and records the URL, no runs the device flow, and without a terminal it fails, suggesting `login` on a terminal. A URL already recorded for that login reuses it without asking; `logout` reads the record (no network) and, under the refresh lock (so a concurrent refresh cannot save the login back), removes the provider token and every URL recorded for it; a URL without a record is not logged in, and nothing is removed. If reusing the provider login fails, `login` warns and falls back to the device flow; if the service rejects the new login (or its whoami fails), its URL record is removed. A token with less than 60 s left is refreshed under an exclusive lock on `<token>.lock`, re-reading the cache after acquiring it, so concurrent CLIs use a rotating refresh token once; a device login saves under the same lock. Only `invalid_grant` removes the refresh token; other OAuth or transport errors keep it. Corrupt cache files, and files in any other format, count as missing (one warning), as does an unreadable settings entry. A command gets its token up front (cheap argument checks first, then the login prompt if stderr is a terminal, then stdin, nix evaluation and uploads), so prompts never interleave with work or yoink's monitor; only a token rejected despite that (a 401) prompts later, for the one request. No token is sent, and no device login or refresh made, over plain `http://` to a host other than loopback (the service URL, the issuer, the device authorization and token endpoints) unless `--allow-insecure` or `NFI_ALLOW_INSECURE=1` allows it. Provider requests (discovery, device authorization, token) use a client that does not follow redirects, since a 307/308 would replay a refresh token or device code to another host; service requests use a separate client that does (reqwest drops the bearer token on a cross-host redirect). Every API request goes through `nfi_auth_client::http::retry`: on a 401 when no explicit token was used it logs in again (when it may prompt) and repeats that single request, which is safe because the auth middleware answers 401 before any handler runs; an explicit token is never replaced. `whoami` fetches no settings and uses no cached ones: it sends the URL's usable login if any, else no token, never prompts, and the service's answer decides (200 a user, or a static token for `(token)` with no session or `additional_info`; 401 not authenticated; 404 no login). Non-interactive use (CI) passes a pre-obtained ID token by env or file, e.g. a CI platform's OIDC token with the right audience.
 
 ## yoink
 
@@ -338,7 +346,8 @@ yoink pulls a flake's dependencies into a binary cache under the user's control,
 ### HTTP backend (`yoink-mirror-http`)
 
 - **Caches:** an upstream (default cache.nixos.org, e.g. a proxy of it) and a target accepting `GET`/`PUT` (any HTTP cache with uploads, including a GitLab generic package registry). Each may use basic auth, a bearer token or a custom header (`PRIVATE-TOKEN`, `JOB-TOKEN`), read from files.
-- **Job per store path hash.** Phases: Queued (`Q`, bounded concurrency), Checking target (`C`, `GET <hash>.narinfo`; present means done), Fetching narinfo (`N`), Transferring NAR (`T`, streamed from upstream straight into the target `PUT`, byte progress, size and `FileHash` checked as it streams), Publishing narinfo (`P`). A requested name must match the upstream narinfo.
+- **Job per requested store path** (hash and name; a hash-only request is its own). Phases: Queued (`Q`, bounded concurrency), Checking target (`C`, `GET <hash>.narinfo`; present means done), Fetching narinfo (`N`), Transferring NAR (`T`, streamed from upstream straight into the target `PUT`, byte progress; the NAR is hashed as it streams and its size and `FileHash` are checked after the upload, a mismatch failing the step), Publishing narinfo (`P`). A requested name must match the upstream narinfo, checked per name.
+- **Timeouts:** `--http-timeout` is an idle limit. Narinfo and `nix-cache-info` requests must complete within it; a NAR transfer fails only when no data moves (nothing read from upstream, nothing taken by the upload) for that long, including waiting for upstream's headers or the target's answer after the last byte. There is no client-wide read timeout (reqwest's is not reset by upload progress).
 - **Integrity:** the narinfo is uploaded only after its NAR, so a narinfo on the target means a complete path. A NAR that fails verification leaves at most an orphaned NAR file, never a narinfo. References are not waited for: the client requests the whole closure.
 - **narinfo:** copied line for line, keeping upstream signatures; only `URL` changes (it isn't signed). `--signing-key-file` adds a signature. NARs go under `nar/` or, with `--nar-layout flat`, next to the narinfos (GitLab generic packages allow no `/` in file names). `nix-cache-info` is created on the target if missing.
 - **Retries:** connection errors, timeouts, HTTP 408/429/5xx and corrupted transfers are retried per step with exponential backoff (`--retries`, default 5) and logged as warnings; other errors (404 upstream, 401/403, name mismatch) are fatal at once.
@@ -347,8 +356,9 @@ yoink pulls a flake's dependencies into a binary cache under the user's control,
 
 - **Targets:** `pkg:…` is a PURL; anything containing `#` is a flakeref, as is `.` alone; anything else containing `@` is reserved for `name@version` (not yet supported); anything else is an error.
 - **Flakerefs** are evaluated locally (`nix derivation show --recursive`), minimised by `nfi`, and their `closure` (sorted by name, then hash) becomes `pkg:nix` PURLs. `to_build`/`to_fetch` and warnings are shown but don't affect the exit status.
-- **Completion:** the CLI exits only when every PURL has a result (0 if all succeeded, 1 otherwise) or on an unrecoverable error; a dropped stream is resumed by re-posting the unfinished PURLs with backoff.
-- **TUI:** fullscreen, with overall progress by path count and by size, and a scrollable field of per-PURL indicators in request order. Indicators shrink through several sizes (from a full line with bar, phase name, byte readout and percentage down to `[T 57]`) so as many as possible fit; warnings and errors colour the indicator. Logs are hidden by default and shown in a merged view or per PURL.
+- **Completion:** the CLI exits only when every PURL has a result (0 if all succeeded, 1 otherwise) or on an unrecoverable error; a dropped stream is resumed by re-posting the unfinished PURLs with backoff. Each log line carries its job's id and its index, so lines the service sends again on a re-post are skipped; only results, phase changes and progress past the highest seen count as progress for giving up.
+- **Making mirrored paths visible to Nix:** Nix caches misses for `narinfo-cache-negative-ttl`. After mirroring (also on detach), for the succeeded `pkg:nix` paths with a name: if `nix store info --json` says the store trusts the caller, `nix build --dry-run --option narinfo-cache-negative-ttl 0 --stdin` (paths on stdin) re-queries them and overwrites stale misses (failure is a warning); otherwise (the daemon ignores that restricted setting for untrusted users) the CLI prints guidance (`trusted-users`, a low TTL in the daemon's config, removing root's `binary-cache-v*.sqlite*`, or `--download`). `--download` (needs `--cache-url`/`YOINK_CACHE_URL`/config `cache_url`, checked up front) replaces that with `nix copy --from <cache> --option narinfo-cache-negative-ttl 0 --stdin`, which reads the cache client-side; its failure (e.g. `require-sigs` for an untrusted user) fails the command after the summary. Nothing is downloaded on detach.
+- **TUI:** fullscreen, with overall progress by path count, and a scrollable field of per-PURL indicators in request order. Indicators shrink through several sizes (from a full line with bar, phase name, byte readout and percentage down to `[T 57]`) so as many as possible fit; warnings and errors colour the indicator. Logs are hidden by default and shown in a merged view or per PURL.
 - **Plain mode** (not a terminal, or `--plain`): phase changes, errors and results as lines; `-v`/`-q` adjust.
 
 ### Future: npm-like use

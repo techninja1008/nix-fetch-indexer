@@ -4,7 +4,7 @@ pub mod client;
 
 use anyhow::{Context, Result, bail};
 use nfi_api::drv::ReducedGraph;
-use nfi_api::{BulkItem, EvalInfo, ReleaseInfo};
+use nfi_api::{BulkItem, BulkResponse, EvalInfo, ReleaseInfo};
 use nfi_auth_client::{Credentials, Identity};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -64,6 +64,11 @@ pub fn print_json<T: serde::Serialize>(v: &T) -> Result<()> {
 pub async fn whoami(creds: &Credentials, url: &str, json: bool) -> Result<bool> {
     let w = match creds.whoami().await? {
         Identity::User(w) => w,
+        Identity::StaticToken(w) if json => w,
+        Identity::StaticToken(_) => {
+            println!("{url}: authenticated with a static token");
+            return Ok(true);
+        }
         Identity::NotAuthenticated => {
             println!("{url}: not authenticated");
             return Ok(false);
@@ -205,7 +210,8 @@ pub fn parse_item(s: &str, system: Option<&str>, outputs: &Option<Vec<String>>) 
 }
 
 /// Read bulk items from a file (`-` for stdin): JSON (`{"items": [...]}` or an
-/// array) or one item per line (blank lines and `#` comments ignored).
+/// array; `system` and `outputs` apply to items without them) or one item
+/// per line (blank lines and `#` comments ignored).
 pub fn read_items(path: &str, system: Option<&str>, outputs: &Option<Vec<String>>) -> Result<Vec<BulkItem>> {
     let text = if path == "-" {
         std::io::read_to_string(std::io::stdin())?
@@ -213,18 +219,47 @@ pub fn read_items(path: &str, system: Option<&str>, outputs: &Option<Vec<String>
         std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?
     };
     let t = text.trim_start();
-    if t.starts_with('{') {
-        let r: nfi_api::BulkRequest = serde_json::from_str(t)?;
-        return Ok(r.items);
-    }
-    if t.starts_with('[') {
-        return Ok(serde_json::from_str(t)?);
+    let items: Option<Vec<BulkItem>> = if t.starts_with('{') {
+        Some(serde_json::from_str::<nfi_api::BulkRequest>(t)?.items)
+    } else if t.starts_with('[') {
+        Some(serde_json::from_str(t)?)
+    } else {
+        None
+    };
+    if let Some(mut items) = items {
+        for i in &mut items {
+            i.system = i.system.take().or(system.map(str::to_string));
+            i.outputs = i.outputs.take().or(outputs.clone());
+        }
+        return Ok(items);
     }
     text.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .map(|l| parse_item(l, system, outputs))
         .collect()
+}
+
+/// Merge the responses to consecutive batches of one bulk request: the
+/// items in order, the closure de-duplicated. The sizes are summed (the
+/// responses have no per-path sizes), so they count paths in several
+/// batches' closures more than once: upper bounds.
+pub fn merge_bulk(responses: Vec<BulkResponse>) -> BulkResponse {
+    let mut closure = std::collections::BTreeSet::new();
+    let mut m = BulkResponse {
+        items: vec![],
+        closure: vec![],
+        nar_size: 0,
+        file_size: 0,
+    };
+    for r in responses {
+        m.items.extend(r.items);
+        closure.extend(r.closure);
+        m.nar_size += r.nar_size;
+        m.file_size += r.file_size;
+    }
+    m.closure = closure.into_iter().collect();
+    m
 }
 
 /// The error count of `e`, falling back to the listed errors (services
@@ -307,6 +342,54 @@ mod tests {
         let i = parse_item("python3Packages.requests abc x86_64-darwin", None, &None).unwrap();
         assert_eq!(i.system.as_deref(), Some("x86_64-darwin"));
         assert!(parse_item("nocommit", None, &None).is_err());
+    }
+
+    #[test]
+    fn json_items_take_the_defaults() {
+        let d = tempfile::tempdir().unwrap();
+        let items = r#"[{"attr": "a", "commit": "c"}, {"attr": "b", "commit": "c", "system": "s", "outputs": ["dev"]}]"#;
+        let (array, object) = (d.path().join("a.json"), d.path().join("o.json"));
+        std::fs::write(&array, items).unwrap();
+        std::fs::write(&object, format!(r#"{{"items": {items}}}"#)).unwrap();
+        let outputs = Some(vec!["*".to_string()]);
+        for p in [array, object] {
+            let i = read_items(p.to_str().unwrap(), Some("x86_64-linux"), &outputs).unwrap();
+            let got: Vec<_> = i
+                .iter()
+                .map(|i| (i.system.as_deref(), i.outputs.clone()))
+                .collect();
+            assert_eq!(
+                got,
+                [
+                    (Some("x86_64-linux"), outputs.clone()),
+                    (Some("s"), Some(vec!["dev".to_string()]))
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn merged_bulk_responses() {
+        let r = |attr: &str, closure: &[&str]| BulkResponse {
+            items: vec![nfi_api::BulkItemResult {
+                attr: attr.into(),
+                commit: "c".into(),
+                system: "s".into(),
+                status: nfi_api::ItemStatus::Ok,
+                release: None,
+                outputs: Default::default(),
+                missing_outputs: vec![],
+                available_outputs: vec![],
+            }],
+            closure: closure.iter().map(|p| p.to_string()).collect(),
+            nar_size: 10,
+            file_size: 1,
+        };
+        let m = merge_bulk(vec![r("b", &["/p/2", "/p/3"]), r("a", &["/p/1", "/p/2"])]);
+        let attrs: Vec<_> = m.items.iter().map(|i| i.attr.as_str()).collect();
+        assert_eq!(attrs, ["b", "a"]);
+        assert_eq!(m.closure, ["/p/1", "/p/2", "/p/3"]);
+        assert_eq!((m.nar_size, m.file_size), (20, 2));
     }
 
     #[test]

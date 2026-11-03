@@ -16,7 +16,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use nfi_auth::{AuthConfig, CONFIG_PATH, ErrorBody, WHOAMI_PATH};
+use nfi_auth::{AuthConfig, CONFIG_PATH, ErrorBody, TOKEN_USERNAME, WHOAMI_PATH, Whoami};
 use std::sync::Arc;
 use tracing::Instrument;
 
@@ -53,7 +53,7 @@ impl Caller {
     fn log_identity(&self) -> (&str, &str) {
         match self {
             Caller::Anonymous => ("-", "-"),
-            Caller::Token => ("(token)", "-"),
+            Caller::Token => (TOKEN_USERNAME, "-"),
             Caller::User { principal, .. } => principal.log_identity(),
         }
     }
@@ -100,7 +100,7 @@ impl Guard {
                 };
                 let principal = authenticator.authenticate(token).await?;
                 let mut vars = principal.vars();
-                vars.insert("request".into(), request_var(m, path));
+                vars.insert("request".into(), request_var(m, path)?);
                 policy.authorize(&vars)?;
                 Ok(Caller::User { principal, vars })
             }
@@ -124,16 +124,32 @@ impl Guard {
         }
     }
 
-    /// The [`WHOAMI_PATH`] response: 404 unless this is an OIDC guard;
-    /// otherwise the caller's token is authenticated, without the policy
-    /// or anonymous access: the [`AuthError`] response if that fails, 500
-    /// if the whoami expression fails, else 200 with the
-    /// [`nfi_auth::Whoami`]. Logged like requests through the
-    /// [`middleware`].
+    /// The [`WHOAMI_PATH`] response: 404 for an open guard; otherwise the
+    /// caller's token is authenticated, without the policy or anonymous
+    /// access: the [`AuthError`] response if that fails, 500 if the whoami
+    /// expression fails, else 200 with the [`Whoami`] (for the fixed token
+    /// of a token guard, [`TOKEN_USERNAME`]). Logged like requests through
+    /// the [`middleware`].
     pub async fn whoami_response(&self, headers: &HeaderMap) -> Response {
         let (method, path) = (Method::GET, WHOAMI_PATH);
-        let Guard::Oidc { authenticator, .. } = self else {
-            return span(&method, path, ("-", "-")).in_scope(|| logged(not_oidc()));
+        let authenticator = match self {
+            Guard::Open => return span(&method, path, ("-", "-")).in_scope(|| logged(not_oidc())),
+            Guard::Token(_) => {
+                return match self.check(headers, &method, path).await {
+                    Ok(c) => span(&method, path, c.log_identity()).in_scope(|| {
+                        logged(
+                            Json(Whoami {
+                                username: TOKEN_USERNAME.into(),
+                                session: None,
+                                additional_info: Default::default(),
+                            })
+                            .into_response(),
+                        )
+                    }),
+                    Err(e) => rejected(&method, path, e),
+                };
+            }
+            Guard::Oidc { authenticator, .. } => authenticator,
         };
         let principal = match bearer(headers) {
             None => Err(AuthError::Missing),

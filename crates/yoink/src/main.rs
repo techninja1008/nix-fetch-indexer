@@ -33,6 +33,14 @@ struct Cli {
     /// matches fewer than this many indexed paths; 0 disables.
     #[arg(long)]
     close_miss_threshold: Option<u64>,
+    /// After mirroring, copy the mirrored nix paths into the local store
+    /// (`nix copy --from <cache URL>`); needs a cache URL.
+    #[arg(long)]
+    download: bool,
+    /// The binary cache the service mirrors into, for --download [default:
+    /// config `cache_url`]
+    #[arg(long, env = "YOINK_CACHE_URL")]
+    cache_url: Option<String>,
     #[command(flatten)]
     common: Common,
     #[command(subcommand)]
@@ -143,9 +151,12 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE })
         }
         Some(Cmd::Whoami) => {
-            let mut targets = vec![(need_url()?, token, YOINK_HINT)];
-            if let Some(n) = nfi_url {
-                targets.push((n, nfi_token, NFI_HINT));
+            let targets: Vec<_> = [(url.clone(), token, YOINK_HINT), (nfi_url, nfi_token, NFI_HINT)]
+                .into_iter()
+                .filter_map(|(u, t, hint)| Some((u?, t, hint)))
+                .collect();
+            if targets.is_empty() {
+                need_url()?;
             }
             let mut ok = true;
             for (u, t, hint) in targets {
@@ -153,7 +164,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     Ok(b) => ok &= b,
                     Err(e) => {
                         ok = false;
-                        println!("{u}: {e:#}");
+                        eprintln!("error: {u}: {e:#}");
                     }
                 }
             }
@@ -171,6 +182,13 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 verbosity: if cli.quiet { -1 } else { cli.verbose.min(2) as i8 },
                 close_miss_threshold: cli.close_miss_threshold,
                 allow_insecure: insecure,
+                download: match (cli.download, cli.cache_url.or(cfg.cache_url)) {
+                    (false, _) => None,
+                    (true, Some(u)) => Some(u),
+                    (true, None) => anyhow::bail!(
+                        "--download needs the cache to download from: set --cache-url, YOINK_CACHE_URL or `cache_url` in the config file"
+                    ),
+                },
             })
             .await
         }

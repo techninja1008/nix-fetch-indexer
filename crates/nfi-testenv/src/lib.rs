@@ -340,8 +340,8 @@ pub async fn start_service_with(auth: nfi_service::auth::ServiceAuth) -> Option<
     let public_url = format!("http://{}", public.local_addr().unwrap());
     let admin_url = format!("http://{}", admin.local_addr().unwrap());
     let (s1, s2) = (state.clone(), state.clone());
-    tokio::spawn(async move { axum_serve(public, nfi_service::api::public_router(s1)).await });
-    tokio::spawn(async move { axum_serve(admin, nfi_service::api::admin_router(s2)).await });
+    tokio::spawn(async move { axum::serve(public, nfi_service::api::public_router(s1)).await });
+    tokio::spawn(async move { axum::serve(admin, nfi_service::api::admin_router(s2)).await });
     tokio::spawn(nfi_service::jobs::worker(state.clone(), unique("worker")));
     Some(TestService {
         public_url,
@@ -349,10 +349,6 @@ pub async fn start_service_with(auth: nfi_service::auth::ServiceAuth) -> Option<
         state,
         has_search,
     })
-}
-
-async fn axum_serve(l: tokio::net::TcpListener, r: nfi_service::api::RouterAlias) {
-    nfi_service::api::serve(l, r).await
 }
 
 // ---------- sample data ----------

@@ -66,7 +66,7 @@ async fn refreshed_login_validates() {
     let idp = MockIdp::start("cli").await;
     let a = Authenticator::new(OidcSettings::new(idp.issuer(), idp.client_id())).unwrap();
     let d = tempfile::tempdir().unwrap();
-    let store = TokenStore::at(d.path());
+    let store = TokenStore::at(d.path().join("tokens"));
     store
         .save_token(&StoredToken {
             issuer: idp.issuer().into(),

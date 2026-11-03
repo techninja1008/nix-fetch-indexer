@@ -115,6 +115,30 @@ struct Embedded {
 }
 
 impl Embedded {
+    /// Wait until an embedded server exits (never, without any), then say
+    /// which and how. Checked once a second.
+    async fn died(&mut self) -> String {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            #[cfg(feature = "embedded-postgres")]
+            if let Some(p) = &mut self.postgres {
+                match p.exited() {
+                    Ok(Some(status)) => return format!("embedded PostgreSQL exited ({status})"),
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(error = %format!("{e:#}"), "checking embedded PostgreSQL"),
+                }
+            }
+            #[cfg(feature = "embedded-meilisearch")]
+            if let Some(m) = &mut self.meilisearch {
+                match m.exited() {
+                    Ok(Some(status)) => return format!("embedded Meilisearch exited ({status})"),
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(error = %format!("{e:#}"), "checking embedded Meilisearch"),
+                }
+            }
+        }
+    }
+
     fn stop(self) {
         // Stop search first, then the database.
         #[cfg(feature = "embedded-meilisearch")]
@@ -234,6 +258,9 @@ async fn run(cli: Cli, embedded: &mut Embedded) -> Result<()> {
     let a = axum::serve(admin, api::admin_router(state.clone())).with_graceful_shutdown(wait(rx));
     let servers = async { tokio::try_join!(async { p.await }, async { a.await }) };
     tokio::pin!(servers);
+    // An embedded server that dies leaves the service failing every request:
+    // exit instead (non-zero), so a supervisor restarts the whole node.
+    let mut failure = None;
     tokio::select! {
         r = &mut servers => { r?; }
         _ = shutdown_signal() => {
@@ -241,13 +268,22 @@ async fn run(cli: Cli, embedded: &mut Embedded) -> Result<()> {
             // Give in-flight requests a moment to finish.
             let _ = tokio::time::timeout(Duration::from_secs(10), &mut servers).await;
         }
+        msg = embedded.died() => {
+            tracing::error!("{msg}; shutting down");
+            let _ = tx.send(());
+            let _ = tokio::time::timeout(Duration::from_secs(10), &mut servers).await;
+            failure = Some(msg);
+        }
     }
     // An interrupted job is picked up again (stale heartbeat) on the next start.
     if let Some(w) = worker {
         w.abort();
     }
     state.pool.close().await;
-    Ok(())
+    match failure {
+        Some(msg) => bail!(msg),
+        None => Ok(()),
+    }
 }
 
 fn hostname() -> String {

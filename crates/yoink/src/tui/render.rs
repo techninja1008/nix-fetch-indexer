@@ -1,6 +1,8 @@
 //! Drawing the screen.
 
-use super::layout::{Grid, Level, STATUS_W};
+use super::layout::{
+    FULL_BAR_MIN, FULL_FIXED_W, FULL_NAME_MIN, FULL_PHASE_W, FULL_READOUT_W, Grid, Level, STATUS_W,
+};
 use super::{App, View};
 use crate::format;
 use crate::state::{Conn, Item, State};
@@ -88,9 +90,14 @@ pub fn indicator(s: &State, item: &Item, level: Level, width: u16) -> Line<'stat
                 (None, Some(p)) => format::readout(&p),
                 _ => String::new(),
             };
-            let (phase_w, readout_w) = (18, 21);
-            let name_w = (rest / 3).max(12);
-            let bar_w = rest.saturating_sub(name_w + phase_w + readout_w + 3);
+            let (phase_w, readout_w) = (FULL_PHASE_W as usize, FULL_READOUT_W as usize);
+            // What the name and bar share; the layout guarantees room for
+            // the narrowest of both.
+            let avail = rest.saturating_sub(FULL_FIXED_W as usize);
+            let name_w = (rest / 3)
+                .max(FULL_NAME_MIN as usize)
+                .min(avail.saturating_sub(FULL_BAR_MIN as usize));
+            let bar_w = avail - name_w;
             spans.push(Span::raw(" "));
             spans.push(Span::styled(pad(&item.name, name_w), name_style));
             spans.push(Span::raw(" "));
@@ -318,6 +325,16 @@ mod tests {
         let full = text(&indicator(&s, &it, Level::Full, 100));
         assert!(full.contains('━') && full.ends_with("57/100 B"), "{full}");
         assert_eq!(full.chars().count(), 100);
+        // Full lines fit exactly at every width the layout uses them at.
+        for width in 1..=200 {
+            let g = Grid::choose(1, width, 10);
+            if g.level == Level::Full {
+                let w = g.cell_w - 1;
+                let full = text(&indicator(&s, &it, Level::Full, w));
+                assert_eq!(full.chars().count(), w as usize, "{width}: {full}");
+                assert!(full.contains('━'), "{width}: {full}");
+            }
+        }
         s.apply(Event::Result {
             purl: a,
             outcome: Outcome::Success,

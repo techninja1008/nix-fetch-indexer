@@ -352,6 +352,23 @@ async fn ingest_lookup_bulk_minimise_prune() {
         assert_eq!(attrs, vec!["hello", "orphanpkg"]);
         let (_, r): (u16, SearchResponse) = c.get(&format!("/v1/search?q=transfer&commit={A}")).await;
         assert_eq!(r.hits.len(), 1);
+        // The commit selects a release like package lookups do: a prefix, in
+        // either case, of the full hash the documents list.
+        for commit in [A[..8].to_string(), A.to_uppercase(), A[..12].to_uppercase()] {
+            let (s, r): (u16, SearchResponse) =
+                c.get(&format!("/v1/search?q=transfer&commit={commit}")).await;
+            assert_eq!((s, r.hits.len()), (200, 1), "{commit}");
+        }
+        let (s, r): (u16, SearchResponse) = c.get(&format!("/v1/search?q=transfer&commit={}", &B[..8])).await;
+        assert_eq!((s, r.hits.len()), (200, 0));
+        for bad in ["aaaa", "zzzzzzzz", "aaaaaaaa-"] {
+            let (s, e): (u16, ErrorBody) = c.get(&format!("/v1/search?commit={bad}")).await;
+            assert_eq!(s, 400, "{bad}");
+            assert!(e.error.contains("expected a hex commit prefix"), "{}", e.error);
+        }
+        let (s, e): (u16, ErrorBody) = c.get(&format!("/v1/search?commit={}", "d".repeat(12))).await;
+        assert_eq!(s, 404);
+        assert_eq!(e.error, format!("unknown commit {}", "d".repeat(12)));
         let (_, r): (u16, SearchResponse) = c.get("/v1/search?q=orphan-tool").await;
         assert_eq!(r.hits[0].attr, "orphanpkg");
     }
@@ -438,6 +455,62 @@ async fn package_lookup_rejects_ambiguous_commit_prefix() {
     let (s, e): (u16, ErrorBody) = c.get("/v1/packages/curl?commit=abcdef02").await;
     assert_eq!(s, 404);
     assert_eq!(e.error, "curl (x86_64-linux) not found at abcdef02");
+    // Search selects releases the same way.
+    if c.svc.has_search {
+        let (s, e): (u16, ErrorBody) = c.get("/v1/search?q=x&commit=ABCDEF01").await;
+        assert_eq!(s, 400);
+        assert_eq!(
+            e.error,
+            "commit prefix \"ABCDEF01\" is ambiguous: it matches 2 releases"
+        );
+        let (s, _): (u16, ErrorBody) = c.get("/v1/search?commit=abcdef03").await;
+        assert_eq!(s, 404);
+    }
+}
+
+/// Bulk requests are capped at `BULK_MAX_ITEMS` items, and items share
+/// queries: many items over a few commits resolve like one each.
+#[tokio::test]
+async fn bulk_item_cap_and_batching() {
+    let Some(c) = setup(None).await else { return };
+    c.ingest_bytes(encode(&bundle(), Format::Json)).await;
+    let item = |attr: &str, commit: &str| json!({"attr": attr, "commit": commit});
+    let over: Vec<Value> = (0..=BULK_MAX_ITEMS).map(|_| item("hello", A)).collect();
+    let (s, e): (u16, ErrorBody) = c.post("/v1/lookup/bulk", &json!({ "items": over })).await;
+    assert_eq!(s, 400);
+    assert_eq!(
+        e.error,
+        format!(
+            "too many items: {} (at most {BULK_MAX_ITEMS} per request; split the request)",
+            BULK_MAX_ITEMS + 1
+        )
+    );
+    // At the cap: every item is answered, in order.
+    let attrs = ["hello", "curl", "missing", "nooutpaths"];
+    let commits = [A.to_string(), B.to_string(), "d".repeat(40)];
+    let items: Vec<Value> = (0..BULK_MAX_ITEMS)
+        .map(|i| item(attrs[i % 4], &commits[i % 3]))
+        .collect();
+    let (s, bulk): (u16, BulkResponse) = c.post("/v1/lookup/bulk", &json!({ "items": items })).await;
+    assert_eq!(s, 200);
+    assert_eq!(bulk.items.len(), BULK_MAX_ITEMS);
+    for (i, it) in bulk.items.iter().enumerate() {
+        let expect = match (attrs[i % 4], i % 3) {
+            (_, 2) => ItemStatus::UnknownCommit,
+            ("hello", _) | ("curl", 0) => ItemStatus::Ok,
+            ("nooutpaths", 0) => ItemStatus::NoOutpaths,
+            _ => ItemStatus::UnknownAttr,
+        };
+        assert_eq!((it.attr.as_str(), it.status), (attrs[i % 4], expect), "item {i}");
+    }
+    let mut expect = vec![
+        path(1, "glibc-2.40"),
+        path(2, "hello-2.12"),
+        path(3, "curl-8.0"),
+        path(4, "openssl-3.0"),
+    ];
+    expect.sort();
+    assert_eq!(bulk.closure, expect);
 }
 
 /// Commit prefixes must have at least 8 hex digits and match at most one
@@ -1260,4 +1333,181 @@ async fn progress_cleared_after_job_finishes() {
         (status.as_str(), progress.as_deref(), blobs),
         ("failed", Some("decoding"), 0)
     );
+}
+
+/// Each claim counts an attempt; a job whose `MAX_ATTEMPTS`th claim goes
+/// stale (its worker died running it) is failed, not claimed again, and its
+/// upload freed.
+#[tokio::test]
+async fn poison_job_fails_after_max_attempts() {
+    use nfi_service::jobs;
+    let Some(pool) = job_pool().await else { return };
+    let stale = Duration::from_secs(120);
+    let job = claim_staged_job(&pool).await;
+    let id = job.id;
+    let attempts = || async {
+        sqlx::query_scalar::<_, i32>("SELECT attempts FROM jobs WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    assert_eq!(attempts().await, 1);
+    let go_stale = || async {
+        sqlx::query("UPDATE jobs SET heartbeat_at = now() - interval '1 hour' WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    };
+    for n in 2..=jobs::MAX_ATTEMPTS {
+        go_stale().await;
+        assert!(jobs::reap(&pool, stale).await.unwrap().is_empty());
+        let again = jobs::claim(&pool, "host-2", stale).await.unwrap().unwrap();
+        assert_eq!(again.id, id);
+        assert_eq!(attempts().await, n);
+    }
+    // A live claim is left alone.
+    assert!(jobs::reap(&pool, stale).await.unwrap().is_empty());
+    go_stale().await;
+    assert!(jobs::claim(&pool, "host-3", stale).await.unwrap().is_none());
+    assert_eq!(jobs::reap(&pool, stale).await.unwrap(), vec![id]);
+    let (status, _, _, blobs) = job_state(&pool, id).await;
+    assert_eq!((status.as_str(), blobs), ("failed", 0));
+    let info = jobs::get(&pool, id).await.unwrap().unwrap();
+    assert_eq!(info.status, JobStatus::Failed);
+    let error = info.error.unwrap();
+    assert!(
+        error.starts_with(&format!("abandoned after {} attempts", jobs::MAX_ATTEMPTS)),
+        "{error}"
+    );
+    assert!(info.finished_at.is_some());
+    // The last claim is fenced off.
+    assert!(!jobs::touch(&pool, &job, None).await.unwrap());
+}
+
+/// An upload that stops receiving data is failed after `STAGING_TIMEOUT`
+/// and its chunks freed; its uploader can't store more. A live upload is
+/// left alone.
+#[tokio::test]
+async fn abandoned_upload_expires() {
+    use nfi_service::jobs;
+    let Some(pool) = job_pool().await else { return };
+    let stale = Duration::from_secs(120);
+    // An upload whose sender stalls after the first chunk.
+    let (tx, rx) = futures::channel::mpsc::unbounded::<Result<bytes::Bytes, std::io::Error>>();
+    tx.unbounded_send(Ok(vec![1u8; jobs::CHUNK].into())).unwrap();
+    let p2 = pool.clone();
+    let upload = tokio::spawn(async move { jobs::enqueue_upload(&p2, rx, json!({})).await });
+    let id: i64 = loop {
+        let row: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT id, (SELECT count(*) FROM job_blob_chunks WHERE job_id = id) FROM jobs
+              WHERE status = 'staging'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        if let Some((id, 1)) = row {
+            break id;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let info = jobs::get(&pool, id).await.unwrap().unwrap();
+    assert_eq!(info.status, JobStatus::Queued);
+    // Still receiving: kept.
+    assert!(jobs::reap(&pool, stale).await.unwrap().is_empty());
+    sqlx::query("UPDATE jobs SET heartbeat_at = now() - make_interval(secs => $2) WHERE id = $1")
+        .bind(id)
+        .bind(jobs::STAGING_TIMEOUT.as_secs_f64() + 1.0)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(jobs::reap(&pool, stale).await.unwrap(), vec![id]);
+    let info = jobs::get(&pool, id).await.unwrap().unwrap();
+    assert_eq!(info.status, JobStatus::Failed);
+    assert!(
+        info.error.as_deref().unwrap().starts_with("upload abandoned"),
+        "{:?}",
+        info.error
+    );
+    assert_eq!(job_state(&pool, id).await.3, 0);
+    // The uploader resumes: its next chunk is refused, nothing is stored and
+    // the job stays failed.
+    tx.unbounded_send(Ok(vec![2u8; jobs::CHUNK].into())).unwrap();
+    let err = upload.await.unwrap().unwrap_err();
+    assert!(format!("{err:#}").contains("upload abandoned"), "{err:#}");
+    let (status, _, _, blobs) = job_state(&pool, id).await;
+    assert_eq!((status.as_str(), blobs), ("failed", 0));
+}
+
+/// Search writes are serialised: concurrent rebuilds and syncs all succeed,
+/// leave the index complete and no scratch index behind (including one left
+/// by an interrupted rebuild).
+#[tokio::test]
+async fn concurrent_search_rebuilds() {
+    let Some(c) = setup(None).await else { return };
+    let Some(m) = c.svc.state.meili.clone() else {
+        return;
+    };
+    c.ingest_bytes(encode(&bundle(), Format::Json)).await;
+    let meili_url = nfi_testenv::services().meili_url.clone().unwrap();
+    let http = reqwest::Client::new();
+    let indexes = || async {
+        let r: Value = http
+            .get(format!("{meili_url}/indexes?limit=1000"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        r["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|i| i["uid"].as_str())
+            .filter(|uid| *uid == m.index || uid.starts_with(&format!("{}_rebuild", m.index)))
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    // A scratch index left by an interrupted rebuild (of an older version).
+    let r = http
+        .post(format!("{meili_url}/indexes"))
+        .json(&json!({"uid": format!("{}_rebuild", m.index)}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    let pool = &c.svc.state.pool;
+    let attrs: std::collections::BTreeSet<String> = ["hello".to_string(), "curl".to_string()].into();
+    let (a, b, s1, s2) = tokio::join!(
+        m.reindex(pool),
+        m.reindex(pool),
+        m.sync_attrs(pool, &attrs),
+        m.sync_attrs(pool, &attrs),
+    );
+    assert_eq!((a.unwrap(), b.unwrap(), s1.unwrap(), s2.unwrap()), (4, 4, 2, 2));
+    let mut left = Vec::new();
+    for _ in 0..50 {
+        left = indexes().await;
+        if left == std::slice::from_ref(&m.index) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(left, std::slice::from_ref(&m.index));
+    let (_, r): (u16, SearchResponse) = c.get("/v1/search?q=transfer").await;
+    assert_eq!(r.hits.len(), 1);
+}
+
+/// Foreign keys that cascade from closures are indexed.
+#[tokio::test]
+async fn missing_paths_closure_is_indexed() {
+    let Some(pool) = job_pool().await else { return };
+    let def: Option<String> =
+        sqlx::query_scalar("SELECT indexdef FROM pg_indexes WHERE indexname = 'missing_paths_closure'")
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+    assert!(def.unwrap().contains("(closure_id)"));
 }

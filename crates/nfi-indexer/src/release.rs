@@ -50,7 +50,7 @@ impl ReleaseLocation {
             .get_text(&self.file("git-revision"))
             .await?
             .trim()
-            .to_string();
+            .to_ascii_lowercase();
         if commit.len() != 40 || !commit.bytes().all(|c| c.is_ascii_hexdigit()) {
             bail!("{}: unexpected git-revision {commit:?}", self.url);
         }

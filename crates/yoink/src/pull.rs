@@ -29,6 +29,8 @@ pub struct PullOptions {
     pub close_miss_threshold: Option<u64>,
     /// See [`Credentials::allow_insecure`].
     pub allow_insecure: bool,
+    /// `--download`: the cache URL to copy the mirrored paths from.
+    pub download: Option<String>,
 }
 
 /// Evaluate flake references and ask NFI which cached paths they need.
@@ -131,9 +133,6 @@ pub async fn pull(o: PullOptions) -> Result<ExitCode> {
     let client = crate::client::Client::new(&o.url, None)?;
     let first = retry(&creds, |t| async { client.with_token(t).mirror(&purls).await }).await;
 
-    let nix = purls
-        .iter()
-        .any(|p| yoink_purl::Purl::parse(p).is_ok_and(|p| p.ty == "nix"));
     let mut state = State::new(&purls);
     state.plan = plan;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -145,8 +144,18 @@ pub async fn pull(o: PullOptions) -> Result<ExitCode> {
     } else {
         let mut plain = Plain::new(o.verbosity);
         let mut tick = tokio::time::interval(Duration::from_secs(1));
+        // Ctrl-C detaches as `q` does in the monitor: clean up, summarise
+        // and exit 130. Listening once, up front, so none is missed.
+        let interrupted = tokio::signal::ctrl_c();
+        tokio::pin!(interrupted);
+        let mut quit = false;
         loop {
             tokio::select! {
+                r = &mut interrupted => {
+                    r.context("listening for Ctrl-C")?;
+                    quit = true;
+                    break;
+                }
                 m = rx.recv() => match m {
                     None => break,
                     Some(Msg::Event(e)) => {
@@ -173,69 +182,80 @@ pub async fn pull(o: PullOptions) -> Result<ExitCode> {
                 }
             }
         }
-        (state, false)
+        (state, quit)
     };
     driver.abort();
-    if nix && let Some(dir) = nix_cache_dir() {
-        forget_nix_cache(&dir);
-    }
     eprintln!("{}", summary(&state));
+    if use_tui && let Conn::Failed(e) = &state.conn {
+        eprintln!("error: {e}");
+    }
+    // Downloading is skipped on detach; the refresh is not.
+    let downloaded = after_mirroring(&o, &state, quit).await;
     if quit {
         eprintln!("detached; the service keeps mirroring the remaining paths");
         return Ok(ExitCode::from(130));
     }
-    if use_tui && let Conn::Failed(e) = &state.conn {
-        eprintln!("error: {e}");
-    }
     let failed = state.items.iter().any(|i| i.outcome != Some(Outcome::Success));
-    Ok(if failed {
+    Ok(if failed || !downloaded {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
     })
 }
 
-/// Nix's cache directory: `$XDG_CACHE_HOME/nix`, else `~/.cache/nix`.
-fn nix_cache_dir() -> Option<std::path::PathBuf> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".cache")))?;
-    Some(base.join("nix"))
+/// The store paths of the `pkg:nix` PURLs mirrored successfully (those with
+/// a name: Nix can't look up a bare hash).
+pub fn mirrored_store_paths(s: &State) -> Vec<String> {
+    s.items
+        .iter()
+        .filter(|i| i.outcome == Some(Outcome::Success))
+        .filter_map(|i| yoink_purl::Purl::parse(&i.purl).ok()?.nix_target().ok())
+        .filter(|t| t.name.is_some())
+        .map(|t| t.path())
+        .collect()
 }
 
-/// Remove nix's binary-cache lookup caches (`binary-cache*` in `dir`): they
-/// remember misses, so paths just mirrored would otherwise look absent.
-fn forget_nix_cache(dir: &std::path::Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+/// Make the mirrored nix paths visible to Nix: download them (`--download`,
+/// unless the user detached), else refresh Nix's cached misses if it trusts
+/// us, else explain. Returns false if the download failed.
+async fn after_mirroring(o: &PullOptions, s: &State, detached: bool) -> bool {
+    let paths = mirrored_store_paths(s);
+    if paths.is_empty() {
+        return true;
+    }
+    let nix = match crate::nix::Nix::new(&o.nix) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!(
+                "{}: {e:#}",
+                if o.download.is_some() { "error" } else { "warning" }
+            );
+            return o.download.is_none();
+        }
     };
-    for e in entries.flatten() {
-        if e.file_name().to_string_lossy().starts_with("binary-cache")
-            && let Err(err) = std::fs::remove_file(e.path())
-        {
-            eprintln!("warning: removing {}: {err}", e.path().display());
+    if let Some(url) = &o.download
+        && !detached
+    {
+        eprintln!("downloading {} paths from {url}", paths.len());
+        return match nix.download(url, &paths).await {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                false
+            }
+        };
+    }
+    match nix.trusted().await {
+        Ok(true) => {
+            if let Err(e) = nix.refresh(&paths).await {
+                eprintln!("warning: refreshing Nix's cached lookups of the mirrored paths: {e:#}");
+            }
+        }
+        Ok(false) => eprintln!("{}", crate::nix::UNTRUSTED_GUIDANCE),
+        Err(e) => {
+            eprintln!("warning: checking whether Nix trusts you: {e:#}");
+            eprintln!("{}", crate::nix::UNTRUSTED_GUIDANCE);
         }
     }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn forgets_nix_cache() {
-        let d = tempfile::tempdir().unwrap();
-        for f in [
-            "binary-cache-v6.sqlite",
-            "binary-cache-v6.sqlite-journal",
-            "eval-cache-v5",
-        ] {
-            std::fs::write(d.path().join(f), b"").unwrap();
-        }
-        super::forget_nix_cache(d.path());
-        let left: Vec<_> = std::fs::read_dir(d.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name().into_string().unwrap())
-            .collect();
-        assert_eq!(left, ["eval-cache-v5"]);
-        super::forget_nix_cache(&d.path().join("missing"));
-    }
+    true
 }

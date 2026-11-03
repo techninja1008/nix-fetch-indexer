@@ -1,6 +1,6 @@
 //! Run a command on a pseudo-terminal, as if from an interactive shell.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
@@ -17,7 +17,13 @@ pub struct PtyOutput {
 /// Run `cmd` with stdin, stdout and stderr on a new `cols`×`rows`
 /// pseudo-terminal that is its controlling terminal, killing it after
 /// `timeout`. Blocks; call it from `spawn_blocking` in async tests.
-pub fn run(mut cmd: Command, cols: u16, rows: u16, timeout: Duration) -> PtyOutput {
+pub fn run(cmd: Command, cols: u16, rows: u16, timeout: Duration) -> PtyOutput {
+    run_typing(cmd, cols, rows, timeout, "")
+}
+
+/// [`run`], typing `input` on the terminal first (it is read by whatever
+/// reads the terminal first, and echoed).
+pub fn run_typing(mut cmd: Command, cols: u16, rows: u16, timeout: Duration, input: &str) -> PtyOutput {
     let (mut master, mut slave) = (0, 0);
     let ws = libc::winsize {
         ws_row: rows,
@@ -54,6 +60,7 @@ pub fn run(mut cmd: Command, cols: u16, rows: u16, timeout: Duration) -> PtyOutp
     drop(slave);
     drop(cmd);
     let mut reader = std::fs::File::from(master);
+    reader.write_all(input.as_bytes()).unwrap();
     let collector = std::thread::spawn(move || {
         let mut out = Vec::new();
         let mut buf = [0u8; 8192];

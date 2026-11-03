@@ -18,7 +18,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Fixed test-only keys (PEM, public `x`, key id); never trust them
@@ -329,7 +329,8 @@ async fn token(State(i): State<MockIdp>, Form(f): Form<HashMap<String, String>>)
 
 /// A service claiming a provider's settings on [`nfi_auth::CONFIG_PATH`]
 /// that records every bearer token sent to it. With a token, whoami answers
-/// `mallory` and any other request `[]`; without one, they get 401. While
+/// `mallory` (or the status set by [`Impostor::set_whoami_status`]) and any
+/// other request `[]`; without one, they get 401. While
 /// [`Impostor::set_no_login`] is set, it is a service without OIDC instead:
 /// its settings are a 404 and requests without a token get `[]`.
 #[derive(Clone)]
@@ -339,6 +340,7 @@ pub struct Impostor {
     bearers: Arc<Mutex<Vec<String>>>,
     requests: Arc<AtomicUsize>,
     no_login: Arc<AtomicBool>,
+    whoami_status: Arc<AtomicU16>,
 }
 
 impl Impostor {
@@ -350,6 +352,7 @@ impl Impostor {
             bearers: Default::default(),
             requests: Default::default(),
             no_login: Default::default(),
+            whoami_status: Default::default(),
         };
         let app = Router::new()
             .route(nfi_auth::CONFIG_PATH, get(impostor_config))
@@ -375,6 +378,11 @@ impl Impostor {
 
     pub fn set_no_login(&self, no_login: bool) {
         self.no_login.store(no_login, Ordering::SeqCst);
+    }
+
+    /// Answer whoami requests with a token with this status (0: normally).
+    pub fn set_whoami_status(&self, status: u16) {
+        self.whoami_status.store(status, Ordering::SeqCst);
     }
 }
 
@@ -405,6 +413,9 @@ async fn impostor(State(i): State<Impostor>, uri: Uri, h: HeaderMap) -> Response
     };
     i.bearers.lock().unwrap().push(t.to_string());
     if uri.path() == nfi_auth::WHOAMI_PATH {
+        if let Ok(s) = StatusCode::from_u16(i.whoami_status.load(Ordering::SeqCst)) {
+            return (s, axum::Json(serde_json::json!({"error": "whoami failed"}))).into_response();
+        }
         return axum::Json(serde_json::json!({"username": "mallory"})).into_response();
     }
     axum::Json(serde_json::json!([])).into_response()

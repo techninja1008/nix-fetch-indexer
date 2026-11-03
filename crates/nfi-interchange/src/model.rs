@@ -518,7 +518,8 @@ impl Bundle {
         self.format_version = FORMAT_VERSION;
     }
 
-    /// Check internal consistency (reference indices, bitset ranges).
+    /// Check internal consistency (commit hashes, uniqueness, reference
+    /// indices, bitset ranges, closed closures).
     pub fn validate(&self) -> Result<(), String> {
         if self.format_version != FORMAT_VERSION {
             return Err(format!(
@@ -537,6 +538,12 @@ impl Bundle {
         for r in &self.releases {
             if !names.insert(&r.name) {
                 return Err(format!("duplicate release {}", r.name));
+            }
+            if r.commit.len() != 40 || !r.commit.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')) {
+                return Err(format!(
+                    "release {}: commit {:?} is not 40 lowercase hex digits",
+                    r.name, r.commit
+                ));
             }
         }
         let ne = self.evals.len();
@@ -578,7 +585,11 @@ impl Bundle {
                 }
             };
             let len = c.paths.len() as u32;
+            let mut hashes = std::collections::HashSet::new();
             for p in &c.paths {
+                if !hashes.insert(p.hash) {
+                    return Err(format!("duplicate closure path {}-{}", p.hash, p.name));
+                }
                 check_closure_bits(&p.closures, &p.name)?;
                 if let Some(r) = p.references.iter().find(|&&r| r >= len) {
                     return Err(format!("{}: reference index {r} out of range", p.name));

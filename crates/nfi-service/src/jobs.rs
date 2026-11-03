@@ -27,6 +27,8 @@ struct JobRow {
 
 fn status(s: &str) -> JobStatus {
     match s {
+        // `staging` (an upload in progress) reads as queued; an abandoned
+        // upload is failed after `STAGING_TIMEOUT`, so waiting on it ends.
         "running" => JobStatus::Running,
         "succeeded" => JobStatus::Succeeded,
         "failed" => JobStatus::Failed,
@@ -66,14 +68,32 @@ pub async fn enqueue(pool: &PgPool, kind: &str, params: Value) -> Result<i64> {
     Ok(id)
 }
 
+/// Claims of a job after which, if its worker stops heartbeating again (it
+/// crashed or was killed running the job), the job is failed instead of
+/// claimed once more: a job that kills its worker would otherwise take down
+/// every replica in turn.
+pub const MAX_ATTEMPTS: i32 = 3;
+
+/// How long an upload may go without receiving data before its staged job is
+/// failed and its chunks freed (the uploading client or replica died).
+pub const STAGING_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How often an upload in progress bumps its staged job's heartbeat when no
+/// chunk was stored meanwhile.
+const STAGING_HEARTBEAT: Duration = Duration::from_secs(30);
+
 /// Stage an uploaded bundle in chunks, then queue an ingest job for it.
+///
+/// While staging, the job's `heartbeat_at` tracks the upload: a staged job
+/// that receives no data for [`STAGING_TIMEOUT`] is failed by [`reap`].
 pub async fn enqueue_upload<S, E>(pool: &PgPool, mut body: S, params: Value) -> Result<i64>
 where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
     E: std::error::Error + Send + Sync + 'static,
 {
     let id: i64 = sqlx::query_scalar(
-        "INSERT INTO jobs (kind, status, params) VALUES ('ingest', 'staging', $1) RETURNING id",
+        "INSERT INTO jobs (kind, status, params, heartbeat_at) VALUES ('ingest', 'staging', $1, now())
+         RETURNING id",
     )
     .bind(params)
     .fetch_one(pool)
@@ -81,6 +101,7 @@ where
     let res: Result<usize> = async {
         let mut buf = Vec::with_capacity(CHUNK);
         let (mut seq, mut total) = (0i32, 0usize);
+        let mut beat = tokio::time::Instant::now();
         while let Some(chunk) = body.next().await {
             let chunk = chunk.context("reading upload")?;
             total += chunk.len();
@@ -89,21 +110,32 @@ where
                 store_chunk(pool, id, seq, &buf).await?;
                 seq += 1;
                 buf.clear();
+                beat = tokio::time::Instant::now();
+            } else if beat.elapsed() >= STAGING_HEARTBEAT {
+                let mut tx = pool.begin().await?;
+                staging_alive(&mut tx, id).await?;
+                tx.commit().await?;
+                beat = tokio::time::Instant::now();
             }
         }
         if !buf.is_empty() {
             store_chunk(pool, id, seq, &buf).await?;
         }
+        let queued = sqlx::query(
+            "UPDATE jobs SET status = 'queued', params = params || $2 WHERE id = $1 AND status = 'staging'",
+        )
+        .bind(id)
+        .bind(json!({"source": "upload", "bytes": total}))
+        .execute(pool)
+        .await?;
+        if queued.rows_affected() == 0 {
+            bail!("{}", staging_expired());
+        }
         Ok(total)
     }
     .await;
     match res {
-        Ok(total) => {
-            sqlx::query("UPDATE jobs SET status = 'queued', params = params || $2 WHERE id = $1")
-                .bind(id)
-                .bind(json!({"source": "upload", "bytes": total}))
-                .execute(pool)
-                .await?;
+        Ok(_) => {
             sqlx::query("SELECT pg_notify('nfi_jobs', $1::text)")
                 .bind(id)
                 .execute(pool)
@@ -111,11 +143,14 @@ where
             Ok(id)
         }
         Err(e) => {
-            sqlx::query("UPDATE jobs SET status = 'failed', error = $2, finished_at = now() WHERE id = $1")
-                .bind(id)
-                .bind(format!("{e:#}"))
-                .execute(pool)
-                .await?;
+            sqlx::query(
+                "UPDATE jobs SET status = 'failed', error = $2, finished_at = now()
+                 WHERE id = $1 AND status = 'staging'",
+            )
+            .bind(id)
+            .bind(format!("{e:#}"))
+            .execute(pool)
+            .await?;
             sqlx::query("DELETE FROM job_blob_chunks WHERE job_id = $1")
                 .bind(id)
                 .execute(pool)
@@ -125,23 +160,90 @@ where
     }
 }
 
+fn staging_expired() -> String {
+    format!(
+        "upload abandoned: no data was received for {} seconds",
+        STAGING_TIMEOUT.as_secs()
+    )
+}
+
+/// Bump a staged job's heartbeat, failing if [`reap`] expired it. Holds the
+/// job's row lock until `tx` ends, so the job isn't expired meanwhile.
+async fn staging_alive(tx: &mut sqlx::PgConnection, job: i64) -> Result<()> {
+    let r = sqlx::query("UPDATE jobs SET heartbeat_at = now() WHERE id = $1 AND status = 'staging'")
+        .bind(job)
+        .execute(&mut *tx)
+        .await?;
+    if r.rows_affected() == 0 {
+        bail!("{}", staging_expired());
+    }
+    Ok(())
+}
+
 async fn store_chunk(pool: &PgPool, job: i64, seq: i32, data: &[u8]) -> Result<()> {
+    // In one transaction with the heartbeat, so a chunk is never stored for
+    // a job that `reap` expired (and whose chunks it deleted).
+    let mut tx = pool.begin().await?;
+    staging_alive(&mut tx, job).await?;
     sqlx::query("INSERT INTO job_blob_chunks (job_id, seq, data) VALUES ($1, $2, $3)")
         .bind(job)
         .bind(seq)
         .bind(data)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(())
 }
 
+/// The staged upload of `job`, read into one buffer allocated up front.
 async fn load_blob(pool: &PgPool, job: i64) -> Result<Bytes> {
-    let chunks: Vec<Vec<u8>> =
-        sqlx::query_scalar("SELECT data FROM job_blob_chunks WHERE job_id = $1 ORDER BY seq")
+    use futures::TryStreamExt;
+    let size: Option<i64> =
+        sqlx::query_scalar("SELECT sum(length(data))::bigint FROM job_blob_chunks WHERE job_id = $1")
             .bind(job)
-            .fetch_all(pool)
+            .fetch_one(pool)
             .await?;
-    Ok(Bytes::from(chunks.concat()))
+    let mut buf = Vec::with_capacity(usize::try_from(size.unwrap_or(0))?);
+    let mut chunks =
+        sqlx::query_scalar::<_, Vec<u8>>("SELECT data FROM job_blob_chunks WHERE job_id = $1 ORDER BY seq")
+            .bind(job)
+            .fetch(pool);
+    while let Some(chunk) = chunks.try_next().await? {
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(buf))
+}
+
+/// Fail abandoned work, freeing its staged uploads: staged jobs whose upload
+/// received no data for [`STAGING_TIMEOUT`], and running jobs whose
+/// [`MAX_ATTEMPTS`]th claim went stale (no heartbeat for `stale`). Returns
+/// the ids of the jobs failed.
+pub async fn reap(pool: &PgPool, stale: Duration) -> Result<Vec<i64>> {
+    let ids: Vec<i64> = sqlx::query_scalar(
+        "WITH failed AS (
+             UPDATE jobs SET status = 'failed', finished_at = now(), claim_id = NULL,
+                    error = CASE WHEN status = 'staging' THEN $4
+                            ELSE format('abandoned after %s attempts: each worker that claimed the job '
+                                        'stopped while running it (it may crash or exhaust the worker''s '
+                                        'memory); see the service logs', attempts) END
+              WHERE (status = 'staging'
+                     AND COALESCE(heartbeat_at, created_at) < now() - make_interval(secs => $1))
+                 OR (status = 'running' AND attempts >= $3
+                     AND heartbeat_at < now() - make_interval(secs => $2))
+             RETURNING id),
+         chunks AS (DELETE FROM job_blob_chunks WHERE job_id IN (SELECT id FROM failed))
+         SELECT id FROM failed ORDER BY id",
+    )
+    .bind(STAGING_TIMEOUT.as_secs_f64())
+    .bind(stale.as_secs_f64())
+    .bind(MAX_ATTEMPTS)
+    .bind(staging_expired())
+    .fetch_all(pool)
+    .await?;
+    for id in &ids {
+        tracing::warn!(job = id, "failed abandoned job");
+    }
+    Ok(ids)
 }
 
 pub async fn get(pool: &PgPool, id: i64) -> Result<Option<JobInfo>> {
@@ -177,20 +279,23 @@ pub struct Claim {
 }
 
 /// Claim the next runnable job: queued, or running with a stale heartbeat
-/// (its replica died, or lost touch with the database).
+/// (its replica died, or lost touch with the database) and claimed fewer
+/// than [`MAX_ATTEMPTS`] times (see [`reap`]).
 pub async fn claim(pool: &PgPool, worker: &str, stale: Duration) -> Result<Option<Claim>> {
     let row: Option<(i64, String, Value, String)> = sqlx::query_as(
         "UPDATE jobs SET status = 'running', worker = $1, claim_id = gen_random_uuid(),
-                started_at = now(), heartbeat_at = now(), error = NULL
+                started_at = now(), heartbeat_at = now(), error = NULL, attempts = attempts + 1
          WHERE id = (
              SELECT id FROM jobs
              WHERE status = 'queued'
-                OR (status = 'running' AND heartbeat_at < now() - make_interval(secs => $2))
+                OR (status = 'running' AND attempts < $3
+                    AND heartbeat_at < now() - make_interval(secs => $2))
              ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1)
          RETURNING id, kind, params, claim_id::text",
     )
     .bind(worker)
     .bind(stale.as_secs_f64())
+    .bind(MAX_ATTEMPTS)
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|(id, kind, params, claim_id)| Claim {
@@ -445,6 +550,9 @@ pub async fn worker(state: AppState, worker_id: String) {
         Err(_) => None,
     };
     loop {
+        if let Err(e) = reap(&state.pool, stale).await {
+            tracing::warn!(error = %e, "failing abandoned jobs failed");
+        }
         match claim(&state.pool, &worker_id, stale).await {
             Ok(Some(job)) => {
                 tracing::info!(job = job.id, kind = %job.kind, "running job");

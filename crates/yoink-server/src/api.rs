@@ -97,11 +97,12 @@ async fn mirror(AxState(s): AxState<State>, req: Request) -> Response {
 /// The events of one job update, in order: logs, status, result.
 fn update_events(purl: &str, u: Update) -> Vec<Event> {
     let mut out = Vec::new();
-    for (level, message) in u.logs {
+    for l in u.logs {
         out.push(Event::Log {
             purl: purl.to_string(),
-            level,
-            message,
+            level: l.level,
+            message: l.message,
+            id: l.id,
         });
     }
     for st in u.statuses {
@@ -126,6 +127,7 @@ fn fatal(purl: &str, message: String) -> Vec<Event> {
             purl: purl.to_string(),
             level: LogLevel::Fatal,
             message,
+            id: None,
         },
         Event::Result {
             purl: purl.to_string(),
@@ -155,7 +157,8 @@ pub fn purl_json(p: &Purl) -> serde_json::Value {
 
 /// Dispatch each PURL to its job and merge the jobs' updates into one
 /// stream, which ends once every PURL has its result. Dropping the stream
-/// (client gone) stops the forwarding, not the jobs.
+/// (client gone) stops the forwarding and the dispatch of the PURLs not yet
+/// started, not the jobs already running.
 fn events(
     s: State,
     mut vars: Vars,
@@ -170,6 +173,12 @@ fn events(
         async move {
             // `purl` is replaced for each PURL.
             for raw in purls {
+                // The client is gone: start nothing more (it re-posts what
+                // it still needs).
+                if tx.is_closed() {
+                    tracing::info!("client gone; not starting the remaining PURLs");
+                    return;
+                }
                 let purl = match Purl::parse(&raw) {
                     Ok(p) => p,
                     Err(e) => {

@@ -9,9 +9,13 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::hash::Hash;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
-use yoink_api::{LogLevel, Outcome, Progress, Unit};
+use yoink_api::{LogId, LogLevel, Outcome, Progress, Unit};
+
+/// Source of [`Job::id`]s.
+static NEXT_JOB: AtomicU64 = AtomicU64::new(1);
 
 /// Logs kept per job; older ones are dropped (subscribers are told how many).
 const MAX_LOGS: usize = 1000;
@@ -28,9 +32,17 @@ pub struct Update {
     /// Status changes since the last update: one per phase entered, with
     /// the last progress it reported; progress-only changes are merged.
     pub statuses: Vec<Status>,
-    pub logs: Vec<(LogLevel, String)>,
+    pub logs: Vec<LogLine>,
     /// Set once, in the last update.
     pub outcome: Option<Outcome>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogLine {
+    /// `None` for a note of the subscription's own (dropped lines).
+    pub id: Option<LogId>,
+    pub level: LogLevel,
+    pub message: String,
 }
 
 /// Phase changes kept per job for subscribers that fall behind.
@@ -49,6 +61,7 @@ struct State {
 }
 
 struct Shared {
+    id: u64,
     state: Mutex<State>,
     changed: watch::Sender<()>,
 }
@@ -96,6 +109,7 @@ impl Job {
     /// A job driven by hand; it ends when the reporter finishes or is dropped.
     pub fn new(phase: &str) -> (Job, JobReporter) {
         let shared = Arc::new(Shared {
+            id: NEXT_JOB.fetch_add(1, Ordering::Relaxed),
             state: Mutex::new(State {
                 status: Status {
                     phase: phase.to_string(),
@@ -113,6 +127,11 @@ impl Job {
             changed: watch::channel(()).0,
         });
         (Job(shared.clone()), JobReporter { shared, owner: true })
+    }
+
+    /// Unique among the jobs of this process.
+    pub fn id(&self) -> u64 {
+        self.0.id
     }
 
     pub fn status(&self) -> Status {
@@ -282,14 +301,25 @@ impl Subscription {
         }
         let first_kept = s.total_logs - s.logs.len();
         if self.seen_logs < first_kept {
-            u.logs.push((
-                LogLevel::Info,
-                format!("({} earlier log lines dropped)", first_kept - self.seen_logs),
-            ));
+            u.logs.push(LogLine {
+                id: None,
+                level: LogLevel::Info,
+                message: format!("({} earlier log lines dropped)", first_kept - self.seen_logs),
+            });
             self.seen_logs = first_kept;
         }
+        let job = self.shared.id;
         u.logs
-            .extend(s.logs.iter().skip(self.seen_logs - first_kept).cloned());
+            .extend(s.logs.iter().enumerate().skip(self.seen_logs - first_kept).map(
+                |(i, (level, message))| LogLine {
+                    id: Some(LogId {
+                        job,
+                        line: (first_kept + i) as u64,
+                    }),
+                    level: *level,
+                    message: message.clone(),
+                },
+            ));
         self.seen_logs = s.total_logs;
         u.outcome = s.outcome;
         self.done = u.outcome.is_some();
@@ -356,6 +386,13 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    fn lines(u: &Update) -> Vec<(Option<u64>, LogLevel, &str)> {
+        u.logs
+            .iter()
+            .map(|l| (l.id.map(|i| i.line), l.level, l.message.as_str()))
+            .collect()
+    }
+
     #[tokio::test]
     async fn subscribe_and_finish() {
         let (job, r) = Job::new("q");
@@ -374,11 +411,13 @@ mod tests {
             .map(|s| (s.phase.as_str(), s.progress.map(|p| p.current)))
             .collect();
         assert_eq!(ph, [("c", None), ("t", Some(5))]);
-        assert_eq!(u.logs, vec![(LogLevel::Warning, "slow".to_string())]);
-        // A late subscriber sees the current status and the logs so far.
+        assert_eq!(lines(&u), [(Some(0), LogLevel::Warning, "slow")]);
+        assert_eq!(u.logs[0].id.unwrap().job, job.id());
+        // A late subscriber sees the current status and the logs so far,
+        // with the same ids.
         let mut b = job.subscribe();
         let u = b.next().await.unwrap();
-        assert_eq!(u.logs.len(), 1);
+        assert_eq!(lines(&u), [(Some(0), LogLevel::Warning, "slow")]);
         assert_eq!(
             u.statuses.len(),
             1,
@@ -387,7 +426,7 @@ mod tests {
         r.finish(Err(anyhow::anyhow!("boom")));
         let u = a.next().await.unwrap();
         assert_eq!(u.outcome, Some(Outcome::Fatal));
-        assert_eq!(u.logs, vec![(LogLevel::Fatal, "boom".to_string())]);
+        assert_eq!(lines(&u), [(Some(1), LogLevel::Fatal, "boom")]);
         assert!(a.next().await.is_none());
         let u = b.next().await.unwrap();
         assert_eq!(u.outcome, Some(Outcome::Fatal));
@@ -423,8 +462,11 @@ mod tests {
         }
         let u = job.subscribe().next().await.unwrap();
         assert_eq!(u.logs.len(), MAX_LOGS + 1);
-        assert_eq!(u.logs[0].1, "(5 earlier log lines dropped)");
-        assert_eq!(u.logs[1].1, "5");
+        assert_eq!(
+            lines(&u)[0],
+            (None, LogLevel::Info, "(5 earlier log lines dropped)")
+        );
+        assert_eq!(lines(&u)[1], (Some(5), LogLevel::Info, "5"));
     }
 
     #[tokio::test]

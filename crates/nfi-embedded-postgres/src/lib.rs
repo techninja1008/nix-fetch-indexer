@@ -368,6 +368,20 @@ impl EmbeddedPostgres {
         self.child.as_ref().map(Child::id)
     }
 
+    /// The server's exit status if it has exited since it started (it then
+    /// counts as stopped). Poll this to supervise the server: nothing else
+    /// notices it dying.
+    pub fn exited(&mut self) -> Result<Option<std::process::ExitStatus>> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(None);
+        };
+        let status = child.try_wait().context("checking on embedded PostgreSQL")?;
+        if status.is_some() {
+            self.child = None;
+        }
+        Ok(status)
+    }
+
     /// Fast shutdown (SIGINT), escalating to SIGKILL after `timeout`.
     pub fn stop_with_timeout(&mut self, timeout: Duration) -> Result<()> {
         let Some(mut child) = self.child.take() else {
