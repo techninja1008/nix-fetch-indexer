@@ -89,10 +89,16 @@ async fn admin_cli_round_trip() {
     assert_eq!(code, 2);
     let out = Command::new(env!("CARGO_BIN_EXE_nfi-admin"))
         .args(["--url", &svc.admin_url, "releases"])
+        .env_remove("NFI_ADMIN_TOKEN")
+        .env_remove("NFI_ADMIN_TOKEN_FILE")
+        // Without a writable token cache (the Nix sandbox's HOME is not), the
+        // CLI fails before it reaches the service.
+        .env("NFI_TOKEN_CACHE", dir.path().join("tokens"))
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("401"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("401"), "{stderr}");
     let (code, _, err) = tokio::task::block_in_place(|| admin(svc2, &["prune"]));
     assert_eq!(code, 1, "{err}");
 }

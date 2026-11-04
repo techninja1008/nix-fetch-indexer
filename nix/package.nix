@@ -11,6 +11,7 @@
   runCommand,
   stdenvNoCC,
   symlinkJoin,
+  aws-lc,
   cacert,
   cargo,
   cargo-nextest,
@@ -18,11 +19,41 @@
   meilisearch,
   nix,
   nix-eval-jobs,
+  pkg-config,
   postgresql,
+  sqlite,
 }:
 
 let
-  cargoNix = import ./Cargo.nix { inherit pkgs; };
+  # aws-lc-sys wants one install prefix holding the libraries, the headers and
+  # the Rust bindings; nixpkgs splits them between `out` and `dev`.
+  awsLcPrefix = symlinkJoin {
+    name = "aws-lc-${aws-lc.version}-prefix";
+    paths = [
+      aws-lc.out
+      aws-lc.dev
+    ];
+  };
+  cargoNix = import ./Cargo.nix {
+    inherit pkgs;
+    # Link nixpkgs' SQLite and AWS-LC as shared libraries instead of compiling
+    # the copies the crates bundle (about a minute or more each).
+    defaultCrateOverrides = pkgs.defaultCrateOverrides // {
+      # Even with rusqlite's `bundled` feature.
+      libsqlite3-sys = _: {
+        LIBSQLITE3_SYS_USE_PKG_CONFIG = true;
+        nativeBuildInputs = [ pkg-config ];
+        buildInputs = [ sqlite ];
+      };
+      # aws-lc-sys refuses an install whose version differs from the one it
+      # bundles, so an aws-lc update needs a matching aws-lc-sys.
+      aws-lc-sys = _: {
+        AWS_LC_SYS_SYSTEM_DIR = awsLcPrefix;
+        AWS_LC_SYS_STATIC = "0";
+        buildInputs = [ aws-lc ];
+      };
+    };
+  };
   # crate2nix resolves features separately for each workspace member, so
   # building each binary on its own would build a shared library once per
   # feature set it ends up with. Like cargo, unify features across the
