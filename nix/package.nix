@@ -11,6 +11,7 @@
   runCommand,
   stdenvNoCC,
   symlinkJoin,
+  aws-lc,
   cacert,
   cargo,
   cargo-nextest,
@@ -18,10 +19,37 @@
   meilisearch,
   nix,
   nix-eval-jobs,
+  pkg-config,
   postgresql,
+  sqlite,
 }:
 
 let
+  # Link nixpkgs' SQLite and AWS-LC as shared libraries instead of compiling
+  # the copies the crates bundle (about a minute or more each).
+  crateOverrides = pkgs.defaultCrateOverrides // {
+    # Even with rusqlite's `bundled` feature.
+    libsqlite3-sys = _: {
+      LIBSQLITE3_SYS_USE_PKG_CONFIG = true;
+      nativeBuildInputs = [ pkg-config ];
+      buildInputs = [ sqlite ];
+    };
+    # nixpkgs splits the install between `out` (libraries) and `dev` (headers
+    # and Rust bindings), so name each half; the bindings are found next to
+    # the headers. USE_SYSTEM makes a failed lookup an error rather than a
+    # fallback to the bundled build. aws-lc-sys refuses an install whose
+    # version differs from the one it bundles, so an aws-lc update needs a
+    # matching aws-lc-sys.
+    aws-lc-sys = _: {
+      AWS_LC_SYS_USE_SYSTEM = "1";
+      AWS_LC_SYS_STATIC = "0";
+      OPENSSL_INCLUDE_DIR = "${lib.getDev aws-lc}/include";
+      OPENSSL_LIB_DIR = "${lib.getLib aws-lc}/lib";
+    };
+  };
+  # Both builds below pass their own builder, which crate2nix then uses as
+  # is, so the overrides go on the builder rather than to Cargo.nix.
+  buildRustCrateFor = pkgs: pkgs.buildRustCrate.override { defaultCrateOverrides = crateOverrides; };
   cargoNix = import ./Cargo.nix { inherit pkgs; };
   # crate2nix resolves features separately for each workspace member, so
   # building each binary on its own would build a shared library once per
@@ -47,7 +75,7 @@ let
       };
       features = [ ];
       runTests = false;
-      buildRustCrateForPkgsFunc = pkgs: pkgs.buildRustCrate;
+      buildRustCrateForPkgsFunc = buildRustCrateFor;
     }).crates;
   crate = name: workspaceCrates.${name};
 
@@ -159,7 +187,7 @@ let
           inherit packageId crateConfigs;
           features = testFeatures;
           runTests = true;
-          buildRustCrateForPkgsFunc = pkgs: pkgs.buildRustCrate;
+          buildRustCrateForPkgsFunc = buildRustCrateFor;
         }).crates.${packageId}.override
           (_: {
             buildTests = true;

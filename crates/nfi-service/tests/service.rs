@@ -1262,14 +1262,15 @@ async fn reclaimed_job_is_cancelled() {
             let mut reached_tx = Some(reached_tx);
             // Keep reporting progress so a write after the reclaim notices it
             // (the first step may already be written before the reclaim).
-            for i in 1.. {
+            let mut i = 0u64;
+            loop {
+                i += 1;
                 progress.set(format!("step {i}"));
                 if let Some(tx) = reached_tx.take() {
                     tx.send(()).unwrap();
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
-            unreachable!()
         })
         .await
     });
