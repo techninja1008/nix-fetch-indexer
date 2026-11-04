@@ -25,15 +25,6 @@
 }:
 
 let
-  # aws-lc-sys wants one install prefix holding the libraries, the headers and
-  # the Rust bindings; nixpkgs splits them between `out` and `dev`.
-  awsLcPrefix = symlinkJoin {
-    name = "aws-lc-${aws-lc.version}-prefix";
-    paths = [
-      aws-lc.out
-      aws-lc.dev
-    ];
-  };
   # Link nixpkgs' SQLite and AWS-LC as shared libraries instead of compiling
   # the copies the crates bundle (about a minute or more each).
   crateOverrides = pkgs.defaultCrateOverrides // {
@@ -43,12 +34,17 @@ let
       nativeBuildInputs = [ pkg-config ];
       buildInputs = [ sqlite ];
     };
-    # aws-lc-sys refuses an install whose version differs from the one it
-    # bundles, so an aws-lc update needs a matching aws-lc-sys.
+    # nixpkgs splits the install between `out` (libraries) and `dev` (headers
+    # and Rust bindings), so name each half; the bindings are found next to
+    # the headers. USE_SYSTEM makes a failed lookup an error rather than a
+    # fallback to the bundled build. aws-lc-sys refuses an install whose
+    # version differs from the one it bundles, so an aws-lc update needs a
+    # matching aws-lc-sys.
     aws-lc-sys = _: {
-      AWS_LC_SYS_SYSTEM_DIR = awsLcPrefix;
+      AWS_LC_SYS_USE_SYSTEM = "1";
       AWS_LC_SYS_STATIC = "0";
-      buildInputs = [ aws-lc ];
+      OPENSSL_INCLUDE_DIR = "${lib.getDev aws-lc}/include";
+      OPENSSL_LIB_DIR = "${lib.getLib aws-lc}/lib";
     };
   };
   # Both builds below pass their own builder, which crate2nix then uses as
