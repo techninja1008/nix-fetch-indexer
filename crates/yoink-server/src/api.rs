@@ -1,5 +1,7 @@
 //! HTTP routes: auth discovery, whoami and the mirror stream. Mirror
-//! requests are authenticated and logged by `nfi_auth_server::middleware`.
+//! requests are authenticated and logged by `nfi_auth_server::middleware`,
+//! in a `request` span naming the user; within it, each PURL requested is
+//! logged with whether it was dispatched or why not, and its outcome.
 
 use crate::job::Update;
 use crate::{Auth, Mirror};
@@ -182,6 +184,7 @@ fn events(
                 let purl = match Purl::parse(&raw) {
                     Ok(p) => p,
                     Err(e) => {
+                        tracing::info!(purl = %raw, error = %e, "invalid PURL");
                         if tx.send(fatal(&raw, e.to_string())).await.is_err() {
                             return;
                         }
@@ -205,23 +208,31 @@ fn events(
                 let job = match s.mirror.mirror(&purl) {
                     Ok(j) => j,
                     Err(e) => {
+                        tracing::info!(purl = %raw, error = %format!("{e:#}"), "PURL not mirrored");
                         if tx.send(fatal(&raw, format!("{e:#}"))).await.is_err() {
                             return;
                         }
                         continue;
                     }
                 };
+                tracing::info!(purl = %raw, "mirroring PURL");
                 let tx = tx.clone();
-                tokio::spawn(async move {
-                    let mut sub = job.subscribe();
-                    while let Some(u) = sub.next().await {
-                        let last = u.outcome.is_some();
-                        if tx.send(update_events(&raw, u)).await.is_err() || last {
-                            return;
+                tokio::spawn(
+                    async move {
+                        let mut sub = job.subscribe();
+                        while let Some(u) = sub.next().await {
+                            if let Some(outcome) = u.outcome {
+                                tracing::info!(purl = %raw, ?outcome, "PURL done");
+                            }
+                            let last = u.outcome.is_some();
+                            if tx.send(update_events(&raw, u)).await.is_err() || last {
+                                return;
+                            }
+                            tokio::time::sleep(UPDATE_INTERVAL).await;
                         }
-                        tokio::time::sleep(UPDATE_INTERVAL).await;
                     }
-                });
+                    .in_current_span(),
+                );
             }
         }
         .instrument(span),

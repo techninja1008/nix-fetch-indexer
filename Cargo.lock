@@ -4964,6 +4964,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "yoink",
  "yoink-api",
  "yoink-purl",
