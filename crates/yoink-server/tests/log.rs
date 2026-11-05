@@ -12,9 +12,13 @@ use yoink::client::Client;
 use yoink_purl::Purl;
 use yoink_server::{Auth, Job, JobTable, Mirror, api};
 
-/// Mirrors `pkg:fake/*`; names containing "bad" fail.
+/// Mirrors `pkg:fake/*`; names containing "bad" fail, and those containing
+/// "slow" report progress until `release`.
 #[derive(Default)]
-struct Fake(JobTable<String>);
+struct Fake {
+    jobs: JobTable<String>,
+    release: Arc<tokio::sync::Notify>,
+}
 
 impl Mirror for Fake {
     fn phases(&self) -> Vec<yoink_api::PhaseDef> {
@@ -26,7 +30,18 @@ impl Mirror for Fake {
             anyhow::bail!("unsupported package type {}", purl.ty);
         }
         let name = purl.name.clone();
-        Ok(self.0.get_or_start(name.clone(), "q", move |_| async move {
+        let release = self.release.clone();
+        Ok(self.jobs.get_or_start(name.clone(), "q", move |r| async move {
+            if name.contains("slow") {
+                let released = release.notified();
+                tokio::pin!(released);
+                for i in 0.. {
+                    tokio::select! {
+                        _ = &mut released => break,
+                        _ = tokio::time::sleep(Duration::from_millis(20)) => r.progress(i, u64::MAX, None),
+                    }
+                }
+            }
             if name.contains("bad") {
                 anyhow::bail!("{name} is bad");
             }
@@ -69,7 +84,8 @@ async fn purls_are_logged_by_user() {
         Expr::new("true").unwrap(),
         Expr::new("!(purl.name.startsWith('secret'))").unwrap(),
     );
-    let state = api::State::new(Arc::new(Fake::default()), auth, 10);
+    let fake = Arc::new(Fake::default());
+    let state = api::State::new(fake.clone(), auth, 10);
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", l.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(l, api::router(state)).await.unwrap() });
@@ -89,6 +105,30 @@ async fn purls_are_logged_by_user() {
     tokio::time::timeout(Duration::from_secs(10), s.collect::<Vec<_>>())
         .await
         .expect("stream ends");
+
+    // A client gone before its PURL finishes: the outcome is still logged.
+    let mut s = c.mirror(&["pkg:fake/slow".to_string()]).await.unwrap();
+    while let Some(e) = s.next().await {
+        if e.unwrap().purl() == Some("pkg:fake/slow") {
+            break;
+        }
+    }
+    drop(s);
+    // Progress keeps being written until the server notices the client is
+    // gone and drops the stream.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    fake.release.notify_one();
+    let slow_done = || {
+        String::from_utf8_lossy(&log.0.lock().unwrap())
+            .contains("PURL done purl=pkg:fake/slow outcome=Success")
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !slow_done() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("outcome logged after the client left");
 
     let out = String::from_utf8_lossy(&log.0.lock().unwrap()).into_owned();
     let lines: Vec<&str> = out.lines().collect();
@@ -110,4 +150,5 @@ async fn purls_are_logged_by_user() {
         "unsupported package type other",
     ]);
     find(&[user, "invalid PURL", "purl=not-a-purl"]);
+    find(&[user, "PURL done", "purl=pkg:fake/slow"]);
 }

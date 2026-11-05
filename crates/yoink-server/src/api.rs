@@ -160,7 +160,8 @@ pub fn purl_json(p: &Purl) -> serde_json::Value {
 /// Dispatch each PURL to its job and merge the jobs' updates into one
 /// stream, which ends once every PURL has its result. Dropping the stream
 /// (client gone) stops the forwarding and the dispatch of the PURLs not yet
-/// started, not the jobs already running.
+/// started, not the jobs already running: they are still followed, to log
+/// their outcomes.
 fn events(
     s: State,
     mut vars: Vars,
@@ -220,15 +221,25 @@ fn events(
                 tokio::spawn(
                     async move {
                         let mut sub = job.subscribe();
+                        // Without a client (`None`), follow the job only to
+                        // log its outcome.
+                        let mut tx = Some(tx);
                         while let Some(u) = sub.next().await {
-                            if let Some(outcome) = u.outcome {
+                            let outcome = u.outcome;
+                            if let Some(outcome) = outcome {
                                 tracing::info!(purl = %raw, ?outcome, "PURL done");
                             }
-                            let last = u.outcome.is_some();
-                            if tx.send(update_events(&raw, u)).await.is_err() || last {
+                            if let Some(t) = &tx
+                                && t.send(update_events(&raw, u)).await.is_err()
+                            {
+                                tx = None;
+                            }
+                            if outcome.is_some() {
                                 return;
                             }
-                            tokio::time::sleep(UPDATE_INTERVAL).await;
+                            if tx.is_some() {
+                                tokio::time::sleep(UPDATE_INTERVAL).await;
+                            }
                         }
                     }
                     .in_current_span(),
