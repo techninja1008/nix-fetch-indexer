@@ -17380,6 +17380,11 @@ rec {
             features = [ "rustls" "http2" "json" "query" "stream" "gzip" "form" ];
           }
           {
+            name = "tracing-subscriber";
+            packageId = "tracing-subscriber";
+            features = [ "env-filter" ];
+          }
+          {
             name = "yoink";
             packageId = "yoink";
           }

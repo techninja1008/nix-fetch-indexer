@@ -27,3 +27,4 @@ yoink = { path = "../yoink" }
 nfi-auth-client.workspace = true
 nfi-test-support.workspace = true
 reqwest.workspace = true
+tracing-subscriber.workspace = true

@@ -1,5 +1,7 @@
 //! HTTP routes: auth discovery, whoami and the mirror stream. Mirror
-//! requests are authenticated and logged by `nfi_auth_server::middleware`.
+//! requests are authenticated and logged by `nfi_auth_server::middleware`,
+//! in a `request` span naming the user; within it, each PURL requested is
+//! logged with whether it was dispatched or why not, and its outcome.
 
 use crate::job::Update;
 use crate::{Auth, Mirror};
@@ -158,7 +160,8 @@ pub fn purl_json(p: &Purl) -> serde_json::Value {
 /// Dispatch each PURL to its job and merge the jobs' updates into one
 /// stream, which ends once every PURL has its result. Dropping the stream
 /// (client gone) stops the forwarding and the dispatch of the PURLs not yet
-/// started, not the jobs already running.
+/// started, not the jobs already running: they are still followed, to log
+/// their outcomes.
 fn events(
     s: State,
     mut vars: Vars,
@@ -182,6 +185,7 @@ fn events(
                 let purl = match Purl::parse(&raw) {
                     Ok(p) => p,
                     Err(e) => {
+                        tracing::info!(purl = %raw, error = %e, "invalid PURL");
                         if tx.send(fatal(&raw, e.to_string())).await.is_err() {
                             return;
                         }
@@ -205,23 +209,41 @@ fn events(
                 let job = match s.mirror.mirror(&purl) {
                     Ok(j) => j,
                     Err(e) => {
+                        tracing::info!(purl = %raw, error = %format!("{e:#}"), "PURL not mirrored");
                         if tx.send(fatal(&raw, format!("{e:#}"))).await.is_err() {
                             return;
                         }
                         continue;
                     }
                 };
+                tracing::info!(purl = %raw, "mirroring PURL");
                 let tx = tx.clone();
-                tokio::spawn(async move {
-                    let mut sub = job.subscribe();
-                    while let Some(u) = sub.next().await {
-                        let last = u.outcome.is_some();
-                        if tx.send(update_events(&raw, u)).await.is_err() || last {
-                            return;
+                tokio::spawn(
+                    async move {
+                        let mut sub = job.subscribe();
+                        // Without a client (`None`), follow the job only to
+                        // log its outcome.
+                        let mut tx = Some(tx);
+                        while let Some(u) = sub.next().await {
+                            let outcome = u.outcome;
+                            if let Some(outcome) = outcome {
+                                tracing::info!(purl = %raw, ?outcome, "PURL done");
+                            }
+                            if let Some(t) = &tx
+                                && t.send(update_events(&raw, u)).await.is_err()
+                            {
+                                tx = None;
+                            }
+                            if outcome.is_some() {
+                                return;
+                            }
+                            if tx.is_some() {
+                                tokio::time::sleep(UPDATE_INTERVAL).await;
+                            }
                         }
-                        tokio::time::sleep(UPDATE_INTERVAL).await;
                     }
-                });
+                    .in_current_span(),
+                );
             }
         }
         .instrument(span),
